@@ -48,7 +48,7 @@ typedef struct
 
 const PS2MemStats * PS2_GetStatsForMemTag(PS2MemTag tag);
 const char * PS2_GetNameForMemTag(PS2MemTag tag);
-const char * PS2_DumpMemTags(void);
+const char * PS2_DumpMemTags();
 
 #ifdef __cplusplus
 } // extern "C"

@@ -73,8 +73,6 @@ static const char * const s_memTagNames[MEMTAG_COUNT] = {
     "Mdl_World",
 };
 
-static char s_memTagsDumpBuff[2048];
-
 static inline size_t MemTagToIndex(PS2MemTag tag)
 {
     const int t = static_cast<int>(tag);
@@ -166,7 +164,7 @@ const char * PS2_FormatMemoryUnit(size_t memorySizeInBytes, int abbreviated)
         value = static_cast<double>(memorySizeInBytes);
     }
 
-    snprintf(s_str, sizeof(s_str), "%.2f %s", value, unit);
+    std::snprintf(s_str, sizeof(s_str), "%.2f %s", value, unit);
     return s_str;
 }
 
@@ -180,8 +178,9 @@ const char * PS2_GetNameForMemTag(PS2MemTag tag)
     return s_memTagNames[MemTagToIndex(tag)];
 }
 
-const char * PS2_DumpMemTags(void)
+const char * PS2_DumpMemTags()
 {
+    static char s_memTagsDumpBuff[2048];
     char * ptr = s_memTagsDumpBuff;
     size_t memTotal = 0;
 
