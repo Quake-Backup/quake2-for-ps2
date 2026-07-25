@@ -460,6 +460,8 @@ void EnsureTextureResident(const tex::Texture & texture)
 
     pkt.SendChain();
     dma_wait_fast();
+
+    vram::NoteTextureUpload(); // for the debug overlay's per-frame upload count
 }
 
 void ReleaseTexture(const tex::Texture & texture)

@@ -47,6 +47,10 @@ static Block s_blocks[kMaxBlocks];
 static int   s_blockCount = 0;
 static u32   s_frame      = 0;
 
+// Debug-overlay stats: the heap's total size and this frame's upload count.
+static int s_heapTotalWords    = 0;
+static int s_uploadsThisFrame  = 0;
+
 void InsertBlockAt(int index)
 {
     PS2_AssertMsg(s_blockCount < kMaxBlocks, "Out of VRAM block descriptors!");
@@ -104,6 +108,7 @@ void Init(int heapBaseWords)
 
     s_blocks[0] = { Address(heapBaseWords), heapEndWords - heapBaseWords, nullptr, 0 };
     s_blockCount = 1;
+    s_heapTotalWords = s_blocks[0].sizeWords;
 
     Com_Printf("GS texture heap: %d KB of VRAM.\n", s_blocks[0].sizeWords * 4 / 1024);
 }
@@ -111,6 +116,7 @@ void Init(int heapBaseWords)
 void BeginFrame()
 {
     ++s_frame;
+    s_uploadsThisFrame = 0;
 }
 
 void EndFrame()
@@ -267,6 +273,32 @@ void Free(const tex::Texture & texture)
     }
 
     PS2_AssertMsg(false, "Resident texture has no VRAM block!");
+}
+
+void NoteTextureUpload()
+{
+    ++s_uploadsThisFrame;
+}
+
+Stats GetStats()
+{
+    Stats stats = {};
+    stats.totalWords       = s_heapTotalWords;
+    stats.uploadsThisFrame = s_uploadsThisFrame;
+
+    for (int i = 0; i < s_blockCount; ++i)
+    {
+        if (s_blocks[i].owner == nullptr)
+        {
+            stats.freeWords += s_blocks[i].sizeWords;
+        }
+        else
+        {
+            ++stats.residentTextures;
+        }
+    }
+
+    return stats;
 }
 
 } // namespace ps2::vram

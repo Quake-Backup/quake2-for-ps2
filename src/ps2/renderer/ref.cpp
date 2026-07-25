@@ -13,6 +13,7 @@
 
 #include "ps2/common.h"
 #include "ps2/renderer/gs.h"
+#include "ps2/renderer/vram.h"
 #include "ps2/renderer/vu1.h"
 #include "ps2/renderer/model.h"
 #include "ps2/renderer/texture.h"
@@ -33,6 +34,7 @@ constexpr u8 kUiBrightness = 128;
 
 static const cvar_t * s_showFpsCount = nullptr;
 static const cvar_t * s_showMemStats = nullptr;
+static const cvar_t * s_showVramStats = nullptr;
 
 // Built-ins used every frame, cached at init to skip the name lookup.
 static const ps2::tex::Texture * s_texConchars = nullptr;
@@ -187,6 +189,53 @@ void DrawMemUsageOverlay()
     DrawInternalString(textX, textY, line);
 }
 
+// GS VRAM texture-heap overlay in the lower-left corner: free/uncommitted heap
+// space, the number of resident textures and the texture uploads done so far
+// this frame (streaming pressure - high or spiking means the heap is thrashing).
+void DrawVramUsageOverlay()
+{
+    if (s_showVramStats->value == 0.0f)
+    {
+        return;
+    }
+
+    constexpr int kLineHeight = kGlyphSize + 2; // Matches DrawInternalString spacing.
+    constexpr int kNumLines   = 4;              // Header + three stats.
+    constexpr int kPanelWidth = 174;
+    constexpr int kPadding    = 4;
+
+    const ps2::vram::Stats stats = ps2::vram::GetStats();
+
+    const int panelHeight = (kNumLines * kLineHeight) + (kPadding * 2);
+    const int panelX = 0;                            // flush to the left edge
+    const int panelY = viddef.height - panelHeight;  // ...and the bottom
+
+    // A black background to give the text more contrast.
+    ps2::gs::FillRect(panelX, panelY, kPanelWidth, panelHeight, 0, 0, 0, 255);
+
+    const int textX = panelX + kPadding;
+    int textY = panelY + kPadding;
+
+    DrawInternalString(textX, textY, "VRAM USAGE");
+    textY += kLineHeight;
+
+    char line[64];
+
+    // PS2_FormatMemoryUnit returns a shared static buffer, so it must be consumed
+    // by this one snprintf before anything else reuses it.
+    std::snprintf(line, sizeof(line), "%-10s %s", "Free",
+                  PS2_FormatMemoryUnit(static_cast<size_t>(stats.freeWords) * 4u, true));
+    DrawInternalString(textX, textY, line);
+    textY += kLineHeight;
+
+    std::snprintf(line, sizeof(line), "%-10s %d", "Resident", stats.residentTextures);
+    DrawInternalString(textX, textY, line);
+    textY += kLineHeight;
+
+    std::snprintf(line, sizeof(line), "%-10s %d", "Uploads", stats.uploadsThisFrame);
+    DrawInternalString(textX, textY, line);
+}
+
 } // namespace
 
 extern "C" {
@@ -207,6 +256,7 @@ qboolean PS2_RefInit(void * hinstance, void * wndproc)
 
     s_showFpsCount = Cvar_Get("ps2_show_fps", "1", 0);
     s_showMemStats = Cvar_Get("ps2_show_memstats", "1", 0);
+    s_showVramStats = Cvar_Get("ps2_show_vramstats", "1", 0);
 
     s_texConchars = ps2::tex::Find("conchars", ps2::tex::ImageType::Pic);
     s_texBacktile = ps2::tex::Find("backtile", ps2::tex::ImageType::Pic);
@@ -368,6 +418,7 @@ void PS2_EndFrame()
 
     DrawFpsCounter();
     DrawMemUsageOverlay();
+    DrawVramUsageOverlay();
 
     ps2::gs::EndFrame();
 }

@@ -24,6 +24,7 @@ enum struct Address : int
 void Init(int heapBaseWords);
 
 // Advances the LRU clock. Call once per frame, from gs::BeginFrame()/EndFrame().
+// BeginFrame() also resets the per-frame texture-upload counter (see GetStats).
 void BeginFrame();
 void EndFrame();
 
@@ -51,5 +52,22 @@ bool BoundThisFrame(const tex::Texture & texture);
 // not resident). The freed range may be handed out without an eviction, so the
 // caller must treat it like evicted VRAM: sync the GS before writing over it.
 void Free(const tex::Texture & texture);
+
+// Records one texture DMA upload for the per-frame counter. Called by
+// gs::EnsureTextureResident each time it transfers a texture's pixels into VRAM
+// (a first upload or a dirty re-upload); reset each frame by BeginFrame().
+void NoteTextureUpload();
+
+// Live snapshot of the texture heap, for the ref.cpp debug overlay.
+struct Stats
+{
+    int freeWords;        // uncommitted VRAM: total size of the free blocks
+    int totalWords;       // heap size handed to Init()
+    int residentTextures; // textures currently holding a block
+    int uploadsThisFrame; // texture DMA uploads since the last BeginFrame()
+};
+
+// Computes the current stats (cheap; walks the block list).
+Stats GetStats();
 
 } // namespace ps2::vram
