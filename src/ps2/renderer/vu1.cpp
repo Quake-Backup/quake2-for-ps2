@@ -233,9 +233,13 @@ void DrawTriangles(const math::Mat4 & mvp, const tex::Texture & texture,
                    const DrawVertex * verts, int vertCount)
 {
     PS2_AssertMsg(s_initialized, "vu1::Init not called!");
-    PS2_AssertMsg(!gs::In2DMode(), "No 3D drawing inside the 2D section!");
     PS2_AssertMsg(vertCount > 0 && (vertCount % 3) == 0, "DrawTriangles wants whole triangles!");
     PS2_AssertMsg((reinterpret_cast<std::uintptr_t>(verts) & 15u) == 0, "Vertex data must be 16-byte aligned!");
+
+    // Send any 2D accumulated before this 3D burst so it draws underneath (and
+    // its textures are consumed before our uploads can evict them). A no-op once
+    // the batch is already flushed - only the first 3D draw after 2D pays it.
+    gs::FlushPending2D();
 
     gs::EnsureTextureResident(texture);
     PS2_Assert(texture.vramAddr != tex::Texture::kNotResident);

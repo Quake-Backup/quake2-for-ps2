@@ -42,19 +42,21 @@ vram::Address GlobalClutAddress();
 void SetClearColor(u8 r, u8 g, u8 b);
 
 // Per-frame lifecycle: BeginFrame() clears the back buffer (color + depth,
-// sent immediately); EndFrame() waits for vsync and flips to the front.
-// 3D drawing (the VU1 path) happens outside the 2D section below.
+// sent immediately); EndFrame() flushes any pending 2D (see below), waits for
+// vsync and flips to the front. 2D and 3D may be drawn in any order between them.
 void BeginFrame();
 void EndFrame();
 
-// The 2D overlay section. All 2D draws (FillRect/SetTextureFor2D/DrawTexturedRect)
-// must happen between Begin2D() and End2D(): they accumulate in a deferred
-// packet with an always-pass z-test that End2D() sends and waits on. 2D and
-// 3D never interleave - 2D outside the section (or 3D inside it) asserts.
-void Begin2D();
-void End2D();
+// 2D draws (FillRect/SetTextureFor2D/DrawTexturedRect) accumulate into a
+// deferred "pending batch" with an always-pass z-test, so it draws on top; the
+// first primitive after a flush opens it lazily - callers just draw, no bracket.
+// The batch is flushed (sent and waited on) automatically before the next 3D
+// draw and by EndFrame(), which keeps its layering correct and its textures
+// resident. Rarely needed directly; the VU1 3D path calls it before drawing so
+// its triangles land under any 2D issued afterwards.
+void FlushPending2D();
 
-// True between Begin2D() and End2D(); the 3D path asserts against it.
+// True while a pending 2D batch is open (a 2D primitive has drawn since the last flush).
 bool In2DMode();
 
 // Adds a solid rectangle to the current frame. Alpha below 255 blends with the

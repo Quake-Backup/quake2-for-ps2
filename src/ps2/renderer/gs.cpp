@@ -8,10 +8,14 @@
  *  are direct top-left pixels.
  *
  *  Frame structure: BeginFrame() clears color and depth immediately (its own
- *  DMA transfer), the VU1 3D world arrives over PATH1, and the 2D overlay
- *  accumulates inside the Begin2D()/End2D() section, sent at End2D() to draw
- *  on top with an always-pass z-test. 2D and 3D never interleave; the section
- *  boundaries are asserted.
+ *  DMA transfer). 2D and 3D then draw in any order. 2D primitives accumulate
+ *  into a deferred "pending batch" (always-pass z-test, so it lands on top);
+ *  the first primitive after a flush opens it lazily. The batch is flushed to
+ *  the GS - sent and waited on - automatically at each 2D->3D boundary (the
+ *  VU1 path calls FlushPending2D() before drawing over PATH1, so its triangles
+ *  land under any 2D issued afterwards) and once more by EndFrame(). Flushing
+ *  at the boundary also keeps the deferred draws' textures resident: they are
+ *  consumed before a later 3D upload can evict the VRAM they sample.
  *
  *  Textures stream on first bind into the VRAM left over after the
  *  framebuffers and z-buffer (~1.27 MB), managed by vram.cpp. While a texture
@@ -259,23 +263,31 @@ void BeginFrame()
     vram::BeginFrame();
 }
 
-void Begin2D()
+// Opens the pending 2D batch on demand: the first 2D primitive after a flush
+// (or after BeginFrame) lands here. Cheap no-op once the batch is already open.
+static void Ensure2D()
 {
-    PS2_AssertMsg(s_frameStarted, "Begin2D outside Begin/EndFrame!");
-    PS2_AssertMsg(!s_in2D, "Begin2D called twice!");
+    PS2_AssertMsg(s_frameStarted, "2D draw outside Begin/EndFrame!");
+    if (s_in2D)
+    {
+        return;
+    }
     s_in2D       = true;
-    s_currentTex = nullptr; // the TEX0 dedupe state is per 2D section
+    s_currentTex = nullptr; // the TEX0 dedupe state is per 2D batch
 
-    // The 2D overlay accumulates here and goes out at End2D, after the 3D
-    // world has drawn: always-pass z-test so it lands on top.
+    // The 2D overlay accumulates here and goes out at the next flush, after any
+    // 3D drawn so far: always-pass z-test so it lands on top.
     RenderPacket & pkt = FramePacket();
     pkt.Reset();
     pkt.DisableTests(s_drawCtx, s_zbuffer);
 }
 
-void End2D()
+void FlushPending2D()
 {
-    PS2_AssertMsg(s_in2D, "End2D without Begin2D!");
+    if (!s_in2D)
+    {
+        return; // nothing accumulated since the last flush
+    }
     s_in2D = false;
 
     RenderPacket & pkt = FramePacket();
@@ -295,7 +307,7 @@ bool In2DMode()
 
 void FillRect(int x, int y, int w, int h, u8 r, u8 g, u8 b, u8 a)
 {
-    PS2_AssertMsg(s_in2D, "FillRect outside the 2D section!");
+    Ensure2D();
 
     RenderPacket & pkt = FramePacket();
     pkt.EnsureSpace(64);
@@ -474,8 +486,8 @@ void ReleaseTexture(const tex::Texture & texture)
 
 void SetTextureFor2D(const tex::Texture & texture)
 {
-    PS2_AssertMsg(s_in2D, "SetTextureFor2D outside the 2D section!");
     PS2_Assert(texture.type != tex::ImageType::Null && texture.pixels != nullptr);
+    Ensure2D();
 
     if (&texture == s_currentTex && !texture.dirtyPixels)
     {
@@ -528,8 +540,8 @@ void SetTextureFor2D(const tex::Texture & texture)
 void DrawTexturedRect(int x, int y, int w, int h,
                       int u0, int v0, int u1, int v1, u8 brightness)
 {
-    PS2_AssertMsg(s_in2D, "DrawTexturedRect outside the 2D section!");
     PS2_AssertMsg(s_currentTex != nullptr, "DrawTexturedRect without SetTextureFor2D!");
+    PS2_AssertMsg(s_in2D, "DrawTexturedRect without an open 2D batch!");
 
     RenderPacket & pkt = FramePacket();
     pkt.EnsureSpace(8);
@@ -562,8 +574,11 @@ void DrawTexturedRect(int x, int y, int w, int h,
 void EndFrame()
 {
     PS2_AssertMsg(s_frameStarted, "EndFrame without BeginFrame!");
-    PS2_AssertMsg(!s_in2D, "EndFrame inside the 2D section - End2D missing!");
     s_frameStarted = false;
+
+    // Send whatever 2D accumulated since the last flush (the HUD/console overlay
+    // in the common case) so it lands on top before the buffer is displayed.
+    FlushPending2D();
 
     graph_wait_vsync();
     graph_set_framebuffer_filtered(static_cast<int>(s_frame[s_drawCtx].address),

@@ -330,8 +330,8 @@ void PS2_DrawFadeScreen()
 
 void PS2_DrawStretchRaw(int x, int y, int w, int h, int cols, int rows, const byte * data)
 {
-    // Called every frame while a cinematic plays, always inside the 2D
-    // section (opened in PS2_BeginFrame) - draw immediately, no deferral.
+    // Called every frame while a cinematic plays; the movie quad is a 2D draw,
+    // so it joins the deferred overlay batch (opened lazily) like any other.
     ps2::cin::DrawFrame(x, y, w, h, cols, rows, data);
 }
 
@@ -348,31 +348,26 @@ void PS2_BeginFrame(float cameraSeparation)
 {
     (void)cameraSeparation;
     ps2::gs::BeginFrame();
-
-    // The engine draws its 2D overlay (console, HUD) right after BeginFrame -
-    // it never calls PS2_RenderFrame until game assets load - so the 2D
-    // section opens here for now. Once the 3D world lands, Begin2D() moves to
-    // after PS2_RenderFrame().
-    ps2::gs::Begin2D();
+    // 2D and 3D now draw freely between here and PS2_EndFrame: 2D primitives
+    // open the deferred overlay batch lazily and it flushes automatically at
+    // each 2D->3D boundary and in gs::EndFrame() - no explicit bracket here.
 }
 
 void PS2_EndFrame()
 {
-    // Cinematic playback test: must run inside the 2D section (the movie quad
-    // is a 2D draw), at its end so the picture lands over the fullscreen
-    // console but under the FPS counter. Enable with cvar "ps2_testcin 1".
+    // Cinematic playback test: the movie quad is a 2D draw, run at frame's end
+    // so it lands over the fullscreen console but under the FPS counter. Enable
+    // with cvar "ps2_testcin 1".
     ps2::test::RunCinematics();
+
+    // VU1 bring-up scene (cvar "ps2_testcube 1"): a 3D draw, so it flushes the
+    // 2D overlay accumulated above and lands on top - staying visible over the
+    // fullscreen console Quake forces while disconnected (its batch programs
+    // its own z-test). gs::EndFrame() then sends any remaining 2D and flips.
+    ps2::test::DrawRotatingCube();
 
     DrawFpsCounter();
     DrawMemUsageOverlay();
-
-    ps2::gs::End2D();
-
-    // VU1 bring-up scene: drawn outside the 2D section (3D inside it would
-    // assert), after the overlay so it stays visible over the fullscreen
-    // console that Quake forces while disconnected (its batch programs its
-    // own z-test). Enable with cvar "ps2_testcube 1".
-    ps2::test::DrawRotatingCube();
 
     ps2::gs::EndFrame();
 }

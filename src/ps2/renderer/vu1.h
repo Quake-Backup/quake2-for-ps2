@@ -53,8 +53,7 @@ void Init();
 // submitted back to back in the same DMA chain, overlapping each chunk's
 // upload with the previous one's transform. Synchronous for now: returns once
 // the GS has consumed the batch, so the vertex data only needs to stay valid
-// for the duration of the call. Call between gs::Begin/EndFrame but outside
-// the gs::Begin2D/End2D section.
+// for the duration of the call. Call between gs::Begin/EndFrame.
 void DrawTriangles(const math::Mat4 & mvp, const tex::Texture & texture,
                    const DrawVertex * verts, int vertCount);
 
