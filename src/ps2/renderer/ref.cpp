@@ -18,6 +18,7 @@
 #include "ps2/renderer/model.h"
 #include "ps2/renderer/texture.h"
 #include "ps2/renderer/cinematic.h"
+#include "ps2/renderer/render_view.h"
 #include "ps2/renderer/tests/draw_cube.h"
 #include "ps2/renderer/tests/cinematics.h"
 #include "ps2/builtin/builtin.h"
@@ -425,8 +426,8 @@ void PS2_EndFrame()
 
 void PS2_RenderFrame(refdef_t * viewDef)
 {
-    // TODO
-    (void)viewDef;
+    PS2_Assert(viewDef != nullptr);
+    ps2::view::RenderFrame(*viewDef);
 }
 
 } // extern "C"

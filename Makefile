@@ -46,6 +46,7 @@ PS2_CXX_SRC =                         \
 	ps2/renderer/model.cpp            \
 	ps2/renderer/model_load.cpp       \
 	ps2/renderer/cinematic.cpp        \
+	ps2/renderer/render_view.cpp      \
 	ps2/renderer/vid.cpp              \
 	ps2/renderer/ref.cpp              \
 	ps2/renderer/vu1.cpp              \
