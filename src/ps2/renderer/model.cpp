@@ -232,7 +232,10 @@ void ModelCache::SetUpInlineModels(ModelInstance & world)
         inl.mins              = sm.mins;
         inl.maxs              = sm.maxs;
         inl.radius            = sm.radius;
-        inl.numLeafs          = sm.visLeafs;
+
+        // Quake 2's on-disk dmodel_t carries no leaf count, and inline models
+        // never walk the leaf array; only the world's LoadLeafs count matters.
+        inl.numLeafs = 0;
 
         if (inl.firstNode >= world.numNodes)
         {
@@ -240,6 +243,8 @@ void ModelCache::SetUpInlineModels(ModelInstance & world)
         }
 
         // Submodel 0 is the world itself; fold its ranges back into the world.
+        // numLeafs stays untouched: the world keeps the full count from
+        // LoadLeafs, or MarkLeaves would have no leafs to stamp visible.
         if (i == 0)
         {
             world.firstModelSurface = sm.firstFace;
@@ -248,7 +253,6 @@ void ModelCache::SetUpInlineModels(ModelInstance & world)
             world.mins              = sm.mins;
             world.maxs              = sm.maxs;
             world.radius            = sm.radius;
-            world.numLeafs          = sm.visLeafs;
         }
     }
 }

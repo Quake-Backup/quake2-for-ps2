@@ -227,7 +227,6 @@ struct SubModelInfo
     Vec3 origin;
     float radius;
     int headNode;
-    int visLeafs;
     int firstFace;
     int numFaces;
 };
