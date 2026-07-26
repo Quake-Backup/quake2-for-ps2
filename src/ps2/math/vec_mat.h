@@ -11,6 +11,7 @@
  * ================================================================================================ */
 
 #include "ps2/math/math.h"
+#include <tamtypes.h>
 
 namespace ps2::math {
 
@@ -88,14 +89,17 @@ struct alignas(16) Mat4
     float m[4][4];
 };
 
+constexpr Mat4 Identity()
+{
+    return {{ { 1.0f, 0.0f, 0.0f, 0.0f },
+              { 0.0f, 1.0f, 0.0f, 0.0f },
+              { 0.0f, 0.0f, 1.0f, 0.0f },
+              { 0.0f, 0.0f, 0.0f, 1.0f } }};
+}
+
 // Matrix concatenation on VU0: (a * b) applies a first under the row-vector convention.
 Mat4 operator*(const Mat4 & a, const Mat4 & b);
 
-// Row-vector transform on VU0: result = v * m. All four components of v are
-// used, so set w to 1 for points. Handy for EE-side verification of the VU1 path.
-Vec4 Transform(const Vec4 & v, const Mat4 & m);
-
-Mat4 Identity();
 Mat4 Translation(float x, float y, float z);
 Mat4 RotationX(float radians);
 Mat4 RotationY(float radians);
@@ -112,5 +116,141 @@ Mat4 LookAt(const Vec3 & eye, const Vec3 & target, const Vec3 & up);
 Mat4 PerspectiveProjection(float fovyRadians, float aspect,
                            float screenW, float screenH,
                            float zNear, float zFar);
+
+// ------------------------------------------------------------------------------------------------
+// VU0 macro-mode helpers
+//
+//  GCC never auto-vectorizes into VU0 macro mode, so anything hot enough to want the
+//  vector unit has to ask for it in asm. Quadword-aligned Vec4 is the shape the unit
+//  wants - lqc2/sqc2 move a whole vector per instruction - so prefer the Vec4 forms
+//  wherever the layout is yours to choose. The Vec3 overloads are for data that is
+//  already stored packed (the model vertex arrays, by the thousand): 12 bytes at
+//  4-byte alignment cannot be lqc2'd, so they merge the three words into one 128-bit
+//  GPR with the MMI shuffles and hand that over with qmtc2 - six instructions per
+//  operand, which Transform earns back several times over but Lerp only breaks even
+//  on. All are inline so the loads and merges schedule into the caller's loop.
+// ------------------------------------------------------------------------------------------------
+
+// Row-vector transform: result = v * m. All four components of v are used, so set
+// w to 1 for points. Also handy for EE-side verification of the VU1 path.
+inline Vec4 Transform(const Vec4 & v, const Mat4 & m)
+{
+    Vec4 result;
+    asm volatile (
+        "lqc2    $vf4, 0x00(%1)    \n\t" // vf4-vf7 = rows of m
+        "lqc2    $vf5, 0x10(%1)    \n\t"
+        "lqc2    $vf6, 0x20(%1)    \n\t"
+        "lqc2    $vf7, 0x30(%1)    \n\t"
+        "lqc2    $vf8, 0x00(%2)    \n\t" // vf8 = v
+        "vmulax  $ACC, $vf4, $vf8  \n\t" // result = v.x*row0 + v.y*row1 + v.z*row2 + v.w*row3
+        "vmadday $ACC, $vf5, $vf8  \n\t"
+        "vmaddaz $ACC, $vf6, $vf8  \n\t"
+        "vmaddw  $vf9, $vf7, $vf8  \n\t"
+        "sqc2    $vf9, 0x00(%0)    \n\t"
+        : : "r" (&result), "r" (&m), "r" (&v)
+        : "memory"
+    );
+    return result;
+}
+
+// Component-wise linear interpolation: out = a + t * (b - a), with the multiply and
+// the add fused into one VU multiply-accumulate. Exact at both ends: t = 0 gives a.
+// Writes through 'out', which may alias 'a' or 'b' (both are loaded up front).
+inline void LerpTo(Vec4 & out, const Vec4 & a, const Vec4 & b, float t)
+{
+    [[maybe_unused]] u32 tmp;
+    asm (
+        "lqc2    $vf8,  %2           \n\t" // vf8 = a, vf9 = b
+        "lqc2    $vf9,  %3           \n\t"
+        "mfc1    %0, %4              \n\t" // vf10.x = t
+        "qmtc2   %0, $vf10           \n\t"
+        "vsub    $vf11, $vf9,  $vf8  \n\t" // vf11 = b - a
+        "vmulax  $ACC,  $vf11, $vf10 \n\t" // ACC  = (b - a) * t
+        "vmaddw  $vf11, $vf8,  $vf0  \n\t" // vf11 = ACC + a * 1
+        "sqc2    $vf11, %1           \n\t"
+        : "=&r" (tmp), "=m" (out)
+        : "m" (a), "m" (b), "f" (t)
+    );
+}
+
+// Value-returning form of LerpTo. Prefer LerpTo in hot loops: the vector unit can
+// only deliver its result to memory, so this form lands it in a temporary that the
+// caller then has to copy out (four instructions GCC will not elide).
+inline Vec4 Lerp(const Vec4 & a, const Vec4 & b, float t)
+{
+    Vec4 result;
+    LerpTo(result, a, b, t);
+    return result;
+}
+
+// Row-vector transform of a packed point: result = { v, 1 } * m, i.e. the full
+// clip-space position of a world-space point, w included. The merged vector's 4th
+// lane is left as whatever the shuffle produced and never read - the row 3 term is
+// taken from vf0's hardwired w = 1 instead of from the vector.
+inline Vec4 Transform(const Vec3 & v, const Mat4 & m)
+{
+    Vec4 result;
+    [[maybe_unused]] u32 t0, t1, t2;
+    asm volatile (
+        "lw      %0, 0x0(%3)       \n\t" // merge v into one quadword: { ?, z, y, x }
+        "lw      %1, 0x4(%3)       \n\t"
+        "lw      %2, 0x8(%3)       \n\t"
+        "pextlw  %0, %1, %0        \n\t"
+        "pcpyld  %0, %2, %0        \n\t"
+        "qmtc2   %0, $vf8          \n\t"
+        "lqc2    $vf4, 0x00(%4)    \n\t" // vf4-vf7 = rows of m
+        "lqc2    $vf5, 0x10(%4)    \n\t"
+        "lqc2    $vf6, 0x20(%4)    \n\t"
+        "lqc2    $vf7, 0x30(%4)    \n\t"
+        "vmulax  $ACC, $vf4, $vf8  \n\t" // result = v.x*row0 + v.y*row1 + v.z*row2 + row3
+        "vmadday $ACC, $vf5, $vf8  \n\t"
+        "vmaddaz $ACC, $vf6, $vf8  \n\t"
+        "vmaddw  $vf9, $vf7, $vf0  \n\t"
+        "sqc2    $vf9, 0x00(%5)    \n\t"
+        : "=&r" (t0), "=&r" (t1), "=&r" (t2)
+        : "r" (&v), "r" (&m), "r" (&result)
+        : "memory"
+    );
+    return result;
+}
+
+// Component-wise linear interpolation: a + t * (b - a), with the multiply and the
+// add fused into one VU multiply-accumulate. Exact at both ends: t = 0 gives a.
+//
+// The result comes back in GPRs rather than being sqc2'd into a local, so that the
+// caller stores the three words straight into wherever its Vec3 lives - an sqc2
+// would need a 16-byte-aligned home first and then a copy out of it. The two source
+// operands are declared to the asm as memory rather than clobbering all of it.
+inline Vec3 Lerp(const Vec3 & a, const Vec3 & b, float t)
+{
+    u32 rx, ry, rz;
+    asm (
+        "lw      %0, 0x0(%3)            \n\t" // vf8 = { ?, a.z, a.y, a.x }
+        "lw      %1, 0x4(%3)            \n\t"
+        "lw      %2, 0x8(%3)            \n\t"
+        "pextlw  %0, %1, %0             \n\t"
+        "pcpyld  %0, %2, %0             \n\t"
+        "qmtc2   %0, $vf8               \n\t"
+        "lw      %0, 0x0(%4)            \n\t" // vf9 = { ?, b.z, b.y, b.x }
+        "lw      %1, 0x4(%4)            \n\t"
+        "lw      %2, 0x8(%4)            \n\t"
+        "pextlw  %0, %1, %0             \n\t"
+        "pcpyld  %0, %2, %0             \n\t"
+        "qmtc2   %0, $vf9               \n\t"
+        "mfc1    %0, %5                 \n\t" // vf10.x = t
+        "qmtc2   %0, $vf10              \n\t"
+        "vsub.xyz   $vf11, $vf9,  $vf8  \n\t" // vf11 = b - a
+        "vmulax.xyz $ACC,  $vf11, $vf10 \n\t" // ACC  = (b - a) * t
+        "vmaddw.xyz $vf11, $vf8,  $vf0  \n\t" // vf11 = ACC + a * 1
+        "qmfc2   %0, $vf11              \n\t" // split the quadword back into words
+        "dsrl32  %1, %0, 0              \n\t"
+        "pcpyud  %2, %0, %0             \n\t"
+        : "=&r" (rx), "=&r" (ry), "=&r" (rz)
+        : "r" (&a), "r" (&b), "f" (t), "m" (a), "m" (b)
+    );
+    return { __builtin_bit_cast(float, rx),
+             __builtin_bit_cast(float, ry),
+             __builtin_bit_cast(float, rz) };
+}
 
 } // namespace ps2::math

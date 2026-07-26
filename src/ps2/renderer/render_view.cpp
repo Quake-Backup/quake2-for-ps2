@@ -98,7 +98,7 @@ static DrawStats s_drawStats = {};
 // Frame setup: camera matrices and frustum
 // ------------------------------------------------------------------------------------------------
 
-int SignBitsForPlane(const cplane_t & plane)
+inline int SignBitsForPlane(const cplane_t & plane)
 {
     // Sign bits are used for fast box-on-plane-side tests.
     int bits = 0;
@@ -130,7 +130,7 @@ void SetUpFrustum(const refdef_t & viewDef)
 }
 
 // True when the box is completely outside the frustum and must not draw.
-bool ShouldCullBBox(float * mins, float * maxs)
+inline bool ShouldCullBBox(float * mins, float * maxs)
 {
     for (cplane_t & plane : s_frustum)
     {
@@ -482,7 +482,7 @@ void RecursiveWorldNode(const refdef_t & viewDef, const mod::ModelInstance & wor
 // ------------------------------------------------------------------------------------------------
 
 // Sends the gathered scratch triangles as one batch and empties the buffer.
-void FlushScratch(const tex::Texture & texture)
+inline void FlushScratch(const tex::Texture & texture)
 {
     if (s_scratchVertCount > 0)
     {
@@ -504,8 +504,10 @@ void FlushScratch(const tex::Texture & texture)
 // band the GS 12.4 coordinates could hold. Clipping runs in clip space - a
 // vertex is inside while w-z >= 0 (near; also excludes everything behind the
 // camera), w+z >= 0 (far), and G*w +/- x/y >= 0 (sides, G = the VU guard-band
-// limit) - and world position/UVs are interpolated directly, both linear
-// under a plane cut. Whole-triangle-inside is the common case and skips it.
+// limit). Everything a vertex carries - world position, UVs, and the six
+// distances themselves - is linear under a plane cut, so a split interpolates
+// the whole ClipVertex as four quadword lerps on VU0, no scalar float math.
+// Whole-triangle-inside is the common case and skips all of it.
 // ------------------------------------------------------------------------------------------------
 
 constexpr int kNumClipPlanes = 6;
@@ -514,12 +516,24 @@ constexpr int kNumClipPlanes = 6;
 // just placed on the boundary (clip-space units, i.e. ~world units here).
 constexpr float kClipEpsilon = 0.01f;
 
-struct ClipVertex
+// Signed distances to the clip planes; >= 0 is inside. Held as two whole quadwords
+// (six planes, two spare lanes) so the whole set interpolates with two vector lerps
+// while the per-plane tests still read it as a plain float array.
+union ClipDists
 {
-    float pos[3];             // world position
-    float st[2];              // diffuse texture coords
-    float d[kNumClipPlanes];  // signed plane distances; >= 0 is inside
+    math::Vec4 q[2];
+    float f[8];
 };
+
+// Everything a clipped vertex carries, laid out as four quadwords so a plane cut
+// interpolates it with four aligned vector lerps and no scalar float math at all.
+struct alignas(16) ClipVertex
+{
+    math::Vec4 pos; // world position, w = 1
+    math::Vec4 st;  // diffuse texture coords in xy; zw unused
+    ClipDists  d;
+};
+static_assert(sizeof(ClipVertex) == 64, "ClipVertex must be exactly four quadwords");
 
 // Sutherland-Hodgman pass of a convex polygon against one plane. 'out' must
 // hold inCount + 1 vertexes. Returns the clipped vertex count.
@@ -531,38 +545,33 @@ int ClipAgainstPlane(const ClipVertex * in, const int inCount, ClipVertex * out,
         const ClipVertex & a = in[i];
         const ClipVertex & b = in[(i + 1 == inCount) ? 0 : i + 1];
 
-        if (a.d[plane] >= 0.0f)
+        if (a.d.f[plane] >= 0.0f)
         {
             out[outCount++] = a;
         }
-        if ((a.d[plane] >= 0.0f) != (b.d[plane] >= 0.0f)) // Edge crosses the plane.
+        if ((a.d.f[plane] >= 0.0f) != (b.d.f[plane] >= 0.0f)) // Edge crosses the plane.
         {
-            const float t = a.d[plane] / (a.d[plane] - b.d[plane]);
+            const float t = a.d.f[plane] / (a.d.f[plane] - b.d.f[plane]);
             ClipVertex & o = out[outCount++];
-            o.pos[0] = a.pos[0] + t * (b.pos[0] - a.pos[0]);
-            o.pos[1] = a.pos[1] + t * (b.pos[1] - a.pos[1]);
-            o.pos[2] = a.pos[2] + t * (b.pos[2] - a.pos[2]);
-            o.st[0]  = a.st[0]  + t * (b.st[0]  - a.st[0]);
-            o.st[1]  = a.st[1]  + t * (b.st[1]  - a.st[1]);
-            for (int p = 0; p < kNumClipPlanes; ++p)
-            {
-                o.d[p] = a.d[p] + t * (b.d[p] - a.d[p]);
-            }
+            math::LerpTo(o.pos,    a.pos,    b.pos,    t);
+            math::LerpTo(o.st,     a.st,     b.st,     t);
+            math::LerpTo(o.d.q[0], a.d.q[0], b.d.q[0], t);
+            math::LerpTo(o.d.q[1], a.d.q[1], b.d.q[1], t);
         }
     }
     return outCount;
 }
 
-void EmitScratchVertex(const float pos[3], const float st[2])
+inline void EmitScratchVertex(const ClipVertex & v)
 {
     vu1::DrawVertex & dst = s_scratchVerts[s_scratchVertCount++];
-    dst.x    = pos[0];
-    dst.y    = pos[1];
-    dst.z    = pos[2];
+    dst.x    = v.pos.x;
+    dst.y    = v.pos.y;
+    dst.z    = v.pos.z;
     dst.w    = 1.0f;
     dst.rgba = kFullBright;
-    dst.s    = st[0];
-    dst.t    = st[1];
+    dst.s    = v.st.x;
+    dst.t    = v.st.y;
     dst.q    = 1.0f;
 }
 
@@ -582,8 +591,8 @@ void GatherPolyTriangles(const mod::ModelPoly & poly, const tex::Texture & textu
             continue;
         }
 
-        // Clip-space plane distances of the three corners (positions are
-        // world space, w = 1, so the transform is three full row dots).
+        // Clip-space plane distances of the three corners (world geometry
+        // draws untransformed, so the point transform is the view-projection).
         ClipVertex corners[3];
         int insidePerPlane[kNumClipPlanes] = {};
         for (int v = 0; v < 3; ++v)
@@ -591,29 +600,23 @@ void GatherPolyTriangles(const mod::ModelPoly & poly, const tex::Texture & textu
             const mod::PolyVertex & src = poly.vertexes[tri.vertexes[v]];
             ClipVertex & c = corners[v];
 
-            c.pos[0] = src.position.x;
-            c.pos[1] = src.position.y;
-            c.pos[2] = src.position.z;
-            c.st[0]  = src.texture_s;
-            c.st[1]  = src.texture_t;
+            c.pos = { src.position.x, src.position.y, src.position.z, 1.0f };
+            c.st  = { src.texture_s, src.texture_t, 0.0f, 0.0f };
 
-            const float (&m)[4][4] = s_viewProjMatrix.m;
-            const float xc = c.pos[0] * m[0][0] + c.pos[1] * m[1][0] + c.pos[2] * m[2][0] + m[3][0];
-            const float yc = c.pos[0] * m[0][1] + c.pos[1] * m[1][1] + c.pos[2] * m[2][1] + m[3][1];
-            const float zc = c.pos[0] * m[0][2] + c.pos[1] * m[1][2] + c.pos[2] * m[2][2] + m[3][2];
-            const float wc = c.pos[0] * m[0][3] + c.pos[1] * m[1][3] + c.pos[2] * m[2][3] + m[3][3];
-
-            const float gw = vu1::kGuardBandNdcLimit * wc;
-            c.d[0] = (wc - zc) - kClipEpsilon; // near (and behind-camera)
-            c.d[1] = (wc + zc) - kClipEpsilon; // far
-            c.d[2] = (gw - xc) - kClipEpsilon; // guard band sides
-            c.d[3] = (gw + xc) - kClipEpsilon;
-            c.d[4] = (gw - yc) - kClipEpsilon;
-            c.d[5] = (gw + yc) - kClipEpsilon;
+            const math::Vec4 clip = math::Transform(c.pos, s_viewProjMatrix);
+            const float gw = vu1::kGuardBandNdcLimit * clip.w;
+            c.d.f[0] = (clip.w - clip.z) - kClipEpsilon; // near (and behind-camera)
+            c.d.f[1] = (clip.w + clip.z) - kClipEpsilon; // far
+            c.d.f[2] = (gw - clip.x) - kClipEpsilon;     // guard band sides
+            c.d.f[3] = (gw + clip.x) - kClipEpsilon;
+            c.d.f[4] = (gw - clip.y) - kClipEpsilon;
+            c.d.f[5] = (gw + clip.y) - kClipEpsilon;
+            c.d.f[6] = 0.0f; // Spare lanes: never read as planes, but they ride
+            c.d.f[7] = 0.0f; // along through the lerps, so keep them finite.
 
             for (int p = 0; p < kNumClipPlanes; ++p)
             {
-                insidePerPlane[p] += (c.d[p] >= 0.0f);
+                insidePerPlane[p] += (c.d.f[p] >= 0.0f);
             }
         }
 
@@ -641,7 +644,7 @@ void GatherPolyTriangles(const mod::ModelPoly & poly, const tex::Texture & textu
             }
             for (const ClipVertex & c : corners)
             {
-                EmitScratchVertex(c.pos, c.st);
+                EmitScratchVertex(c);
             }
             continue;
         }
@@ -678,9 +681,9 @@ void GatherPolyTriangles(const mod::ModelPoly & poly, const tex::Texture & textu
         }
         for (int v = 1; v < count - 1; ++v)
         {
-            EmitScratchVertex(in[0].pos,     in[0].st);
-            EmitScratchVertex(in[v].pos,     in[v].st);
-            EmitScratchVertex(in[v + 1].pos, in[v + 1].st);
+            EmitScratchVertex(in[0]);
+            EmitScratchVertex(in[v]);
+            EmitScratchVertex(in[v + 1]);
         }
         s_drawStats.trisDrawn += count - 2;
     }

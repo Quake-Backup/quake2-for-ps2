@@ -51,34 +51,6 @@ Mat4 operator*(const Mat4 & a, const Mat4 & b)
     return result;
 }
 
-Vec4 Transform(const Vec4 & v, const Mat4 & m)
-{
-    Vec4 result;
-    asm volatile (
-        "lqc2    $vf4, 0x00(%1)     \n\t" // vf4-vf7 = rows of m
-        "lqc2    $vf5, 0x10(%1)     \n\t"
-        "lqc2    $vf6, 0x20(%1)     \n\t"
-        "lqc2    $vf7, 0x30(%1)     \n\t"
-        "lqc2    $vf8, 0x00(%2)     \n\t" // vf8 = v
-        "vmulax  $ACC, $vf4, $vf8   \n\t" // result = v.x*row0 + v.y*row1 + v.z*row2 + v.w*row3
-        "vmadday $ACC, $vf5, $vf8   \n\t"
-        "vmaddaz $ACC, $vf6, $vf8   \n\t"
-        "vmaddw  $vf9, $vf7, $vf8   \n\t"
-        "sqc2    $vf9, 0x00(%0)     \n\t"
-        : : "r" (&result), "r" (&m), "r" (&v)
-        : "memory"
-    );
-    return result;
-}
-
-Mat4 Identity()
-{
-    return {{ { 1.0f, 0.0f, 0.0f, 0.0f },
-              { 0.0f, 1.0f, 0.0f, 0.0f },
-              { 0.0f, 0.0f, 1.0f, 0.0f },
-              { 0.0f, 0.0f, 0.0f, 1.0f } }};
-}
-
 Mat4 Translation(float x, float y, float z)
 {
     Mat4 result = Identity();
