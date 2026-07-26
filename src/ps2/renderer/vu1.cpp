@@ -92,12 +92,12 @@ constexpr u64 kVertexRegList = (u64(GIF_REG_ST)   << 0) |
                                (u64(GIF_REG_XYZ2) << 8);
 
 // Guard band: the clip judgement multiplies x/y by this before clipw tests
-// them against |w|, so triangles survive out to |ndc| = 0.8 - about 5x the
-// half-screen (the visible screen ends at ndc 640/4096 = 0.15) while staying
-// inside the representable 12.4 coordinate range. The GS scissor does the
-// actual on-screen cut; only triangles beyond the band (or crossing the
-// near/far planes, z scale 1) are dropped whole via the ADC bit.
-constexpr float kGuardBandScale = 1.25f;
+// them against |w|, so triangles survive out to |ndc| = kGuardBandNdcLimit -
+// about 5x the half-screen (the visible screen ends at ndc 640/4096 = 0.15)
+// while staying inside the representable 12.4 coordinate range. The GS
+// scissor does the actual on-screen cut; only triangles beyond the band (or
+// crossing the near/far planes, z scale 1) are dropped whole via the ADC bit.
+constexpr float kGuardBandScale = 1.0f / kGuardBandNdcLimit;
 
 // Unpacked to kFrameConstantsAddr before every batch. Static so the DMA REF
 // source stays valid; rebuilt per draw.

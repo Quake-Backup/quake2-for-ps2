@@ -90,6 +90,10 @@ constexpr int kScratchMaxVerts = 3072; // whole triangles (3 * 1024); 96 KB
 alignas(16) static vu1::DrawVertex s_scratchVerts[kScratchMaxVerts];
 static int s_scratchVertCount = 0;
 
+// Performance counters for the frame, reset by RenderFrame and read through
+// GetDrawStats() by the ps2_show_drawstats overlay.
+static DrawStats s_drawStats = {};
+
 // ------------------------------------------------------------------------------------------------
 // Frame setup: camera matrices and frustum
 // ------------------------------------------------------------------------------------------------
@@ -132,6 +136,7 @@ bool ShouldCullBBox(float * mins, float * maxs)
     {
         if (BOX_ON_PLANE_SIDE(mins, maxs, &plane) == 2)
         {
+            ++s_drawStats.boxesCulled;
             return true;
         }
     }
@@ -377,6 +382,8 @@ void RecursiveWorldNode(const refdef_t & viewDef, const mod::ModelInstance & wor
         return; // Entirely outside the view frustum.
     }
 
+    ++s_drawStats.nodesWalked;
+
     // Leaf: stamp its surfaces as drawable this frame.
     if (node->contents != -1)
     {
@@ -449,10 +456,12 @@ void RecursiveWorldNode(const refdef_t & viewDef, const mod::ModelInstance & wor
             // Translucent/warped: kept for a later back-to-front alpha pass.
             surf->textureChain = s_alphaSurfaces;
             s_alphaSurfaces = surf;
+            ++s_drawStats.surfacesAlpha;
             continue;
         }
 
         // Opaque: thread onto its texture's draw chain.
+        ++s_drawStats.surfaces;
         const tex::Texture * texture = TextureAnimation(surf->texInfo);
         if (texture->textureChain == nullptr)
         {
@@ -477,12 +486,88 @@ void FlushScratch(const tex::Texture & texture)
 {
     if (s_scratchVertCount > 0)
     {
+        ++s_drawStats.drawBatches;
         vu1::DrawTriangles(s_viewProjMatrix, texture, s_scratchVerts, s_scratchVertCount);
         s_scratchVertCount = 0;
     }
 }
 
-// Appends a polygon's triangles to the scratch buffer, flushing when full.
+// ------------------------------------------------------------------------------------------------
+// Triangle clipping against the VU clip volume
+//
+// The VU microprogram does not clip: a triangle with any vertex outside its
+// clip volume is rejected whole (ADC bit), so world triangles must be
+// pre-clipped here on the EE against all six planes the VU judges - near and
+// far (z is judged exactly), and the four guard-band side planes. The sides
+// matter just as much as near: a floor polygon clipped at the near plane
+// right under the camera lands at tiny w and enormous |x/w|, far outside any
+// band the GS 12.4 coordinates could hold. Clipping runs in clip space - a
+// vertex is inside while w-z >= 0 (near; also excludes everything behind the
+// camera), w+z >= 0 (far), and G*w +/- x/y >= 0 (sides, G = the VU guard-band
+// limit) - and world position/UVs are interpolated directly, both linear
+// under a plane cut. Whole-triangle-inside is the common case and skips it.
+// ------------------------------------------------------------------------------------------------
+
+constexpr int kNumClipPlanes = 6;
+
+// Clip a hair early so the VU's judgement never flags a vertex this clipper
+// just placed on the boundary (clip-space units, i.e. ~world units here).
+constexpr float kClipEpsilon = 0.01f;
+
+struct ClipVertex
+{
+    float pos[3];             // world position
+    float st[2];              // diffuse texture coords
+    float d[kNumClipPlanes];  // signed plane distances; >= 0 is inside
+};
+
+// Sutherland-Hodgman pass of a convex polygon against one plane. 'out' must
+// hold inCount + 1 vertexes. Returns the clipped vertex count.
+int ClipAgainstPlane(const ClipVertex * in, const int inCount, ClipVertex * out, const int plane)
+{
+    int outCount = 0;
+    for (int i = 0; i < inCount; ++i)
+    {
+        const ClipVertex & a = in[i];
+        const ClipVertex & b = in[(i + 1 == inCount) ? 0 : i + 1];
+
+        if (a.d[plane] >= 0.0f)
+        {
+            out[outCount++] = a;
+        }
+        if ((a.d[plane] >= 0.0f) != (b.d[plane] >= 0.0f)) // Edge crosses the plane.
+        {
+            const float t = a.d[plane] / (a.d[plane] - b.d[plane]);
+            ClipVertex & o = out[outCount++];
+            o.pos[0] = a.pos[0] + t * (b.pos[0] - a.pos[0]);
+            o.pos[1] = a.pos[1] + t * (b.pos[1] - a.pos[1]);
+            o.pos[2] = a.pos[2] + t * (b.pos[2] - a.pos[2]);
+            o.st[0]  = a.st[0]  + t * (b.st[0]  - a.st[0]);
+            o.st[1]  = a.st[1]  + t * (b.st[1]  - a.st[1]);
+            for (int p = 0; p < kNumClipPlanes; ++p)
+            {
+                o.d[p] = a.d[p] + t * (b.d[p] - a.d[p]);
+            }
+        }
+    }
+    return outCount;
+}
+
+void EmitScratchVertex(const float pos[3], const float st[2])
+{
+    vu1::DrawVertex & dst = s_scratchVerts[s_scratchVertCount++];
+    dst.x    = pos[0];
+    dst.y    = pos[1];
+    dst.z    = pos[2];
+    dst.w    = 1.0f;
+    dst.rgba = kFullBright;
+    dst.s    = st[0];
+    dst.t    = st[1];
+    dst.q    = 1.0f;
+}
+
+// Appends a polygon's triangles to the scratch buffer, clipping the ones that
+// cross the VU clip volume and flushing when full.
 void GatherPolyTriangles(const mod::ModelPoly & poly, const tex::Texture & texture)
 {
     const int numTriangles = poly.numVerts - 2;
@@ -497,25 +582,107 @@ void GatherPolyTriangles(const mod::ModelPoly & poly, const tex::Texture & textu
             continue;
         }
 
-        if (s_scratchVertCount + 3 > kScratchMaxVerts)
-        {
-            FlushScratch(texture);
-        }
-
+        // Clip-space plane distances of the three corners (positions are
+        // world space, w = 1, so the transform is three full row dots).
+        ClipVertex corners[3];
+        int insidePerPlane[kNumClipPlanes] = {};
         for (int v = 0; v < 3; ++v)
         {
             const mod::PolyVertex & src = poly.vertexes[tri.vertexes[v]];
-            vu1::DrawVertex & dst = s_scratchVerts[s_scratchVertCount++];
+            ClipVertex & c = corners[v];
 
-            dst.x    = src.position.x;
-            dst.y    = src.position.y;
-            dst.z    = src.position.z;
-            dst.w    = 1.0f;
-            dst.rgba = kFullBright;
-            dst.s    = src.texture_s;
-            dst.t    = src.texture_t;
-            dst.q    = 1.0f;
+            c.pos[0] = src.position.x;
+            c.pos[1] = src.position.y;
+            c.pos[2] = src.position.z;
+            c.st[0]  = src.texture_s;
+            c.st[1]  = src.texture_t;
+
+            const float (&m)[4][4] = s_viewProjMatrix.m;
+            const float xc = c.pos[0] * m[0][0] + c.pos[1] * m[1][0] + c.pos[2] * m[2][0] + m[3][0];
+            const float yc = c.pos[0] * m[0][1] + c.pos[1] * m[1][1] + c.pos[2] * m[2][1] + m[3][1];
+            const float zc = c.pos[0] * m[0][2] + c.pos[1] * m[1][2] + c.pos[2] * m[2][2] + m[3][2];
+            const float wc = c.pos[0] * m[0][3] + c.pos[1] * m[1][3] + c.pos[2] * m[2][3] + m[3][3];
+
+            const float gw = vu1::kGuardBandNdcLimit * wc;
+            c.d[0] = (wc - zc) - kClipEpsilon; // near (and behind-camera)
+            c.d[1] = (wc + zc) - kClipEpsilon; // far
+            c.d[2] = (gw - xc) - kClipEpsilon; // guard band sides
+            c.d[3] = (gw + xc) - kClipEpsilon;
+            c.d[4] = (gw - yc) - kClipEpsilon;
+            c.d[5] = (gw + yc) - kClipEpsilon;
+
+            for (int p = 0; p < kNumClipPlanes; ++p)
+            {
+                insidePerPlane[p] += (c.d[p] >= 0.0f);
+            }
         }
+
+        int insideTotal = 0;
+        bool outsideAny = false;
+        for (int p = 0; p < kNumClipPlanes; ++p)
+        {
+            insideTotal += insidePerPlane[p];
+            outsideAny  |= (insidePerPlane[p] == 0);
+        }
+
+        if (outsideAny)
+        {
+            ++s_drawStats.trisCulled;
+            continue; // All three corners outside one plane: entirely out.
+        }
+
+        if (insideTotal == 3 * kNumClipPlanes)
+        {
+            // Whole triangle inside: the common case, no clipping.
+            ++s_drawStats.trisDrawn;
+            if (s_scratchVertCount + 3 > kScratchMaxVerts)
+            {
+                FlushScratch(texture);
+            }
+            for (const ClipVertex & c : corners)
+            {
+                EmitScratchVertex(c.pos, c.st);
+            }
+            continue;
+        }
+
+        // Straddling triangle: clip against every plane in turn. Each pass
+        // can add one vertex (3 -> at most 9); the survivors fan-triangulate.
+        ++s_drawStats.trisClipped;
+        ClipVertex bufferA[3 + kNumClipPlanes];
+        ClipVertex bufferB[3 + kNumClipPlanes];
+
+        const ClipVertex * in = corners;
+        ClipVertex * out = bufferA;
+        int count = 3;
+        for (int p = 0; p < kNumClipPlanes && count >= 3; ++p)
+        {
+            if (insidePerPlane[p] == 3)
+            {
+                continue; // All corners inside this plane: every clipped
+                          // vertex is a convex mix of them, so none can
+                          // cross it either.
+            }
+            count = ClipAgainstPlane(in, count, out, p);
+            in  = out;
+            out = (out == bufferA) ? bufferB : bufferA;
+        }
+        if (count < 3)
+        {
+            continue;
+        }
+
+        if (s_scratchVertCount + (count - 2) * 3 > kScratchMaxVerts)
+        {
+            FlushScratch(texture);
+        }
+        for (int v = 1; v < count - 1; ++v)
+        {
+            EmitScratchVertex(in[0].pos,     in[0].st);
+            EmitScratchVertex(in[v].pos,     in[v].st);
+            EmitScratchVertex(in[v + 1].pos, in[v + 1].st);
+        }
+        s_drawStats.trisDrawn += count - 2;
     }
 }
 
@@ -579,6 +746,8 @@ void RenderWorldModel(const refdef_t & viewDef)
 
 void BeginRegistration()
 {
+    s_drawStats = {};
+
     // New map: forget the previous map's clusters so the first frame re-marks.
     s_viewCluster     = kInvalidCluster;
     s_viewCluster2    = kInvalidCluster;
@@ -586,9 +755,16 @@ void BeginRegistration()
     s_oldViewCluster2 = kInvalidCluster;
 }
 
+const DrawStats & GetDrawStats()
+{
+    return s_drawStats;
+}
+
 void RenderFrame(const refdef_t & viewDef)
 {
     PS2_Assert(viewDef.width > 0 && viewDef.height > 0);
+
+    s_drawStats = {};
 
     SetupFrame(viewDef);
 

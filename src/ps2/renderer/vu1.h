@@ -43,6 +43,15 @@ constexpr u32 PackColorRGBA(u32 r, u32 g, u32 b, u32 a)
     return r | (g << 8) | (b << 16) | (a << 24);
 }
 
+// The NDC guard band the microprogram accepts: a triangle with any vertex at
+// |x/w| or |y/w| beyond this (or outside the exact [-1, +1] z range) is
+// rejected whole, not clipped - bounded by the reach of the GS 12.4 window
+// coordinates, so it cannot simply be raised. Callers submitting geometry
+// that can cross these planes (the world renderer) must pre-clip against
+// them on the EE; the visible screen only spans |ndc| = screenW/4096, so the
+// band still leaves several screens of margin fully to the VU.
+constexpr float kGuardBandNdcLimit = 0.8f;
+
 // Brings up the VIF1 DMA channel, uploads the microprogram to VU1 micro memory
 // and programs the double-buffer registers. Call once, after gs::Init().
 void Init();

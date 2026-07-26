@@ -32,9 +32,10 @@ constexpr int kGlyphSize = 8;
 // Vertex colour applied to textured 2D (GS modulate: 128 = texels unchanged).
 constexpr u8 kUiBrightness = 128;
 
-static const cvar_t * s_showFpsCount = nullptr;
-static const cvar_t * s_showMemStats = nullptr;
+static const cvar_t * s_showFpsCount  = nullptr;
+static const cvar_t * s_showMemStats  = nullptr;
 static const cvar_t * s_showVramStats = nullptr;
+static const cvar_t * s_showDrawStats = nullptr;
 
 // Built-ins used every frame, cached at init to skip the name lookup.
 static const ps2::tex::Texture * s_texConchars = nullptr;
@@ -236,6 +237,53 @@ void DrawVramUsageOverlay()
     DrawInternalString(textX, textY, line);
 }
 
+// 3D draw statistics overlay in the top-left corner: what the last rendered
+// frame's view pass walked, culled, clipped and submitted to VU1.
+void DrawDrawStatsOverlay()
+{
+    if (s_showDrawStats->value == 0.0f)
+    {
+        return;
+    }
+
+    const ps2::view::DrawStats & stats = ps2::view::GetDrawStats();
+
+    const struct { const char * label; int value; } rows[] = {
+        { "Nodes",   stats.nodesWalked   },
+        { "Surfs",   stats.surfaces      },
+        { "Alpha",   stats.surfacesAlpha },
+        { "Tris",    stats.trisDrawn     },
+        { "Clipped", stats.trisClipped   },
+        { "Culled",  stats.trisCulled    },
+        { "Batches", stats.drawBatches   },
+        { "BoxCull", stats.boxesCulled   },
+    };
+
+    constexpr int kLineHeight = kGlyphSize + 2; // Matches DrawInternalString spacing.
+    constexpr int kPanelWidth = 136;
+    constexpr int kPadding    = 4;
+    constexpr int kNumLines   = ps2::ArrayLength(rows) + 1; // Header + one per counter.
+
+    const int panelHeight = (kNumLines * kLineHeight) + (kPadding * 2);
+
+    // A black background to give the text more contrast.
+    ps2::gs::FillRect(0, 0, kPanelWidth, panelHeight, 0, 0, 0, 255);
+
+    const int textX = kPadding;
+    int textY = kPadding;
+
+    DrawInternalString(textX, textY, "DRAW STATS");
+    textY += kLineHeight;
+
+    char line[64];
+    for (const auto & row : rows)
+    {
+        std::snprintf(line, sizeof(line), "%-8s %6d", row.label, row.value);
+        DrawInternalString(textX, textY, line);
+        textY += kLineHeight;
+    }
+}
+
 } // namespace
 
 extern "C" {
@@ -254,9 +302,10 @@ qboolean PS2_RefInit(void * hinstance, void * wndproc)
     ps2::vu1::Init();
     ps2::mod::Init();
 
-    s_showFpsCount = Cvar_Get("ps2_show_fps", "1", 0);
-    s_showMemStats = Cvar_Get("ps2_show_memstats", "1", 0);
+    s_showFpsCount  = Cvar_Get("ps2_show_fps", "1", 0);
+    s_showMemStats  = Cvar_Get("ps2_show_memstats", "1", 0);
     s_showVramStats = Cvar_Get("ps2_show_vramstats", "1", 0);
+    s_showDrawStats = Cvar_Get("ps2_show_drawstats", "1", 0);
 
     s_texConchars = ps2::tex::Find("conchars", ps2::tex::ImageType::Pic);
     s_texBacktile = ps2::tex::Find("backtile", ps2::tex::ImageType::Pic);
@@ -420,6 +469,7 @@ void PS2_EndFrame()
     DrawFpsCounter();
     DrawMemUsageOverlay();
     DrawVramUsageOverlay();
+    DrawDrawStatsOverlay();
 
     ps2::gs::EndFrame();
 }
