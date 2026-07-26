@@ -16,6 +16,8 @@
 #include <tamtypes.h>
 #include <draw_buffers.h> // texbuffer_t
 
+namespace ps2::mod { struct ModelSurface; }
+
 namespace ps2::tex {
 
 // What a texture is used for by the game. Mirrors the image classes of the
@@ -83,6 +85,11 @@ struct Texture final
     TexFilter     magFilter;
     TexFilter     minFilter;
 
+    // Head of this texture's world-surface draw chain. render_view.cpp threads
+    // the frame's visible surfaces here while walking the BSP, then draws each
+    // chain as one batch and resets it to null - it never outlives the frame.
+    mutable const mod::ModelSurface * textureChain;
+
     // Residency is a cache managed by gs/vram: binding a const Texture may
     // upload it (or evict others), so these mutate behind the const API.
     static constexpr auto kNotResident = vram::Address::Invalid;
@@ -94,7 +101,6 @@ struct Texture final
     // Called after rewriting 'pixels' so the next bind refreshes GS VRAM.
     void MarkPixelsDirty() const { dirtyPixels = true; }
 
-    // Later additions for world rendering: scrap-atlas UVs, per-texture surface chain.
     // TODO: Consider texture mipmaps support.
 };
 

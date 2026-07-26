@@ -1,12 +1,11 @@
 /* ================================================================================================
  * File: ref.cpp
  * Brief: The refexport_t implementation - the functions the Quake II client calls
- *        to draw. This pass implements the full 2D overlay path (console, HUD,
- *        menus) - pics, glyphs, tile fills, solid fills and fades - plus
- *        cinematic playback (cinematic.cpp) and the image registration cycle
- *        (textures load from disk on first use and are freed when a level stops
- *        referencing them). The 3D world is stubbed and lands in the next
- *        milestones.
+ *        to draw. Implements the full 2D overlay path (console, HUD, menus) -
+ *        pics, glyphs, tile fills, solid fills and fades - plus cinematic
+ *        playback (cinematic.cpp) and the image/model registration cycle
+ *        (assets load from disk on first use and are freed when a level stops
+ *        referencing them). RenderFrame draws the 3D world geometry (render_view.cpp)
  *
  * This source code is released under the GNU GPL v2 license.
  * ================================================================================================ */
@@ -287,6 +286,7 @@ void PS2_BeginRegistration(const char * mapName)
 {
     ps2::tex::BeginRegistration();
     ps2::mod::BeginRegistration(mapName);
+    ps2::view::BeginRegistration();
 }
 
 void PS2_EndRegistration()

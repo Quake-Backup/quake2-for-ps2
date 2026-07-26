@@ -180,7 +180,7 @@ struct ModelNode
 {
     // common with leaf
     int contents; // -1, to differentiate from leafs
-    int visFrame; // node needs to be traversed if current
+    mutable int visFrame; // node needs to be traversed if current
 
     // for bounding box culling
     float minmaxs[6];
@@ -202,7 +202,7 @@ struct ModelLeaf
 {
     // common with node
     int contents; // will be a negative contents number
-    int visFrame; // node needs to be traversed if current
+    mutable int visFrame; // node needs to be traversed if current
 
     // for bounding box culling
     float minmaxs[6];
@@ -322,5 +322,10 @@ void BeginRegistration(const char * mapName);
 void EndRegistration();
 
 const ModelInstance * Find(const char * name);
+
+// The world map loaded by the last BeginRegistration; null before any map load.
+// NOTE: the view renderer stamps per-frame visibility into the world as it
+// draws (node/leaf/surface visFrame fields, per-texture surface chains).
+const ModelInstance * GetWorldModel();
 
 } // namespace ps2::mod

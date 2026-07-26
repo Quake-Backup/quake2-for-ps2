@@ -359,23 +359,26 @@ Texture & TextureCache::Register(const char * name, const void * pixels, int wid
     const TexFilter filter = (type == ImageType::Pic || type == ImageType::Sprite)
                              ? TexFilter::Nearest : TexFilter::Linear;
 
-    Texture & texture   = m_texturePool.Slot(slot);
-    texture.pixels      = pixels;
-    texture.width       = width;
-    texture.height      = height;
-    texture.vramAddr    = Texture::kNotResident;
-    texture.dirtyPixels = !builtin; // loader-written pixels may still sit in the dcache;
-                                    // the first upload must flush them (built-ins were
-                                    // written by the ELF loader and need no flush).
-    texture.format      = format;
-    texture.components  = components;
-    texture.function    = TexFunction::Modulate;
-    texture.magFilter   = filter;
-    texture.minFilter   = filter;
-    texture.type        = type;
-    texture.flags       = flags;
-    texture.regSequence = m_regSequence;
+    Texture & texture = m_texturePool.Slot(slot);
     std::snprintf(texture.name, sizeof(texture.name), "%s", name);
+
+    texture.regSequence  = m_regSequence;
+    texture.pixels       = pixels;
+    texture.width        = width;
+    texture.height       = height;
+    texture.type         = type;
+    texture.flags        = flags;
+    texture.format       = format;
+    texture.components   = components;
+    texture.function     = TexFunction::Modulate;
+    texture.magFilter    = filter;
+    texture.minFilter    = filter;
+    texture.textureChain = nullptr;
+    texture.vramAddr     = Texture::kNotResident;
+    texture.texbuf       = {};
+    texture.dirtyPixels  = !builtin; // loader-written pixels may still sit in the dcache;
+                                     // the first upload must flush them (built-ins were
+                                     // written by the ELF loader and need no flush).
 
     const auto inserted = m_lookup.emplace(LookupKey(texture.name, texture.type), slot);
     PS2_AssertMsg(inserted.second, "Duplicate texture name+type!");

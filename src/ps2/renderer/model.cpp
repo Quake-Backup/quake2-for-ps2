@@ -51,6 +51,7 @@ public:
     void EndRegistration();
 
     const ModelInstance * Find(const char * name);
+    const ModelInstance * WorldModel() { return m_worldModel; }
 
 private:
     const ModelInstance * LoadModel(const char * name);
@@ -402,6 +403,11 @@ void EndRegistration()
 const ModelInstance * Find(const char * name)
 {
     return s_cache.Find(name);
+}
+
+const ModelInstance * GetWorldModel()
+{
+    return s_cache.WorldModel();
 }
 
 } // namespace ps2::mod
