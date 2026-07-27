@@ -109,7 +109,7 @@ void Sys_UnloadGame()
 
 void Sys_ConsoleOutput(const char * string)
 {
-    std::fputs(string, stdout);
+    std::printf("[Q2] %s", string);
 }
 
 char * Sys_ConsoleInput()

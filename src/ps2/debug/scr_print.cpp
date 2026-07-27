@@ -297,7 +297,7 @@ void ScrPrintf(const char * format, ...)
     }
 
     // Echo to stdout and flush.
-    puts(s_tempbuff);
+    printf("[Q2] %s", s_tempbuff);
     fflush(stdout);
 
     for (int i = 0; i < bufsz; ++i)
