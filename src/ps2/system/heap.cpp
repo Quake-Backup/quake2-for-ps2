@@ -13,6 +13,10 @@
 #include <new>
 #include <cstdio>  // snprintf
 #include <cstring> // memset
+#include <cstdint> // uintptr_t
+#include <unistd.h> // sbrk
+
+#include <kernel.h> // EndOfHeap, GetMemorySize
 
 // dlmalloc
 #pragma GCC diagnostic push
@@ -137,6 +141,47 @@ void PS2_TagsAddMem(PS2MemTag tag, size_t sizeBytes)
     s_memTagCounts[MemTagToIndex(tag)].totalBytes += sizeBytes;
 }
 
+size_t PS2_GetTotalMemBytes()
+{
+    // GetMemorySize() is an EE kernel syscall returning the installed RAM in
+    // bytes. Retail consoles answer 32MB; fall back to that if it ever fails.
+    const s32 memSize = GetMemorySize();
+    return (memSize > 0) ? static_cast<size_t>(memSize) : (32u * 1024u * 1024u);
+}
+
+size_t PS2_GetAvailableMemBytes()
+{
+    // sbrk(0) hands back the current program break without moving it. crt0 hands
+    // the kernel [_end, all remaining RAM) via SetupHeap, so the break starts at
+    // _end (just past our bss) and only ever grows - and since dlmalloc.c routes
+    // every allocator in the link through dlmalloc, dlmalloc is the sole caller
+    // of sbrk. The gap up to EndOfHeap() is therefore exactly the RAM nothing has
+    // claimed yet. Note this is *unclaimed* memory: blocks dlmalloc has already
+    // sbrk'd and since freed sit in its free lists and do not show up here.
+    const std::uintptr_t brk = reinterpret_cast<std::uintptr_t>(sbrk(0));
+    const std::uintptr_t top = reinterpret_cast<std::uintptr_t>(EndOfHeap());
+
+    if (brk == 0u || brk == ~static_cast<std::uintptr_t>(0) || top <= brk)
+    {
+        return 0u; // sbrk failed, or the heap is exhausted
+    }
+    return static_cast<size_t>(top - brk);
+}
+
+void PS2_TagsAddSystemMem()
+{
+    const size_t totalBytes = PS2_GetTotalMemBytes();
+    const size_t availBytes = PS2_GetAvailableMemBytes();
+
+    // Everything the game will never get to allocate: the first megabyte of RAM
+    // reserved for the EE kernel, our ELF image (text/data/bss), and the stack
+    // the kernel carved out above the heap ceiling.
+    if (totalBytes > availBytes)
+    {
+        PS2_TagsAddMem(MEMTAG_MISC, totalBytes - availBytes);
+    }
+}
+
 const char * PS2_FormatMemoryUnit(size_t memorySizeInBytes, int abbreviated)
 {
     static char s_str[64];
@@ -201,6 +246,7 @@ const char * PS2_DumpMemTags()
     }
 
     ptr += std::sprintf(ptr, "\nTOTAL MEM: %s\n", PS2_FormatMemoryUnit(memTotal, true));
+    ptr += std::sprintf(ptr, "FREE MEM (sbrk):  %s\n", PS2_FormatMemoryUnit(PS2_GetAvailableMemBytes(), true));
     ptr += std::sprintf(ptr, "--------------------------- MEMTAGS ---------------------------");
 
     s_memTagsDumpBuff[sizeof(s_memTagsDumpBuff) - 1] = '\0';

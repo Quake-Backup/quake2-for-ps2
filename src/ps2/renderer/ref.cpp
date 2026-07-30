@@ -152,7 +152,7 @@ void DrawMemUsageOverlay()
     }
 
     constexpr int kLineHeight = kGlyphSize + 2;   // Matches DrawInternalString spacing.
-    constexpr int kNumLines   = MEMTAG_COUNT + 2; // Header + one per tag + total.
+    constexpr int kNumLines   = MEMTAG_COUNT + 3; // Header + one per tag + total + sbrk left.
     constexpr int kPanelWidth = 176;
     constexpr int kPadding    = 4;
 
@@ -188,6 +188,7 @@ void DrawMemUsageOverlay()
     }
 
     std::snprintf(line, sizeof(line), "%-10s %s", "Total", PS2_FormatMemoryUnit(totalBytes, true));
+    std::snprintf(line, sizeof(line), "%-10s %s", "Sbrk Left", PS2_FormatMemoryUnit(PS2_GetAvailableMemBytes(), true));
     DrawInternalString(textX, textY, line);
 }
 

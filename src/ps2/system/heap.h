@@ -34,6 +34,18 @@ void * PS2_MemAllocAligned(size_t alignment, size_t sizeBytes, PS2MemTag tag);
 void PS2_MemFree(void * ptr, size_t sizeBytes, PS2MemTag tag);
 void PS2_TagsAddMem(PS2MemTag tag, size_t sizeBytes);
 
+// Total EE RAM as reported by the kernel (32MB on a retail console).
+size_t PS2_GetTotalMemBytes();
+
+// EE RAM still available to the program right now: the gap between the current
+// program break and the ceiling the kernel set up for the heap.
+size_t PS2_GetAvailableMemBytes();
+
+// Books the RAM that the game can never allocate - EE kernel, the loaded ELF
+// image (text/data/bss), the thread stack - into MEMTAG_MISC. Call once, as
+// early as possible in main().
+void PS2_TagsAddSystemMem();
+
 // Formatter for printing the memory tags.
 const char * PS2_FormatMemoryUnit(size_t memorySizeInBytes, int abbreviated);
 
