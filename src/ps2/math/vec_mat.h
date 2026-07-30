@@ -13,6 +13,9 @@
 #include "ps2/math/math.h"
 #include <tamtypes.h>
 
+#define bits_to_u32(x) __builtin_bit_cast(u32,   (x))
+#define bits_to_f32(x) __builtin_bit_cast(float, (x))
+
 namespace ps2::math {
 
 // ------------------------------------------------------------------------------------------------
@@ -248,9 +251,7 @@ inline Vec3 Lerp(const Vec3 & a, const Vec3 & b, float t)
         : "=&r" (rx), "=&r" (ry), "=&r" (rz)
         : "r" (&a), "r" (&b), "f" (t), "m" (a), "m" (b)
     );
-    return { __builtin_bit_cast(float, rx),
-             __builtin_bit_cast(float, ry),
-             __builtin_bit_cast(float, rz) };
+    return { bits_to_f32(rx), bits_to_f32(ry), bits_to_f32(rz) };
 }
 
 } // namespace ps2::math

@@ -38,18 +38,23 @@ constexpr int ArrayLength(const T (&)[N])
 
 // Helper assert macros that display the error on screen and halt.
 // Prefer these over standard assert().
-#define PS2_Assert(cond)                               \
-    do {                                               \
-        if (!(cond))                                   \
-        {                                              \
-            Sys_Error("Assert Failed: %s", #cond);     \
-        }                                              \
-    } while (0)
+#if PS2_QUAKE_ASSERTS
+    #define PS2_Assert(cond)                               \
+        do {                                               \
+            if (!(cond))                                   \
+            {                                              \
+                Sys_Error("Assert Failed: %s", #cond);     \
+            }                                              \
+        } while (0)
 
-#define PS2_AssertMsg(cond, message)                   \
-    do {                                               \
-        if (!(cond))                                   \
-        {                                              \
-            Sys_Error("Assert Failed: %s", (message)); \
-        }                                              \
-    } while (0)
+    #define PS2_AssertMsg(cond, message)                   \
+        do {                                               \
+            if (!(cond))                                   \
+            {                                              \
+                Sys_Error("Assert Failed: %s", (message)); \
+            }                                              \
+        } while (0)
+#else // PS2_QUAKE_ASSERTS
+    #define PS2_Assert(cond)             (void)sizeof(cond)
+    #define PS2_AssertMsg(cond, message) (void)sizeof(cond)
+#endif // PS2_QUAKE_ASSERTS

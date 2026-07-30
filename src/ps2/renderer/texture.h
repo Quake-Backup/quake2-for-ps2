@@ -115,6 +115,19 @@ int GsFunction(TexFunction function);
 int GsMagFilter(TexFilter filter);
 int GsMinFilter(TexFilter filter);
 
+// Converts image-normalized texture coordinates - 0..1 spanning the image,
+// which is what Quake's MD2 glcmds store - into the GS's normalized ST space.
+// The two are not the same thing: normalized ST spans the TEX0 TW/TH extent,
+// the image size rounded UP to a power of two, so for the non-power-of-two
+// images Quake is full of (a 276x194 model skin samples as 512x256) ST = 1.0
+// lands well past the last real texel. Multiply by these to hit the image's
+// true right/bottom edge; both come back 1.0 for power-of-two images.
+//
+// Only valid for coordinates that stay within [0, 1]. A tiling texture still
+// wraps at the power-of-two extent, so non-power-of-two world textures need
+// resampling on load, not a coordinate scale.
+void StScaleFor(const Texture & texture, float * outScaleS, float * outScaleT);
+
 // Registers the built-in images (they stream into GS VRAM on first bind).
 // Call once, after gs::Init().
 void Init();
@@ -143,11 +156,11 @@ const Texture * Find(const char * name, ImageType type);
 void TouchTexture(const Texture & texture);
 
 // Number of built-in debug checkerboard variants (distinct colors).
-constexpr int kNumDebugTextures = 6;
+constexpr int kNumDebugTextures = PS2_QUAKE_DEBUG ? 6 : 1;
 
 // Checkerboard stand-ins ("pics/debug0..5.pcx"). Variant 0 is the pink/black
 // checker drawn wherever an image is missing; the others give test scenes
 // several distinct textures to exercise VRAM streaming.
-const Texture & DebugTexture(int index = 0);
+const Texture & DebugTexture(int variant = 0);
 
 } // namespace ps2::tex

@@ -7,6 +7,7 @@
  * This source code is released under the GNU GPL v2 license.
  * ================================================================================================ */
 
+#if PS2_QUAKE_DEBUG
 namespace ps2::test {
 
 // Runs one frame of the cinematic playback test. Call every frame inside the
@@ -15,3 +16,4 @@ namespace ps2::test {
 void RunCinematics();
 
 } // namespace ps2::test
+#endif // PS2_QUAKE_DEBUG

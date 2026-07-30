@@ -47,6 +47,7 @@ PS2_CXX_SRC =                         \
 	ps2/renderer/model_load.cpp       \
 	ps2/renderer/cinematic.cpp        \
 	ps2/renderer/render_view.cpp      \
+	ps2/renderer/render_md2.cpp       \
 	ps2/renderer/vid.cpp              \
 	ps2/renderer/ref.cpp              \
 	ps2/renderer/vu1.cpp              \
@@ -102,7 +103,7 @@ CXX_OBJS = $(addprefix $(OUTPUT_DIR)/$(SRC_DIR)/, $(CXX_SRC:.cpp=.o))
 # Each .vcl assembles into .vudata with <name>_CodeStart/_CodeEnd link symbols
 # (see PS2_DECLARE_VU_MICROPROGRAM in ps2/renderer/vu1.h).
 VCL_PATH  = $(SRC_DIR)/ps2/renderer/vu1progs
-VCL_FILES = textured_triangles.vcl
+VCL_FILES = textured_triangles.vcl lerped_triangles.vcl
 VU_OBJS   = $(addprefix $(OUTPUT_DIR)/vu/, $(VCL_FILES:.vcl=.o))
 
 # Standalone command line tools under src/tools, built with the HOST compiler
@@ -125,9 +126,9 @@ DEPS    = $(C_OBJS:.o=.d) $(CXX_OBJS:.o=.d)
 #  Compiler / linker flags (appended to the SDK defaults from Makefile.eeglobal)
 # ----------------------------------------------------------------------------
 
-# TODO: Define a debug and a release (optimized) target. Release should disable asserts.
+# TODO: Define a debug and a release (optimized) target. Release should disable asserts and strip the elf.
 
-COMMON_DEFS = -DGAME_HARD_LINKED -DPS2_QUAKE
+COMMON_DEFS = -DGAME_HARD_LINKED -DPS2_QUAKE -DPS2_QUAKE_DEBUG=1 -DPS2_QUAKE_ASSERTS=1
 
 EE_INCS += -I$(SRC_DIR)
 

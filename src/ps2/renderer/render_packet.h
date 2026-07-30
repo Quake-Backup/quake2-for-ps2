@@ -16,6 +16,7 @@
 #include <draw2d.h>
 #include <draw_buffers.h>
 #include <draw_sampling.h>
+#include <gif_tags.h>
 #include <packet.h>
 
 namespace ps2::gs {
@@ -93,6 +94,17 @@ public:
     void Clear(int context, float x, float y, float width, float height, int r, int g, int b)
     {
         m_ptr = draw_clear(m_ptr, context, x, y, width, height, r, g, b);
+    }
+
+    // Writes one GS register directly, as a GIF tag + A+D data pair. For the
+    // rare register the draw_* helpers leave untouched (e.g. re-arming ZBUF's
+    // write mask, which draw_enable/disable_tests never program).
+    void SetRegister(u64 reg, u64 data)
+    {
+        PACK_GIFTAG(m_ptr, GIF_SET_TAG(1, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+        ++m_ptr;
+        PACK_GIFTAG(m_ptr, data, reg);
+        ++m_ptr;
     }
 
     void RectFilled(int context, rect_t & rect)

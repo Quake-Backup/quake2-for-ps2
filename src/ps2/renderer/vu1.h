@@ -17,10 +17,12 @@ namespace ps2::vu1 {
 
 // Declares the linker symbols bracketing an assembled VU microprogram in the
 // ELF's .vudata section. 'progName' must match the #vuprog name in the .vcl.
+// The instruction count is in 64-bit VU instructions - the unit MPG upload
+// destinations and MSCAL entry points use - NOT qwords (half as many).
 #define PS2_DECLARE_VU_MICROPROGRAM(progName) \
     extern "C" u32 progName##_CodeStart __attribute__((section(".vudata"))); \
     extern "C" u32 progName##_CodeEnd   __attribute__((section(".vudata"))); \
-    inline u32 progName##_InstructionQwordCount() { return u32((&progName##_CodeEnd - &progName##_CodeStart) / 2); } \
+    inline u32 progName##_InstructionCount() { return u32((&progName##_CodeEnd - &progName##_CodeStart) / 2); } \
     inline ps2::vu1::VUCode progName##_Code() { return { &progName##_CodeStart, &progName##_CodeEnd }; }
 
 // One triangle vertex, 2 qwords, matching the microprogram's input layout.
@@ -52,7 +54,39 @@ constexpr u32 PackColorRGBA(u32 r, u32 g, u32 b, u32 a)
 // band still leaves several screens of margin fully to the VU.
 constexpr float kGuardBandNdcLimit = 0.8f;
 
-// Brings up the VIF1 DMA channel, uploads the microprogram to VU1 micro memory
+// Optional batch draw flags (OR-able). Blended batches combine with the
+// framebuffer through the A+D block's source-alpha blend and mask their
+// depth writes - the z-test still reads, so they sort against opaque
+// geometry but never occlude. Untextured batches draw pure gouraud colour
+// (the texture argument is still bound, just not sampled).
+enum class DrawFlags : u32
+{
+    None       = 0,
+    Blended    = 1 << 0,
+    Untextured = 1 << 1,
+};
+
+constexpr DrawFlags operator|(DrawFlags a, DrawFlags b)
+{
+    return static_cast<DrawFlags>(static_cast<u32>(a) | static_cast<u32>(b));
+}
+
+constexpr bool HasDrawFlag(DrawFlags flags, DrawFlags test)
+{
+    return (static_cast<u32>(flags) & static_cast<u32>(test)) != 0;
+}
+
+// Backface culling mode for DrawLerpedTriangles: which sign of a triangle's
+// screen-space signed area gets rejected on the VU. Which of the two is
+// facing away depends on the winding and the projection's Y orientation.
+enum class FaceCull : u32
+{
+    None     = 0,
+    Negative = 1,
+    Positive = 2,
+};
+
+// Brings up the VIF1 DMA channel, uploads the microprograms to VU1 micro memory
 // and programs the double-buffer registers. Call once, after gs::Init().
 void Init();
 
@@ -64,6 +98,46 @@ void Init();
 // the GS has consumed the batch, so the vertex data only needs to stay valid
 // for the duration of the call. Call between gs::Begin/EndFrame.
 void DrawTriangles(const math::Mat4 & mvp, const tex::Texture & texture,
-                   const DrawVertex * verts, int vertCount);
+                   const DrawVertex * verts, int vertCount,
+                   DrawFlags flags = DrawFlags::None);
+
+// ------------------------------------------------------------------------------------------------
+// Keyframe-lerped triangles (MD2 alias models)
+// ------------------------------------------------------------------------------------------------
+
+// The two keyframes' quantized positions of one vertex, interleaved: the
+// current frame's dtrivertx_t bytes, then the old frame's, both copied
+// verbatim from the MD2 frame data (the VIF widens each byte into an integer
+// lane; the microprogram converts and lerps them). The 4th byte of each word
+// is that frame's lightnormalindex, which rides along unread - the EE indexes
+// its color LUT with it instead.
+struct LerpVertexBytes
+{
+    u32 cur;
+    u32 old;
+};
+
+// Per-vertex attributes for DrawLerpedTriangles - everything but the
+// position. One qword, matching the microprogram's input layout; the
+// same packed-color placement rules as DrawVertex apply.
+struct alignas(16) LerpDrawAttrib
+{
+    u32 rgba;      // packed color, use PackColorRGBA()
+    float s, t, q; // texture coords; q must be 1.0f
+};
+static_assert(sizeof(LerpDrawAttrib) == 16, "LerpDrawAttrib must be exactly 1 qword");
+
+// Draws textured triangles whose positions VU1 interpolates from the two
+// keyframe streams: position = cur * frontv + old * backv, plus the MVP's
+// row 3 - fold the MD2 lerp's uniform 'move' translation in there (see
+// render_md2.cpp). Both arrays must be 16-byte aligned, and 'positions'
+// needs one readable element past vertCount when the count is odd: the byte
+// stream is DMA'd in whole qwords and the pad element fills the last one
+// (transferred, never read). Chunking, texture residency and synchronicity
+// as DrawTriangles.
+void DrawLerpedTriangles(const math::Mat4 & mvp, const tex::Texture & texture,
+                         const math::Vec3 & frontv, const math::Vec3 & backv,
+                         const LerpVertexBytes * positions, const LerpDrawAttrib * attribs,
+                         int vertCount, FaceCull faceCull = FaceCull::None, DrawFlags flags = DrawFlags::None);
 
 } // namespace ps2::vu1

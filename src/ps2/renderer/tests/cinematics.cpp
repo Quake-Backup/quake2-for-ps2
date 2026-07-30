@@ -10,6 +10,7 @@
  * This source code is released under the GNU GPL v2 license.
  * ================================================================================================ */
 
+#if PS2_QUAKE_DEBUG
 #include "ps2/common.h"
 #include "ps2/renderer/tests/cinematics.h"
 
@@ -79,3 +80,4 @@ void RunCinematics()
 }
 
 } // namespace ps2::test
+#endif // PS2_QUAKE_DEBUG

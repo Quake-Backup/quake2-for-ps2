@@ -5,6 +5,7 @@
  * This source code is released under the GNU GPL v2 license.
  * ================================================================================================ */
 
+#if PS2_QUAKE_DEBUG
 #include "ps2/common.h"
 #include "ps2/renderer/tests/draw_cube.h"
 #include "ps2/renderer/texture.h"
@@ -53,6 +54,36 @@ constexpr int kMaxTess = 8;
 // DrawTriangles is synchronous a single buffer can serve all six faces in
 // turn, referenced in place by the DMA chain.
 alignas(16) static vu1::DrawVertex s_faceVerts[kMaxTess * kMaxTess * 6];
+
+// For ps2_testcube_vulerp:
+// byte-quantized positions and split-off attributes (face counts are always
+// even - tess^2 * 6 - so the byte stream never needs the odd-count pad).
+alignas(16) static vu1::LerpVertexBytes s_facePosBytes[kMaxTess * kMaxTess * 6];
+alignas(16) static vu1::LerpDrawAttrib  s_faceAttribs[kMaxTess * kMaxTess * 6];
+
+// Requantizes s_faceVerts[0..numVerts) into the byte-position/attribute
+// streams: byte = (coord + H) * 255 / (2H) - the exact inverse of the
+// frontv/backv scale and row-3 offset the vulerp draw sets up. Both
+// keyframes get the same bytes.
+void QuantizeFaceForVuLerp(int numVerts)
+{
+    constexpr float kQuant = 255.0f / (2.0f * kCubeHalfSize);
+
+    for (int v = 0; v < numVerts; ++v)
+    {
+        const vu1::DrawVertex & src = s_faceVerts[v];
+
+        const u32 bx = static_cast<u32>((src.x + kCubeHalfSize) * kQuant + 0.5f);
+        const u32 by = static_cast<u32>((src.y + kCubeHalfSize) * kQuant + 0.5f);
+        const u32 bz = static_cast<u32>((src.z + kCubeHalfSize) * kQuant + 0.5f);
+
+        const u32 packed = bx | (by << 8) | (bz << 16); // 4th byte (the MD2 normal index) unused
+        s_facePosBytes[v].cur = packed;
+        s_facePosBytes[v].old = packed;
+
+        s_faceAttribs[v] = { src.rgba, src.s, src.t, src.q };
+    }
+}
 
 // Emits the vertex at (u, v) in [0,1]^2 of a face: position and color are the
 // bilinear blend of the face's four corners (in winding order), s/t map the
@@ -166,6 +197,37 @@ void DrawRotatingCube()
     static_assert(tex::kNumDebugTextures >= 6, "One variant per cube face");
     static const cvar_t * s_testEviction = Cvar_Get("ps2_testcube_vram_tex_eviction", "0", 0);
 
+    // With ps2_testcube_vulerp on, the faces render through the MD2 keyframe
+    // path instead: positions quantized to MD2-style bytes and decoded back
+    // on VU1, with the decode scale split between the two keyframe streams
+    // (both carry the same bytes, so the split must cancel out) and the
+    // decode offset folded into the MVP's row 3 exactly as render_md2 folds
+    // the lerp's 'move' term. Same cube, give or take 8-bit quantization -
+    // a pixel-comparable smoke test of the V4_8 unpack, the itof0 conversion
+    // and the lerp, with no model data in the loop.
+    static const cvar_t * s_testVuLerp = Cvar_Get("ps2_testcube_vulerp", "0", 0);
+    const bool vuLerp = (s_testVuLerp->value != 0.0f);
+
+    Mat4 mvpLerp = {};
+    Vec3 frontv  = {};
+    Vec3 backv   = {};
+    if (vuLerp)
+    {
+        // A moving split so both streams and the add are exercised; the sum
+        // is constant, so any wobble or shimmer is a lerp-path bug.
+        const float backlerp = 0.5f + 0.5f * Sinf(t);
+        const float decode   = (2.0f * kCubeHalfSize) / 255.0f;
+        frontv = { decode * (1.0f - backlerp), decode * (1.0f - backlerp), decode * (1.0f - backlerp) };
+        backv  = { decode * backlerp, decode * backlerp, decode * backlerp };
+
+        const Vec4 row3 = Transform(Vec4{ -kCubeHalfSize, -kCubeHalfSize, -kCubeHalfSize, 1.0f }, mvp);
+        mvpLerp = mvp;
+        mvpLerp.m[3][0] = row3.x;
+        mvpLerp.m[3][1] = row3.y;
+        mvpLerp.m[3][2] = row3.z;
+        mvpLerp.m[3][3] = row3.w;
+    }
+
     const int tick = Sys_Milliseconds() / 2000;
     for (int face = 0; face < 6; ++face)
     {
@@ -174,8 +236,19 @@ void DrawRotatingCube()
                           : face;
 
         const int numVerts = EmitFace(s_faceVerts, kFaces[face], tess);
-        vu1::DrawTriangles(mvp, tex::DebugTexture(variant), s_faceVerts, numVerts);
+
+        if (vuLerp)
+        {
+            QuantizeFaceForVuLerp(numVerts);
+            vu1::DrawLerpedTriangles(mvpLerp, tex::DebugTexture(variant), frontv, backv,
+                                     s_facePosBytes, s_faceAttribs, numVerts);
+        }
+        else
+        {
+            vu1::DrawTriangles(mvp, tex::DebugTexture(variant), s_faceVerts, numVerts);
+        }
     }
 }
 
 } // namespace ps2::test
+#endif // PS2_QUAKE_DEBUG

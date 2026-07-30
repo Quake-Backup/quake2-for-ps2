@@ -35,6 +35,7 @@
 #include "ps2/builtin/builtin.h" // global_palette
 
 #include <dma.h>
+#include <gs_gp.h>
 #include <gs_psm.h>
 #include <graph.h>
 #include <kernel.h> // SyncDCache
@@ -133,6 +134,12 @@ int CurrentContext()
 int DepthTestMethod()
 {
     return static_cast<int>(s_zbuffer.method);
+}
+
+u64 ZBufData(bool maskDepthWrites)
+{
+    // Note ZBUF wants a word address >> 11, unlike TEX0's >> 6.
+    return GS_SET_ZBUF(s_zbuffer.address >> 11, s_zbuffer.zsm, maskDepthWrites ? 1 : 0);
 }
 
 void SetClearColor(u8 r, u8 g, u8 b)
@@ -247,6 +254,13 @@ void BeginFrame()
 
     draw_disable_blending(); // draw_clear must overwrite, never blend
     clear.DisableTests(s_drawCtx, s_zbuffer);
+
+    // Re-arm depth writes: a blended VU1 batch (ZMSK = 1) may have been this
+    // context's last word on ZBUF two frames ago, and draw_disable_tests only
+    // touches TEST - without this the z=0 sprite would clear color but leave
+    // stale depth behind.
+    clear.SetRegister(static_cast<u64>(GS_REG_ZBUF + s_drawCtx), ZBufData(false));
+
     clear.Clear(s_drawCtx,
                 0.0f, 0.0f,
                 static_cast<float>(kWidth), static_cast<float>(kHeight),
@@ -276,10 +290,12 @@ static void Ensure2D()
     s_currentTex = nullptr; // the TEX0 dedupe state is per 2D batch
 
     // The 2D overlay accumulates here and goes out at the next flush, after any
-    // 3D drawn so far: always-pass z-test so it lands on top.
+    // 3D drawn so far: always-pass z-test so it lands on top. ZBUF is re-armed
+    // too, in case a blended 3D batch (ZMSK = 1) drew before this batch opened.
     RenderPacket & pkt = FramePacket();
     pkt.Reset();
     pkt.DisableTests(s_drawCtx, s_zbuffer);
+    pkt.SetRegister(static_cast<u64>(GS_REG_ZBUF + s_drawCtx), ZBufData(false));
 }
 
 void FlushPending2D()

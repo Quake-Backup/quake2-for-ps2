@@ -56,6 +56,17 @@ int GsMinFilter(TexFilter filter)
     return (filter == TexFilter::Linear) ? LOD_MIN_LINEAR : LOD_MIN_NEAREST;
 }
 
+void StScaleFor(const Texture & texture, float * outScaleS, float * outScaleT)
+{
+    // draw_log2 rounds up, and it is the same call gs.cpp fills TEX0's TW/TH
+    // with - so this stays exact whatever the texture is, resident or not.
+    const int potWidth  = 1 << draw_log2(static_cast<unsigned int>(texture.width));
+    const int potHeight = 1 << draw_log2(static_cast<unsigned int>(texture.height));
+
+    *outScaleS = static_cast<float>(texture.width)  / static_cast<float>(potWidth);
+    *outScaleT = static_cast<float>(texture.height) / static_cast<float>(potHeight);
+}
+
 int BytesPerTexel(PixelFormat format)
 {
     switch (format)
@@ -75,7 +86,7 @@ namespace {
 
 // Cache lookup key: the name hash continued with the image type as one extra
 // FNV-1a byte, so the same file may be cached independently per ImageType.
-constexpr u64 LookupKey(const char * fullname, ImageType type)
+inline u64 LookupKey(const char * fullname, ImageType type)
 {
     u64 hash = HashStr64(fullname);
     hash ^= static_cast<u8>(type);
@@ -127,22 +138,26 @@ constexpr int kCheckerSquares = 4;
 
 const u16 * MakeCheckerPattern(int variant)
 {
-    PS2_Assert(variant >= 0 && variant < kNumDebugTextures);
+    if (variant < 0 || variant >= kNumDebugTextures)
+    {
+        variant = 0;
+    }
 
     constexpr auto Rgb16 = [](u32 r, u32 g, u32 b) -> u16
     {
-        return static_cast<u16>((1u << 15) | ((b >> 3) << 10) |
-                               ((g >> 3) << 5) | (r >> 3));
+        return static_cast<u16>((1u << 15) | ((b >> 3) << 10) | ((g >> 3) << 5) | (r >> 3));
     };
 
     // One bright color per variant, checkered against black.
     constexpr u16 variantColors[kNumDebugTextures] = {
         Rgb16(255, 100, 255), // pink
+#if PS2_QUAKE_DEBUG
         Rgb16(255,  60,  60), // red
         Rgb16( 60, 255,  60), // green
         Rgb16( 80,  80, 255), // blue
         Rgb16(255, 255,  60), // yellow
         Rgb16( 60, 255, 255), // cyan
+#endif // PS2_QUAKE_DEBUG
     };
     const u16 colors[2] = { variantColors[variant], Rgb16(0, 0, 0) };
 
@@ -169,7 +184,7 @@ class TextureCache final
 public:
     void Init();
     const Texture * Find(const char * name, const ImageType type);
-    const Texture & DebugTexture(int index) const;
+    const Texture & DebugTexture(int variant) const;
 
     void BeginRegistration();
     void EndRegistration();
@@ -332,10 +347,13 @@ void TextureCache::EndRegistration()
     }
 }
 
-const Texture & TextureCache::DebugTexture(int index) const
+const Texture & TextureCache::DebugTexture(int variant) const
 {
-    PS2_Assert(index >= 0 && index < kNumDebugTextures);
-    return *m_debugTextures[index];
+    if (variant < 0 || variant >= kNumDebugTextures)
+    {
+        variant = 0;
+    }
+    return *m_debugTextures[variant];
 }
 
 Texture & TextureCache::Register(const char * name, const void * pixels, int width, int height,
@@ -417,11 +435,13 @@ void TextureCache::Init()
         { "pics/inventory.pcx", inventory_data,        inventory_width, inventory_height, PixelFormat::Palette8, TexComponents::RGB  },
         { "pics/help.pcx",      help_data,             help_width,      help_height,      PixelFormat::Palette8, TexComponents::RGB  },
         { "pics/debug0.pcx",    MakeCheckerPattern(0), kCheckerDim,     kCheckerDim,      PixelFormat::RGB16,    TexComponents::RGB  },
+#if PS2_QUAKE_DEBUG // Extra debug textures for the textured cube test:
         { "pics/debug1.pcx",    MakeCheckerPattern(1), kCheckerDim,     kCheckerDim,      PixelFormat::RGB16,    TexComponents::RGB  },
         { "pics/debug2.pcx",    MakeCheckerPattern(2), kCheckerDim,     kCheckerDim,      PixelFormat::RGB16,    TexComponents::RGB  },
         { "pics/debug3.pcx",    MakeCheckerPattern(3), kCheckerDim,     kCheckerDim,      PixelFormat::RGB16,    TexComponents::RGB  },
         { "pics/debug4.pcx",    MakeCheckerPattern(4), kCheckerDim,     kCheckerDim,      PixelFormat::RGB16,    TexComponents::RGB  },
         { "pics/debug5.pcx",    MakeCheckerPattern(5), kCheckerDim,     kCheckerDim,      PixelFormat::RGB16,    TexComponents::RGB  },
+#endif // PS2_QUAKE_DEBUG
     };
 
     for (const BuiltinImage & builtin : builtins)
@@ -474,9 +494,9 @@ void TouchTexture(const Texture & texture)
     s_cache.MarkReferenced(texture);
 }
 
-const Texture & DebugTexture(int index)
+const Texture & DebugTexture(int variant)
 {
-    return s_cache.DebugTexture(index);
+    return s_cache.DebugTexture(variant);
 }
 
 } // namespace ps2::tex

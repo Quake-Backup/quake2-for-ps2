@@ -33,6 +33,12 @@ int CurrentContext();
 // that program the TEST register themselves (the VU1 3D batches).
 int DepthTestMethod();
 
+// The ZBUF register value for the frame's z-buffer, for paths that program it
+// themselves (the VU1 3D batches). 'maskDepthWrites' sets the ZMSK bit: depth
+// reads still test, but nothing is written - for blended draws that must not
+// occlude (projected shadows, translucent surfaces).
+u64 ZBufData(bool maskDepthWrites);
+
 // GS VRAM word address of the 256-entry global-palette CLUT (Quake's shared
 // 8-bit palette), uploaded once by Init() to a fixed spot outside the texture
 // heap. PixelFormat::Palette8 textures sample through it.

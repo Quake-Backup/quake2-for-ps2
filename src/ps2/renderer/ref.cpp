@@ -18,6 +18,7 @@
 #include "ps2/renderer/texture.h"
 #include "ps2/renderer/cinematic.h"
 #include "ps2/renderer/render_view.h"
+#include "ps2/renderer/render_md2.h"
 #include "ps2/renderer/tests/draw_cube.h"
 #include "ps2/renderer/tests/cinematics.h"
 #include "ps2/builtin/builtin.h"
@@ -257,6 +258,7 @@ void DrawDrawStatsOverlay()
         { "Culled",  stats.trisCulled    },
         { "Batches", stats.drawBatches   },
         { "BoxCull", stats.boxesCulled   },
+        { "Ents",    stats.entities      },
     };
 
     constexpr int kLineHeight = kGlyphSize + 2; // Matches DrawInternalString spacing.
@@ -302,8 +304,8 @@ qboolean PS2_RefInit(void * hinstance, void * wndproc)
     ps2::vu1::Init();
     ps2::mod::Init();
 
-    s_showFpsCount  = Cvar_Get("ps2_show_fps", "1", 0);
-    s_showMemStats  = Cvar_Get("ps2_show_memstats", "1", 0);
+    s_showFpsCount  = Cvar_Get("ps2_show_fps",       "1", 0);
+    s_showMemStats  = Cvar_Get("ps2_show_memstats",  "1", 0);
     s_showVramStats = Cvar_Get("ps2_show_vramstats", "1", 0);
     s_showDrawStats = Cvar_Get("ps2_show_drawstats", "1", 0);
 
@@ -317,6 +319,8 @@ qboolean PS2_RefInit(void * hinstance, void * wndproc)
 
     viddef.width  = ps2::gs::Width();
     viddef.height = ps2::gs::Height();
+
+    ps2::view::InitEntityRendering();
 
     Com_Printf("PS2 refresh initialised: %dx%d\n", viddef.width, viddef.height);
     return true;
@@ -455,6 +459,7 @@ void PS2_BeginFrame(float cameraSeparation)
 
 void PS2_EndFrame()
 {
+#if PS2_QUAKE_DEBUG
     // Cinematic playback test: the movie quad is a 2D draw, run at frame's end
     // so it lands over the fullscreen console but under the FPS counter. Enable
     // with cvar "ps2_testcin 1".
@@ -465,6 +470,7 @@ void PS2_EndFrame()
     // fullscreen console Quake forces while disconnected (its batch programs
     // its own z-test). gs::EndFrame() then sends any remaining 2D and flips.
     ps2::test::DrawRotatingCube();
+#endif // PS2_QUAKE_DEBUG
 
     DrawFpsCounter();
     DrawMemUsageOverlay();

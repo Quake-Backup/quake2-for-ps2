@@ -7,6 +7,7 @@
  * This source code is released under the GNU GPL v2 license.
  * ================================================================================================ */
 
+#if PS2_QUAKE_DEBUG
 namespace ps2::test {
 
 // Draws the 3D test cube for the current frame (a 3D draw, so it flushes any pending 2D
@@ -15,3 +16,4 @@ namespace ps2::test {
 void DrawRotatingCube();
 
 } // namespace ps2::test
+#endif // PS2_QUAKE_DEBUG

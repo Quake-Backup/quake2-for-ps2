@@ -22,10 +22,12 @@
  *      8-999  the two XTOP double buffers (VIF1 BASE=8, OFFSET=496)
  *
  *  Batch layout inside a double buffer (relative to XTOP): input is one header
- *  qword (vertex count in .w), 5 GIF/AD tag qwords, then 2 qwords per vertex;
+ *  qword (vertex count in .w), 7 GIF/AD tag qwords, then 2 qwords per vertex;
  *  the microprogram builds the GS packet in the same buffer after the input.
- *  The A+D block programs TEST as well as TEX0/TEX1, so a batch draws with the
- *  proper z-test no matter what state the surrounding 2D packets left behind.
+ *  The A+D block programs TEST, ALPHA and ZBUF as well as TEX0/TEX1, so a
+ *  batch draws with the proper z-test, blend function and depth-write mask no
+ *  matter what state the surrounding 2D packets (or an earlier blended batch)
+ *  left behind.
  *
  * This source code is released under the GNU GPL v2 license.
  * ================================================================================================ */
@@ -44,12 +46,13 @@
 namespace ps2::vu1 {
 
 PS2_DECLARE_VU_MICROPROGRAM(VU1Prog_TexturedTriangles);
+PS2_DECLARE_VU_MICROPROGRAM(VU1Prog_LerpedTriangles);
 
 namespace {
 
 // Vertices per VU run: DrawTriangles splits larger draws into chunks of this
-// size. Bounded by the VU double buffer: input (6 + 2n) plus output (5 + 3n)
-// qwords must fit in one 496-qword buffer half, so n <= 97 - and chunks are
+// size. Bounded by the VU double buffer: input (8 + 2n) plus output (7 + 3n)
+// qwords must fit in one 496-qword buffer half, so n <= 96 - and chunks are
 // whole triangles, hence 96.
 constexpr int kMaxVertsPerBatch = 96;
 
@@ -62,8 +65,41 @@ constexpr int kFrameConstantsAddr = 0;
 
 // Batch layout, relative to the current double buffer (XTOP).
 constexpr int kBatchHeaderAddr = 0; // vertex count in .w
-constexpr int kGifTagsAddr     = 1; // 5 qwords: GIF set tag, TEST, TEX1, TEX0, prim tag
-constexpr int kVertexDataAddr  = kGifTagsAddr + 5;
+constexpr int kGifTagsAddr     = 1; // 7 qwords: GIF set tag, TEST/TEX1/TEX0/ALPHA/ZBUF A+D, prim tag
+constexpr int kNumGifTagQwords = 7; // must match the microprograms' tag-copy loops
+constexpr int kVertexDataAddr  = kGifTagsAddr + kNumGifTagQwords;
+
+// ------------------------------------------------------------------------------------------------
+// Lerped-triangles batch layout (must match lerped_triangles.vcl)
+// ------------------------------------------------------------------------------------------------
+
+// Vertices per lerped VU run: the 3-qword-per-vertex batch (2 position
+// qwords + 1 attribute) fits fewer than the world path's 96. Whole
+// triangles, and even - so every full chunk's slice of the 8-byte position
+// stream is whole source qwords starting 16-byte aligned.
+constexpr int kMaxLerpVertsPerBatch = 78;
+
+// The regions sit at fixed offsets sized for the maximum chunk (short
+// chunks leave gaps), so the microprogram addresses them with immediates.
+constexpr int kLerpBatchHeaderAddr = 0; // vertex count in .w
+constexpr int kLerpFrontVAddr      = 1; // current frame scale * (1 - backlerp)
+constexpr int kLerpBackVAddr       = 2; // old frame scale * backlerp
+constexpr int kLerpGifTagsAddr     = 3; // the same 7-qword block as the world path
+constexpr int kLerpPositionsAddr   = kLerpGifTagsAddr + kNumGifTagQwords;              // 2 qwords per vertex
+constexpr int kLerpAttribsAddr     = kLerpPositionsAddr + (2 * kMaxLerpVertsPerBatch); // 1 qword per vertex
+constexpr int kLerpOutputAddr      = kLerpAttribsAddr + kMaxLerpVertsPerBatch;         // the GS packet
+
+static_assert(kLerpFrontVAddr == 1 && kLerpBackVAddr == 2 && kLerpPositionsAddr == 10 &&
+              kLerpAttribsAddr == 166 && kLerpOutputAddr == 244,
+              "Batch layout must match the #defines in lerped_triangles.vcl");
+static_assert(kLerpOutputAddr + kNumGifTagQwords + (3 * kMaxLerpVertsPerBatch) <= kDoubleBufferOffset,
+              "Lerp batch input + GS packet must fit one double-buffer half");
+static_assert((kMaxLerpVertsPerBatch % 3) == 0, "Lerp chunks are whole triangles");
+static_assert((kMaxLerpVertsPerBatch % 2) == 0, "Lerp chunk position slices must be whole qwords");
+
+// Chain footprint of one lerped chunk: header/frontv/backv/tags inline
+// unpack (1 + 10 qwords), two REF unpacks, FLUSH + MSCAL; ~15 in practice.
+constexpr int kLerpChunkChainQwords = 20;
 
 // The chain is tags plus small per-chunk inline unpacks; constants and
 // vertices are referenced in place. Sized so a DrawTriangles call fits ~30
@@ -71,7 +107,7 @@ constexpr int kVertexDataAddr  = kGifTagsAddr + 5;
 constexpr int kDrawPacketQwords = 512;
 
 // Conservative chain footprint of one chunk segment (header/tags inline
-// unpack, vertex REF unpack, FLUSH + MSCAL; ~11 qwords in practice) and of
+// unpack, vertex REF unpack, FLUSH + MSCAL; ~13 qwords in practice) and of
 // the chain tail (trailing FLUSH + END tag). DrawTriangles flushes the packet
 // when the next chunk plus the tail might not fit.
 constexpr int kChunkChainQwords = 16;
@@ -114,10 +150,19 @@ static FrameConstants s_constants;
 static VifPacket s_drawPacket;
 static bool s_initialized = false;
 
+// Micro memory entry point of the lerped-triangles program (64-bit
+// instruction units; the textured program sits at 0). Set by Init().
+static u32 s_lerpedProgAddr = 0;
+static u32 s_texturedTrisProgAddr = 0;
+
+// ------------------------------------------------------------------------------------------------
+// Helper functions
+// ------------------------------------------------------------------------------------------------
+
 // TEX0/TEX1 register qwords for the batch's texture bind, sent A+D over PATH1.
 // Built here rather than with the packet2_utils helpers because those hardcode
 // GS context 0 and this renderer alternates contexts per frame.
-u64 MakeTex0Data(const tex::Texture & texture)
+inline u64 MakeTex0Data(const tex::Texture & texture)
 {
     // Palettized textures sample through the global-palette CLUT; reloading
     // the on-chip CLUT cache on every bind is cheap (1 KB). Everything else
@@ -137,7 +182,7 @@ u64 MakeTex0Data(const tex::Texture & texture)
                        palettized ? CLUT_LOAD : CLUT_NO_LOAD);
 }
 
-u64 MakeTex1Data(const tex::Texture & texture)
+inline u64 MakeTex1Data(const tex::Texture & texture)
 {
     return GS_SET_TEX1(LOD_USE_K, 0,
                        tex::GsMagFilter(texture.magFilter),
@@ -147,18 +192,52 @@ u64 MakeTex1Data(const tex::Texture & texture)
 
 // Pixel tests for the batch: the environment's alpha test plus the real
 // z-test (mirrors libdraw's draw_enable_tests).
-u64 MakeTestData()
+inline u64 MakeTestData()
 {
     return GS_SET_TEST(DRAW_ENABLE, ATEST_METHOD_NOTEQUAL, 0x00, ATEST_KEEP_FRAMEBUFFER,
                        DRAW_DISABLE, DRAW_DISABLE,
                        DRAW_ENABLE, gs::DepthTestMethod());
 }
 
+// Blend function for batches drawn with the PRIM ABE bit on: the standard
+// source-alpha blend (Cs - Cd) * As / 128 + Cd. Opaque batches write it too -
+// deterministic register state, ignored while ABE is off.
+inline u64 MakeAlphaData()
+{
+    return GS_SET_ALPHA(BLEND_COLOR_SOURCE, BLEND_COLOR_DEST,
+                        BLEND_ALPHA_SOURCE, BLEND_COLOR_DEST, 0x80);
+}
+
+// Emits the batch's 7 GIF tag qwords into an open inline unpack: the A+D
+// state block and the drawing tag for 'vertCount' vertices. Blended batches
+// turn the prim's ABE bit on and mask depth writes; untextured ones clear
+// the TME bit (the texture registers are still written, just not sampled).
+void AddBatchGifTags(VifPacket & pkt, const tex::Texture & texture, int ctx,
+                     int vertCount, DrawFlags flags)
+{
+    const bool blended = HasDrawFlag(flags, DrawFlags::Blended);
+    const int  tme     = HasDrawFlag(flags, DrawFlags::Untextured) ? 0 : 1;
+
+    // Five A+D register writes: pixel tests, the texture bind, the blend
+    // function and the depth-write mask for this context...
+    pkt.AddQword(GIF_SET_TAG(5, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+    pkt.AddQword(MakeTestData(), static_cast<u64>(GS_REG_TEST + ctx));
+    pkt.AddQword(MakeTex1Data(texture), static_cast<u64>(GS_REG_TEX1 + ctx));
+    pkt.AddQword(MakeTex0Data(texture), static_cast<u64>(GS_REG_TEX0 + ctx));
+    pkt.AddQword(MakeAlphaData(), static_cast<u64>(GS_REG_ALPHA + ctx));
+    pkt.AddQword(gs::ZBufData(blended), static_cast<u64>(GS_REG_ZBUF + ctx));
+
+    // ...then the drawing tag: gouraud triangle list, STQ mapping, with the
+    // per-vertex registers of kVertexRegList.
+    const u128 prim = VU_GS_PRIM(PRIM_TRIANGLE, 1, tme, 0, blended ? 1 : 0, 0, 0, ctx, 0);
+    pkt.AddQword(VU_GS_GIFTAG(static_cast<u64>(vertCount), 1, 1, prim, 0, 3), kVertexRegList);
+}
+
 // Emits one chunk into the chain: batch header and GIF tags unpacked inline
 // to the current double buffer, the vertex data referenced in place, and the
 // MSCAL that runs the microprogram over it.
 void AddBatchChunk(VifPacket & pkt, const tex::Texture & texture, int ctx,
-                   const DrawVertex * verts, int vertCount)
+                   const DrawVertex * verts, int vertCount, DrawFlags flags)
 {
     PS2_Assert(vertCount > 0 && vertCount <= kMaxVertsPerBatch && (vertCount % 3) == 0);
     pkt.EnsureSpace(kChunkChainQwords + kChainTailQwords);
@@ -170,24 +249,61 @@ void AddBatchChunk(VifPacket & pkt, const tex::Texture & texture, int ctx,
         pkt.AddU32(0);
         pkt.AddU32(static_cast<u32>(vertCount));
 
-        // Three A+D register writes: pixel tests and the texture bind for
-        // this context...
-        pkt.AddQword(GIF_SET_TAG(3, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
-        pkt.AddQword(MakeTestData(), static_cast<u64>(GS_REG_TEST + ctx));
-        pkt.AddQword(MakeTex1Data(texture), static_cast<u64>(GS_REG_TEX1 + ctx));
-        pkt.AddQword(MakeTex0Data(texture), static_cast<u64>(GS_REG_TEX0 + ctx));
-
-        // ...then the drawing tag: gouraud textured triangle list, STQ mapping,
-        // with the per-vertex registers of kVertexRegList.
-        const u128 prim = VU_GS_PRIM(PRIM_TRIANGLE, 1, 1, 0, 0, 0, 0, ctx, 0);
-        pkt.AddQword(VU_GS_GIFTAG(static_cast<u64>(vertCount), 1, 1, prim, 0, 3),
-                     kVertexRegList);
+        AddBatchGifTags(pkt, texture, ctx, vertCount, flags);
     }
     pkt.CloseInlineUnpack();
 
     pkt.AddUnpackData(kVertexDataAddr, verts, static_cast<u32>(vertCount * 2), true);
 
-    pkt.AddStartProgram(0);
+    pkt.AddStartProgram(s_texturedTrisProgAddr);
+}
+
+// The lerped equivalent: header (count + the two lerp scale vectors) and GIF
+// tags inline, then the two vertex streams, then the MSCAL. The byte-position
+// DMA must be whole source qwords, so an odd count transfers one pad vertex
+// the VU never reads (the fixed region has room: odd counts are < the even
+// maximum).
+void AddLerpBatchChunk(VifPacket & pkt, const tex::Texture & texture, int ctx,
+                       const math::Vec3 & frontv, const math::Vec3 & backv,
+                       const LerpVertexBytes * positions, const LerpDrawAttrib * attribs,
+                       int vertCount, FaceCull faceCull, DrawFlags flags)
+{
+    PS2_Assert(vertCount > 0 && vertCount <= kMaxLerpVertsPerBatch && (vertCount % 3) == 0);
+    pkt.EnsureSpace(kLerpChunkChainQwords + kChainTailQwords);
+
+    pkt.OpenInlineUnpack(kLerpBatchHeaderAddr, true);
+    {
+        pkt.AddU32(static_cast<u32>(faceCull)); // backface cull mode in .x
+        pkt.AddU32(0);
+        pkt.AddU32(0);
+        pkt.AddU32(static_cast<u32>(vertCount));
+
+        pkt.AddFloat(frontv.x);
+        pkt.AddFloat(frontv.y);
+        pkt.AddFloat(frontv.z);
+        pkt.AddFloat(0.0f); // .w rides through the lerp; keep it finite
+
+        pkt.AddFloat(backv.x);
+        pkt.AddFloat(backv.y);
+        pkt.AddFloat(backv.z);
+        pkt.AddFloat(0.0f);
+
+        AddBatchGifTags(pkt, texture, ctx, vertCount, flags);
+    }
+    pkt.CloseInlineUnpack();
+
+    // The keyframe bytes: V4_8 elements, one source word and two destination
+    // qwords per vertex, padded to an even vertex count so the transfer is
+    // whole qwords (every word the DMA carries must be unpack payload).
+    const int srcVerts = vertCount + (vertCount & 1);
+    pkt.AddUnpackDataFmt(kLerpPositionsAddr, positions,
+                         static_cast<u32>(srcVerts / 2), // qwords: 8 bytes per vertex
+                         static_cast<u32>(srcVerts * 2), // elements: 2 per vertex
+                         P2_UNPACK_V4_8, true);
+
+    pkt.AddUnpackData(kLerpAttribsAddr, attribs, static_cast<u32>(vertCount), true);
+
+    pkt.AddStartProgram(s_lerpedProgAddr);
 }
 
 // FLUSH so a DMA wait covers the VU runs and their XGKICKs, then terminate
@@ -198,6 +314,21 @@ void SendChainAndWait(VifPacket & pkt)
     pkt.AddEndTag();
     pkt.Send();
     pkt.Wait();
+}
+
+// Rebuilds s_constants for a draw and opens the chain with its unpack to the
+// fixed low VU addresses (shared by both draw paths).
+void BeginDrawChain(VifPacket & pkt, const math::Mat4 & mvp)
+{
+    s_constants.mvp       = mvp;
+    s_constants.gsScale   = { 2048.0f, 2048.0f, kGsDepthScale, 0.0f };
+    s_constants.gsOffset  = { 2048.0f + static_cast<float>(gs::Width())  * 0.5f,
+                              2048.0f + static_cast<float>(gs::Height()) * 0.5f,
+                              kGsDepthScale, 0.0f };
+    s_constants.clipScale = { kGuardBandScale, kGuardBandScale, 1.0f, 0.0f };
+
+    pkt.Reset();
+    pkt.AddUnpackData(kFrameConstantsAddr, &s_constants, sizeof(FrameConstants) / 16, false);
 }
 
 } // namespace
@@ -214,15 +345,24 @@ void Init()
     dma_channel_initialize(DMA_CHANNEL_VIF1, nullptr, 0);
     dma_channel_fast_waits(DMA_CHANNEL_VIF1);
 
-    const auto instructions = VU1Prog_TexturedTriangles_InstructionQwordCount();
-    PS2_AssertMsg(instructions <= 2048, "Microprogram overflows VU1 micro memory!");
+    // Both microprograms stay resident: the textured one at micro address 0,
+    // the lerped one right above it. MPG uploads round an odd instruction
+    // count up to even, so the second base rounds up too.
+    const u32 texturedInstructions = VU1Prog_TexturedTriangles_InstructionCount();
+    const u32 lerpedInstructions   = VU1Prog_LerpedTriangles_InstructionCount();
+
+    s_texturedTrisProgAddr = 0;
+    s_lerpedProgAddr = (texturedInstructions + 1u) & ~1u;
+    PS2_AssertMsg(s_lerpedProgAddr + lerpedInstructions <= 2048,
+                  "Microprograms overflow VU1 micro memory!");
 
     s_drawPacket.Init(kDrawPacketQwords);
 
-    // Upload the microprogram to micro address 0 and set up the double buffer.
-    // Synchronous; VU1 is ready once this returns.
+    // Upload the microprograms and set up the double buffer. Synchronous;
+    // VU1 is ready once this returns.
     VifPacket & pkt = s_drawPacket;
-    pkt.AddMicroProgram(0, VU1Prog_TexturedTriangles_Code());
+    pkt.AddMicroProgram(s_texturedTrisProgAddr, VU1Prog_TexturedTriangles_Code());
+    pkt.AddMicroProgram(s_lerpedProgAddr, VU1Prog_LerpedTriangles_Code());
     pkt.AddDoubleBufferSettings(kDoubleBufferBase, kDoubleBufferOffset);
     pkt.AddEndTag();
     pkt.Send();
@@ -230,7 +370,7 @@ void Init()
 }
 
 void DrawTriangles(const math::Mat4 & mvp, const tex::Texture & texture,
-                   const DrawVertex * verts, int vertCount)
+                   const DrawVertex * verts, int vertCount, DrawFlags flags)
 {
     PS2_AssertMsg(s_initialized, "vu1::Init not called!");
     PS2_AssertMsg(vertCount > 0 && (vertCount % 3) == 0, "DrawTriangles wants whole triangles!");
@@ -246,17 +386,8 @@ void DrawTriangles(const math::Mat4 & mvp, const tex::Texture & texture,
 
     const int ctx = gs::CurrentContext();
 
-    s_constants.mvp       = mvp;
-    s_constants.gsScale   = { 2048.0f, 2048.0f, kGsDepthScale, 0.0f };
-    s_constants.gsOffset  = { 2048.0f + static_cast<float>(gs::Width())  * 0.5f,
-                              2048.0f + static_cast<float>(gs::Height()) * 0.5f,
-                              kGsDepthScale, 0.0f };
-    s_constants.clipScale = { kGuardBandScale, kGuardBandScale, 1.0f, 0.0f };
-
     VifPacket & pkt = s_drawPacket;
-    pkt.Reset();
-
-    pkt.AddUnpackData(kFrameConstantsAddr, &s_constants, sizeof(FrameConstants) / 16, false);
+    BeginDrawChain(pkt, mvp);
 
     // One chunk per VU run; the double buffer overlaps each chunk's unpack
     // with the previous chunk's transform.
@@ -268,13 +399,52 @@ void DrawTriangles(const math::Mat4 & mvp, const tex::Texture & texture,
         if (pkt.QwordCount() + kChunkChainQwords + kChainTailQwords > kDrawPacketQwords)
         {
             SendChainAndWait(pkt);
-            pkt.Reset();
-            pkt.AddUnpackData(kFrameConstantsAddr, &s_constants, sizeof(FrameConstants) / 16, false);
+            BeginDrawChain(pkt, mvp);
         }
 
         const int remaining  = vertCount - firstVert;
         const int chunkVerts = (remaining < kMaxVertsPerBatch) ? remaining : kMaxVertsPerBatch;
-        AddBatchChunk(pkt, texture, ctx, verts + firstVert, chunkVerts);
+        AddBatchChunk(pkt, texture, ctx, verts + firstVert, chunkVerts, flags);
+    }
+
+    SendChainAndWait(pkt);
+}
+
+void DrawLerpedTriangles(const math::Mat4 & mvp, const tex::Texture & texture,
+                         const math::Vec3 & frontv, const math::Vec3 & backv,
+                         const LerpVertexBytes * positions, const LerpDrawAttrib * attribs,
+                         int vertCount, FaceCull faceCull, DrawFlags flags)
+{
+    PS2_AssertMsg(s_initialized, "vu1::Init not called!");
+    PS2_AssertMsg(vertCount > 0 && (vertCount % 3) == 0, "DrawLerpedTriangles wants whole triangles!");
+    PS2_AssertMsg((reinterpret_cast<std::uintptr_t>(positions) & 15u) == 0, "Position data must be 16-byte aligned!");
+    PS2_AssertMsg((reinterpret_cast<std::uintptr_t>(attribs) & 15u) == 0, "Attribute data must be 16-byte aligned!");
+
+    gs::FlushPending2D();
+
+    gs::EnsureTextureResident(texture);
+    PS2_Assert(texture.vramAddr != tex::Texture::kNotResident);
+
+    const int ctx = gs::CurrentContext();
+
+    VifPacket & pkt = s_drawPacket;
+    BeginDrawChain(pkt, mvp);
+
+    // Chunking as in DrawTriangles. Full chunks are even, so every chunk's
+    // slice of the 8-byte position stream starts 16-byte aligned; only a
+    // final odd chunk pads its transfer (see AddLerpBatchChunk).
+    for (int firstVert = 0; firstVert < vertCount; firstVert += kMaxLerpVertsPerBatch)
+    {
+        if (pkt.QwordCount() + kLerpChunkChainQwords + kChainTailQwords > kDrawPacketQwords)
+        {
+            SendChainAndWait(pkt);
+            BeginDrawChain(pkt, mvp);
+        }
+
+        const int remaining  = vertCount - firstVert;
+        const int chunkVerts = (remaining < kMaxLerpVertsPerBatch) ? remaining : kMaxLerpVertsPerBatch;
+        AddLerpBatchChunk(pkt, texture, ctx, frontv, backv,
+                          positions + firstVert, attribs + firstVert, chunkVerts, faceCull, flags);
     }
 
     SendChainAndWait(pkt);

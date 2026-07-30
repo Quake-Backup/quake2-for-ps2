@@ -20,6 +20,7 @@
 
 #include "ps2/common.h"
 #include "ps2/renderer/render_view.h"
+#include "ps2/renderer/render_md2.h"
 #include "ps2/renderer/texture.h"
 #include "ps2/renderer/model.h"
 #include "ps2/renderer/vu1.h"
@@ -675,6 +676,8 @@ void GatherPolyTriangles(const mod::ModelPoly & poly, const tex::Texture & textu
             continue;
         }
 
+        // TODO: Cull and reject back-facing triangles.
+
         if (s_scratchVertCount + (count - 2) * 3 > kScratchMaxVerts)
         {
             FlushScratch(texture);
@@ -741,6 +744,169 @@ void RenderWorldModel(const refdef_t & viewDef)
     DrawTextureChains();
 }
 
+// ------------------------------------------------------------------------------------------------
+// Point lighting (world lightmap sampling for entity models)
+// ------------------------------------------------------------------------------------------------
+
+enum LightSampleResult : int { NoHit = -1, Hit = 0, HitColorSampled = 1 };
+
+// Descends the BSP along the start->end segment looking for the first lit
+// surface it crosses (ref_gl's RecursiveLightPoint): finds the node plane the
+// segment straddles, recurses the near side, and on the way back samples the
+// lightmap of the node surface containing the crossing point - each style's
+// sample scaled by its current lightstyle. Returns -1 for no hit, 0 for a hit
+// with no light data, 1 for a sampled hit ('outColor' and 'outLightSpot' set).
+LightSampleResult RecursiveLightPoint(const mod::ModelInstance & world, const mod::ModelNode * node,
+                                      const lightstyle_t * lightstyles, const vec3_t start, const vec3_t end,
+                                      vec3_t outColor, vec3_t outLightSpot)
+{
+    if (node->contents != -1)
+    {
+        return NoHit; // Leaf: didn't hit anything on the way down.
+    }
+
+    // Which side(s) of this node's plane does the segment touch?
+    const cplane_t * const plane = node->plane;
+    const float front = DotProduct(start, plane->normal) - plane->dist;
+    const float back  = DotProduct(end,   plane->normal) - plane->dist;
+    const int   side  = (front < 0.0f);
+
+    if ((back < 0.0f) == side)
+    {
+        // Whole segment on one side; no surface of this node can be crossed.
+        return RecursiveLightPoint(world, node->children[side], lightstyles, start, end, outColor, outLightSpot);
+    }
+
+    // The segment crosses the plane at 'mid': trace the near half first.
+    const float frac = front / (front - back);
+
+    vec3_t mid;
+    mid[0] = start[0] + (end[0] - start[0]) * frac;
+    mid[1] = start[1] + (end[1] - start[1]) * frac;
+    mid[2] = start[2] + (end[2] - start[2]) * frac;
+
+    const auto r = RecursiveLightPoint(world, node->children[side], lightstyles, start, mid, outColor, outLightSpot);
+    if (r >= Hit)
+    {
+        return r; // Hit something nearer.
+    }
+
+    VectorCopy(mid, outLightSpot);
+
+    // Check the crossing point against this node's surfaces.
+    const int numSurfaces = node->numSurfaces;
+    const mod::ModelSurface * surf = world.surfaces + node->firstSurface;
+    for (int i = 0; i < numSurfaces; ++i, ++surf)
+    {
+        if (HasFlag(surf->flags, mod::SurfaceFlags::DrawTurb | mod::SurfaceFlags::DrawSky))
+        {
+            continue; // No lightmaps on water/sky.
+        }
+
+        const mod::ModelTexInfo * tex = surf->texInfo;
+
+        const int s = static_cast<int>(DotProduct(mid, tex->vecs[0]) + tex->vecs[0][3]);
+        const int t = static_cast<int>(DotProduct(mid, tex->vecs[1]) + tex->vecs[1][3]);
+
+        if (s < surf->textureMins[0] || t < surf->textureMins[1])
+        {
+            continue;
+        }
+
+        int ds = s - surf->textureMins[0];
+        int dt = t - surf->textureMins[1];
+
+        if (ds > surf->extents[0] || dt > surf->extents[1])
+        {
+            continue;
+        }
+
+        if (surf->samples == nullptr)
+        {
+            return Hit; // Hit, but the surface carries no light data.
+        }
+
+        // 16-texel lightmap granularity, one RGB triplet per luxel, one
+        // whole map per active style.
+        ds >>= 4;
+        dt >>= 4;
+
+        VectorClear(outColor);
+
+        const u8 * lightmap = surf->samples;
+        lightmap += 3 * (dt * ((surf->extents[0] >> 4) + 1) + ds);
+
+        for (int map = 0; map < mod::kMaxLightmaps && surf->styles[map] != 255; ++map)
+        {
+            const float * styleRGB = lightstyles[surf->styles[map]].rgb;
+
+            outColor[0] += lightmap[0] * styleRGB[0] * (1.0f / 255.0f);
+            outColor[1] += lightmap[1] * styleRGB[1] * (1.0f / 255.0f);
+            outColor[2] += lightmap[2] * styleRGB[2] * (1.0f / 255.0f);
+
+            lightmap += 3 * ((surf->extents[0] >> 4) + 1) * ((surf->extents[1] >> 4) + 1);
+        }
+
+        return HitColorSampled;
+    }
+
+    // Nothing on this node; carry on down the far half of the segment.
+    return RecursiveLightPoint(world, node->children[!side], lightstyles, mid, end, outColor, outLightSpot);
+}
+
+// ------------------------------------------------------------------------------------------------
+// Entity pass
+// ------------------------------------------------------------------------------------------------
+
+void RenderEntities(const refdef_t & viewDef, const bool translucentPass)
+{
+    static const cvar_t * s_skipEntities = Cvar_Get("ps2_skip_entities", "0", 0);
+
+    if (s_skipEntities->value != 0.0f)
+    {
+        return; // Debug: skip all entity models.
+    }
+
+    const int numEntities = viewDef.num_entities;
+    for (int e = 0; e < numEntities; ++e)
+    {
+        const entity_t & entity = viewDef.entities[e];
+
+        if (entity.flags & RF_BEAM)
+        {
+            continue; // TODO: beam cylinders (effects milestone).
+        }
+
+        // Translucents draw after every solid, so they blend over a finished
+        // opaque scene rather than whatever happened to be drawn so far.
+        const bool translucent = (entity.flags & RF_TRANSLUCENT) != 0;
+        if (translucent != translucentPass)
+        {
+            continue;
+        }
+
+        // entity_t::model is opaque outside the refresh module, hence the cast.
+        const auto * model = reinterpret_cast<const mod::ModelInstance *>(entity.model);
+        if (model == nullptr)
+        {
+            // TODO: null-model placeholder (entity models milestone).
+            continue;
+        }
+
+        switch (model->type)
+        {
+        case mod::ModelType::AliasMD2:
+            DrawAliasMD2Entity(viewDef, entity, s_viewProjMatrix);
+            break;
+
+        case mod::ModelType::Brush:
+        case mod::ModelType::Sprite:
+            // TODO: brush and sprite entity models (entity models milestone).
+            break;
+        }
+    }
+}
+
 } // namespace
 
 // ------------------------------------------------------------------------------------------------
@@ -758,9 +924,80 @@ void BeginRegistration()
     s_oldViewCluster2 = kInvalidCluster;
 }
 
-const DrawStats & GetDrawStats()
+DrawStats & GetDrawStats()
 {
     return s_drawStats;
+}
+
+void CalcPointLightColor(const refdef_t & viewDef, const vec3_t point,
+                         vec3_t outColor, vec3_t outLightSpot)
+{
+    const mod::ModelInstance * world = mod::GetWorldModel();
+
+    if (world == nullptr || world->lightData == nullptr)
+    {
+        // No world or a map compiled without light data: fullbright.
+        VectorSet(outColor, 1.0f, 1.0f, 1.0f);
+        return;
+    }
+
+    // Trace straight down; 2048 units reaches the floor from anywhere sane.
+    const vec3_t endPoint = { point[0], point[1], point[2] - 2048.0f };
+
+    vec3_t sampled = {};
+    const auto r = RecursiveLightPoint(*world, world->nodes, viewDef.lightstyles,
+                                       point, endPoint, sampled, outLightSpot);
+    if (r == NoHit)
+    {
+        VectorClear(outColor); // Left the world without hitting anything.
+    }
+    else
+    {
+        VectorCopy(sampled, outColor);
+    }
+
+    // Add the frame's dynamic lights, falling off linearly with distance.
+    const dlight_t * dl = viewDef.dlights;
+    const int numDlights = viewDef.num_dlights;
+    for (int i = 0; i < numDlights; ++i, ++dl)
+    {
+        vec3_t dist;
+        VectorSubtract(point, dl->origin, dist);
+
+        const float add = (dl->intensity - VectorLength(dist)) * (1.0f / 256.0f);
+        if (add > 0.0f)
+        {
+            outColor[0] += add * dl->color[0];
+            outColor[1] += add * dl->color[1];
+            outColor[2] += add * dl->color[2];
+        }
+    }
+}
+
+bool FrustumCullsPoints(const vec3_t * points, int numPoints)
+{
+    // Each point's mask has one bit per side plane it is outside of; the AND
+    // across all points is nonzero exactly when one plane excludes them all.
+    // (Conservative: a box crossing a frustum corner passes and draws.)
+    u32 aggregate = ~0u;
+    for (int i = 0; i < numPoints; ++i)
+    {
+        u32 mask = 0;
+        for (int p = 0; p < 4; ++p)
+        {
+            if (DotProduct(points[i], s_frustum[p].normal) - s_frustum[p].dist < 0.0f)
+            {
+                mask |= (1u << p);
+            }
+        }
+
+        aggregate &= mask;
+        if (aggregate == 0)
+        {
+            return false; // No plane excludes every point seen so far.
+        }
+    }
+    return true;
 }
 
 void RenderFrame(const refdef_t & viewDef)
@@ -772,9 +1009,11 @@ void RenderFrame(const refdef_t & viewDef)
     SetupFrame(viewDef);
 
     RenderWorldModel(viewDef);
+    RenderEntities(viewDef, /*translucentPass=*/false);
+    RenderEntities(viewDef, /*translucentPass=*/true);
 
-    // Later milestones continue here: solid entities, translucent
-    // surfaces/entities, particles, dynamic lights.
+    // Later milestones continue here: translucent world surfaces,
+    // particles, dynamic lights.
 }
 
 } // namespace ps2::view

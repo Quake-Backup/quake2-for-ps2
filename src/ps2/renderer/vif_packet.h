@@ -97,13 +97,28 @@ public:
     // transfer completes. At most 256 qwords per unpack.
     void AddUnpackData(u32 vuAddr, const void * data, u32 qwords, bool useTop)
     {
-        PS2_AssertMsg(qwords <= 256, "VIF unpacks are limited to 256 qwords!");
+        AddUnpackDataFmt(vuAddr, data, qwords, qwords, P2_UNPACK_V4_32, useTop);
+    }
+
+    // General form of AddUnpackData for the packed VIF formats, where the DMA
+    // transfer length and the unpack length differ. 'srcQwords' is what the
+    // REF tag carries; 'numElements' is the VIFcode NUM field - the elements
+    // *written* to VU memory (one destination qword each for the V4 formats;
+    // 256 max). The transfer must hold exactly the payload the unpack
+    // consumes: a V4_8 element eats one source word, so numElements must be
+    // 4 * srcQwords - any spare words in the transfer would be decoded as
+    // VIFcodes (with data-dependent chaos as the result), and the VIF stalls
+    // waiting for payload that never comes if the transfer runs short.
+    void AddUnpackDataFmt(u32 vuAddr, const void * data, u32 srcQwords, u32 numElements,
+                          enum UnpackMode format, bool useTop)
+    {
+        PS2_AssertMsg(numElements <= 256, "VIF unpacks are limited to 256 elements!");
         PS2_AssertMsg((reinterpret_cast<std::uintptr_t>(data) & 15u) == 0, "Unpack data must be 16-byte aligned!");
 
-        packet2_chain_ref(m_packet, data, qwords, 0, 0, 0);
+        packet2_chain_ref(m_packet, data, srcQwords, 0, 0, 0);
         packet2_vif_stcycl(m_packet, 1, 1, 0);
-        packet2_vif_open_unpack(m_packet, P2_UNPACK_V4_32, vuAddr, useTop, /*masked=*/0, /*usigned=*/1, 0);
-        packet2_vif_close_unpack_manual(m_packet, qwords);
+        packet2_vif_open_unpack(m_packet, format, vuAddr, useTop, /*masked=*/0, /*usigned=*/1, 0);
+        packet2_vif_close_unpack_manual(m_packet, numElements);
     }
 
     // Small unpacks built directly into the chain: open, append qwords, close.
