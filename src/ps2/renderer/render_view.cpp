@@ -344,10 +344,12 @@ void MarkLeaves(const mod::ModelInstance & world)
 // World BSP walk and texture chains
 // ------------------------------------------------------------------------------------------------
 
-// Returns the texture a surface draws with this frame, following the animation
-// chain for animated walls (torches, screens). Never null: the model loader
-// substitutes the debug checkerboard for missing wall textures.
-const tex::Texture * TextureAnimation(const mod::ModelTexInfo * texInfo)
+// Returns the texture a surface draws with, following the animation chain for
+// animated walls (torches, screens). Never null: the model loader substitutes
+// the debug checkerboard for missing wall textures. World surfaces step the
+// chain on game time; brush model entities step it on entity.frame instead,
+// which is how the game scripts a door or button changing its own texture.
+const tex::Texture * TextureAnimation(const mod::ModelTexInfo * texInfo, int animFrame)
 {
     PS2_Assert(texInfo != nullptr && texInfo->texture != nullptr);
 
@@ -356,7 +358,7 @@ const tex::Texture * TextureAnimation(const mod::ModelTexInfo * texInfo)
         return texInfo->texture; // Not animated.
     }
 
-    int c = s_textureAnimFrame % texInfo->numFrames;
+    int c = animFrame % texInfo->numFrames;
     while (c-- > 0)
     {
         texInfo = texInfo->next;
@@ -463,7 +465,7 @@ void RecursiveWorldNode(const refdef_t & viewDef, const mod::ModelInstance & wor
 
         // Opaque: thread onto its texture's draw chain.
         ++s_drawStats.surfaces;
-        const tex::Texture * texture = TextureAnimation(surf->texInfo);
+        const tex::Texture * texture = TextureAnimation(surf->texInfo, s_textureAnimFrame);
         if (texture->textureChain == nullptr)
         {
             // First surface for this texture this frame; remember the chain.
@@ -482,13 +484,25 @@ void RecursiveWorldNode(const refdef_t & viewDef, const mod::ModelInstance & wor
 // Triangle gathering and submission
 // ------------------------------------------------------------------------------------------------
 
+// Everything the gather path needs beyond the geometry itself. The world pass
+// draws untransformed, fullbright and opaque; a brush model entity carries its
+// own model-view-projection and may blend, so the same clipper and scratch
+// buffer serve both.
+struct SurfaceDrawState
+{
+    const math::Mat4 * mvp;   // Clips and draws with this; the world's is the plain view-projection.
+    u32                rgba;  // Packed vertex colour (GS modulate: 128 = unchanged, alpha 0x80 = 1.0).
+    vu1::DrawFlags     flags; // Batch flags, i.e. whether the submission blends.
+};
+
 // Sends the gathered scratch triangles as one batch and empties the buffer.
-inline void FlushScratch(const tex::Texture & texture)
+inline void FlushScratch(const tex::Texture & texture, const SurfaceDrawState & state)
 {
     if (s_scratchVertCount > 0)
     {
         ++s_drawStats.drawBatches;
-        vu1::DrawTriangles(s_viewProjMatrix, texture, s_scratchVerts, s_scratchVertCount);
+        vu1::DrawTriangles(*state.mvp, texture, s_scratchVerts, s_scratchVertCount,
+                           state.flags);
         s_scratchVertCount = 0;
     }
 }
@@ -563,22 +577,128 @@ int ClipAgainstPlane(const ClipVertex * in, const int inCount, ClipVertex * out,
     return outCount;
 }
 
-inline void EmitScratchVertex(const ClipVertex & v)
+inline void EmitScratchVertex(const ClipVertex & v, u32 rgba)
 {
     vu1::DrawVertex & dst = s_scratchVerts[s_scratchVertCount++];
     dst.x    = v.pos.x;
     dst.y    = v.pos.y;
     dst.z    = v.pos.z;
     dst.w    = 1.0f;
-    dst.rgba = kFullBright;
+    dst.rgba = rgba;
     dst.s    = v.st.x;
     dst.t    = v.st.y;
     dst.q    = 1.0f;
 }
 
+// Fills in a corner's six clip-plane distances from its position. The vertex
+// draws untransformed and the VU applies 'mvp', so the judgement has to happen
+// in that same clip space.
+inline void SetClipDists(ClipVertex & c, const math::Mat4 & mvp)
+{
+    const math::Vec4 clip = math::Transform(c.pos, mvp);
+    const float gw = vu1::kGuardBandNdcLimit * clip.w;
+    c.d.f[0] = (clip.w - clip.z) - kClipEpsilon; // near (and behind-camera)
+    c.d.f[1] = (clip.w + clip.z) - kClipEpsilon; // far
+    c.d.f[2] = (gw - clip.x) - kClipEpsilon;     // guard band sides
+    c.d.f[3] = (gw + clip.x) - kClipEpsilon;
+    c.d.f[4] = (gw - clip.y) - kClipEpsilon;
+    c.d.f[5] = (gw + clip.y) - kClipEpsilon;
+    c.d.f[6] = 0.0f; // Spare lanes: never read as planes, but they ride
+    c.d.f[7] = 0.0f; // along through the lerps, so keep them finite.
+}
+
+// Clips one triangle against the VU clip volume and appends the survivors to
+// the scratch buffer, flushing it when full. The corners arrive with their
+// position and UVs set; their clip distances are computed here.
+void GatherTriangle(ClipVertex (&corners)[3],
+                    const tex::Texture & texture,
+                    const SurfaceDrawState & state)
+{
+    int insidePerPlane[kNumClipPlanes] = {};
+    for (ClipVertex & c : corners)
+    {
+        SetClipDists(c, *state.mvp);
+        for (int p = 0; p < kNumClipPlanes; ++p)
+        {
+            insidePerPlane[p] += (c.d.f[p] >= 0.0f);
+        }
+    }
+
+    int insideTotal = 0;
+    bool outsideAny = false;
+    for (int p = 0; p < kNumClipPlanes; ++p)
+    {
+        insideTotal += insidePerPlane[p];
+        outsideAny  |= (insidePerPlane[p] == 0);
+    }
+
+    if (outsideAny)
+    {
+        ++s_drawStats.trisCulled;
+        return; // All three corners outside one plane: entirely out.
+    }
+
+    if (insideTotal == 3 * kNumClipPlanes)
+    {
+        // Whole triangle inside: the common case, no clipping.
+        ++s_drawStats.trisDrawn;
+        if (s_scratchVertCount + 3 > kScratchMaxVerts)
+        {
+            FlushScratch(texture, state);
+        }
+        for (const ClipVertex & c : corners)
+        {
+            EmitScratchVertex(c, state.rgba);
+        }
+        return;
+    }
+
+    // Straddling triangle: clip against every plane in turn. Each pass
+    // can add one vertex (3 -> at most 9); the survivors fan-triangulate.
+    ++s_drawStats.trisClipped;
+    ClipVertex bufferA[3 + kNumClipPlanes];
+    ClipVertex bufferB[3 + kNumClipPlanes];
+
+    const ClipVertex * in = corners;
+    ClipVertex * out = bufferA;
+    int count = 3;
+    for (int p = 0; p < kNumClipPlanes && count >= 3; ++p)
+    {
+        if (insidePerPlane[p] == 3)
+        {
+            continue; // All corners inside this plane: every clipped
+                      // vertex is a convex mix of them, so none can
+                      // cross it either.
+        }
+        count = ClipAgainstPlane(in, count, out, p);
+        in  = out;
+        out = (out == bufferA) ? bufferB : bufferA;
+    }
+    if (count < 3)
+    {
+        return;
+    }
+
+    // TODO: Cull and reject back-facing triangles.
+
+    if (s_scratchVertCount + (count - 2) * 3 > kScratchMaxVerts)
+    {
+        FlushScratch(texture, state);
+    }
+    for (int v = 1; v < count - 1; ++v)
+    {
+        EmitScratchVertex(in[0],     state.rgba);
+        EmitScratchVertex(in[v],     state.rgba);
+        EmitScratchVertex(in[v + 1], state.rgba);
+    }
+    s_drawStats.trisDrawn += count - 2;
+}
+
 // Appends a polygon's triangles to the scratch buffer, clipping the ones that
 // cross the VU clip volume and flushing when full.
-void GatherPolyTriangles(const mod::ModelPoly & poly, const tex::Texture & texture)
+void GatherPolyTriangles(const mod::ModelPoly & poly,
+                         const tex::Texture & texture,
+                         const SurfaceDrawState & state)
 {
     const int numTriangles = poly.numVerts - 2;
     for (int t = 0; t < numTriangles; ++t)
@@ -592,109 +712,25 @@ void GatherPolyTriangles(const mod::ModelPoly & poly, const tex::Texture & textu
             continue;
         }
 
-        // Clip-space plane distances of the three corners (world geometry
-        // draws untransformed, so the point transform is the view-projection).
         ClipVertex corners[3];
-        int insidePerPlane[kNumClipPlanes] = {};
         for (int v = 0; v < 3; ++v)
         {
             const mod::PolyVertex & src = poly.vertexes[tri.vertexes[v]];
-            ClipVertex & c = corners[v];
-
-            c.pos = { src.position.x, src.position.y, src.position.z, 1.0f };
-            c.st  = { src.texture_s, src.texture_t, 0.0f, 0.0f };
-
-            const math::Vec4 clip = math::Transform(c.pos, s_viewProjMatrix);
-            const float gw = vu1::kGuardBandNdcLimit * clip.w;
-            c.d.f[0] = (clip.w - clip.z) - kClipEpsilon; // near (and behind-camera)
-            c.d.f[1] = (clip.w + clip.z) - kClipEpsilon; // far
-            c.d.f[2] = (gw - clip.x) - kClipEpsilon;     // guard band sides
-            c.d.f[3] = (gw + clip.x) - kClipEpsilon;
-            c.d.f[4] = (gw - clip.y) - kClipEpsilon;
-            c.d.f[5] = (gw + clip.y) - kClipEpsilon;
-            c.d.f[6] = 0.0f; // Spare lanes: never read as planes, but they ride
-            c.d.f[7] = 0.0f; // along through the lerps, so keep them finite.
-
-            for (int p = 0; p < kNumClipPlanes; ++p)
-            {
-                insidePerPlane[p] += (c.d.f[p] >= 0.0f);
-            }
+            corners[v].pos = { src.position.x, src.position.y, src.position.z, 1.0f };
+            corners[v].st  = { src.texture_s, src.texture_t, 0.0f, 0.0f };
         }
 
-        int insideTotal = 0;
-        bool outsideAny = false;
-        for (int p = 0; p < kNumClipPlanes; ++p)
-        {
-            insideTotal += insidePerPlane[p];
-            outsideAny  |= (insidePerPlane[p] == 0);
-        }
-
-        if (outsideAny)
-        {
-            ++s_drawStats.trisCulled;
-            continue; // All three corners outside one plane: entirely out.
-        }
-
-        if (insideTotal == 3 * kNumClipPlanes)
-        {
-            // Whole triangle inside: the common case, no clipping.
-            ++s_drawStats.trisDrawn;
-            if (s_scratchVertCount + 3 > kScratchMaxVerts)
-            {
-                FlushScratch(texture);
-            }
-            for (const ClipVertex & c : corners)
-            {
-                EmitScratchVertex(c);
-            }
-            continue;
-        }
-
-        // Straddling triangle: clip against every plane in turn. Each pass
-        // can add one vertex (3 -> at most 9); the survivors fan-triangulate.
-        ++s_drawStats.trisClipped;
-        ClipVertex bufferA[3 + kNumClipPlanes];
-        ClipVertex bufferB[3 + kNumClipPlanes];
-
-        const ClipVertex * in = corners;
-        ClipVertex * out = bufferA;
-        int count = 3;
-        for (int p = 0; p < kNumClipPlanes && count >= 3; ++p)
-        {
-            if (insidePerPlane[p] == 3)
-            {
-                continue; // All corners inside this plane: every clipped
-                          // vertex is a convex mix of them, so none can
-                          // cross it either.
-            }
-            count = ClipAgainstPlane(in, count, out, p);
-            in  = out;
-            out = (out == bufferA) ? bufferB : bufferA;
-        }
-        if (count < 3)
-        {
-            continue;
-        }
-
-        // TODO: Cull and reject back-facing triangles.
-
-        if (s_scratchVertCount + (count - 2) * 3 > kScratchMaxVerts)
-        {
-            FlushScratch(texture);
-        }
-        for (int v = 1; v < count - 1; ++v)
-        {
-            EmitScratchVertex(in[0]);
-            EmitScratchVertex(in[v]);
-            EmitScratchVertex(in[v + 1]);
-        }
-        s_drawStats.trisDrawn += count - 2;
+        GatherTriangle(corners, texture, state);
     }
 }
 
 // Draws every texture chain built by RecursiveWorldNode and resets them.
 void DrawTextureChains()
 {
+    // World geometry sits in world space already, so its "model" transform is
+    // the plain view-projection.
+    const SurfaceDrawState state = { &s_viewProjMatrix, kFullBright, vu1::DrawFlags::None };
+
     for (int i = 0; i < s_chainTextureCount; ++i)
     {
         const tex::Texture * texture = s_chainTextures[i];
@@ -705,11 +741,11 @@ void DrawTextureChains()
             {
                 if (poly->numVerts >= 3) // Need at least one triangle.
                 {
-                    GatherPolyTriangles(*poly, *texture);
+                    GatherPolyTriangles(*poly, *texture, state);
                 }
             }
         }
-        FlushScratch(*texture);
+        FlushScratch(*texture, state);
 
         texture->textureChain = nullptr; // Reset for the next frame.
     }
@@ -855,10 +891,250 @@ LightSampleResult RecursiveLightPoint(const mod::ModelInstance & world, const mo
 }
 
 // ------------------------------------------------------------------------------------------------
+// Brush model entities (inline BSP submodels: doors, plats, trains, buttons)
+// ------------------------------------------------------------------------------------------------
+
+// A surface is drawn when the camera is on its front side by more than this,
+// in world units (ref_gl's BACKFACE_EPSILON). Surfaces the camera is level
+// with are edge-on and contribute nothing.
+constexpr float kBackFaceEpsilon = 0.01f;
+
+// An inline submodel's surfaces live in the world model's surface array but
+// hang off the submodel's own BSP subtree, so the world walk never reaches
+// them - they are drawn here instead, transformed by the entity that carries
+// them. There is no PVS or texture chaining involved: the surface count is
+// small and the transform is per-entity, so each one is gathered immediately
+// and batched only across runs of the same texture.
+void DrawBrushModelEntity(const refdef_t & viewDef, const entity_t & entity)
+{
+    static const cvar_t * s_skipBrushModels = Cvar_Get("ps2_skip_brushmodels", "0", 0);
+
+    if (s_skipBrushModels->value != 0.0f)
+    {
+        return; // Debug: skip brush model entities.
+    }
+
+    const auto * model = reinterpret_cast<const mod::ModelInstance *>(entity.model);
+    PS2_Assert(model != nullptr);
+
+    if (model->numModelSurfaces == 0)
+    {
+        return; // Submodel with no faces of its own (a pure clip brush).
+    }
+
+    // Frustum cull. A rotated submodel has no axis-aligned box that survives
+    // the rotation, so it falls back to the model's bounding sphere.
+    const bool rotated = (entity.angles[0] != 0.0f ||
+                          entity.angles[1] != 0.0f ||
+                          entity.angles[2] != 0.0f);
+    vec3_t mins, maxs;
+    if (rotated)
+    {
+        for (int i = 0; i < 3; ++i)
+        {
+            mins[i] = entity.origin[i] - model->radius;
+            maxs[i] = entity.origin[i] + model->radius;
+        }
+    }
+    else
+    {
+        const float * const modelMins = &model->mins.x;
+        const float * const modelMaxs = &model->maxs.x;
+        for (int i = 0; i < 3; ++i)
+        {
+            mins[i] = entity.origin[i] + modelMins[i];
+            maxs[i] = entity.origin[i] + modelMaxs[i];
+        }
+    }
+    if (ShouldCullBBox(mins, maxs))
+    {
+        return;
+    }
+
+    ++s_drawStats.entities;
+
+    // The per-surface side test runs in model space, so the camera goes there
+    // rather than every surface plane coming out - one transform instead of N.
+    vec3_t modelOrigin;
+    VectorSubtract(viewDef.vieworg, entity.origin, modelOrigin);
+    if (rotated)
+    {
+        vec3_t temp, forward, right, up;
+        VectorCopy(modelOrigin, temp);
+        AngleVectors(entity.angles, forward, right, up);
+
+        modelOrigin[0] =  DotProduct(temp, forward);
+        modelOrigin[1] = -DotProduct(temp, right);
+        modelOrigin[2] =  DotProduct(temp, up);
+    }
+
+    const math::Mat4 mvp = MakeEntityMatrix(entity, /*flipPitchAngle=*/false) * s_viewProjMatrix;
+
+    // ref_gl draws translucent brush models at a flat quarter alpha rather
+    // than the entity's own (glColor4f(1,1,1,0.25) in R_DrawBrushModel).
+    const bool translucent = (entity.flags & RF_TRANSLUCENT) != 0;
+    const SurfaceDrawState state = {
+        &mvp,
+        translucent ? vu1::PackColorRGBA(128, 128, 128, 0x80 / 4) : kFullBright,
+        translucent ? vu1::DrawFlags::Blended : vu1::DrawFlags::None
+    };
+
+    // Consecutive surfaces usually share a texture, so the batch only breaks
+    // when it actually changes.
+    const tex::Texture * batchTexture = nullptr;
+
+    mod::ModelSurface * surf = model->surfaces + model->firstModelSurface;
+    for (int i = 0; i < model->numModelSurfaces; ++i, ++surf)
+    {
+        const cplane_t & plane = *surf->plane;
+        const float dot = DotProduct(modelOrigin, plane.normal) - plane.dist;
+
+        const bool planeBack = HasFlag(surf->flags, mod::SurfaceFlags::PlaneBack);
+        if (!(( planeBack && dot < -kBackFaceEpsilon) ||
+              (!planeBack && dot >  kBackFaceEpsilon)))
+        {
+            continue; // Facing away from the camera.
+        }
+
+        if (surf->texInfo->flags & (SURF_TRANS33 | SURF_TRANS66 | SURF_WARP))
+        {
+            // Deferred to the (not yet implemented) back-to-front alpha pass.
+            // TODO: the chain carries no transform, so when that pass lands a
+            // moving submodel's water/glass would draw at its rest position -
+            // ref_gl has the same bug (R_DrawAlphaSurfaces reloads the world
+            // matrix). Needs the entity matrix stored alongside the surface.
+            surf->textureChain = s_alphaSurfaces;
+            s_alphaSurfaces = surf;
+            ++s_drawStats.surfacesAlpha;
+            continue;
+        }
+
+        const tex::Texture * texture = TextureAnimation(surf->texInfo, entity.frame);
+        if (texture != batchTexture)
+        {
+            if (batchTexture != nullptr)
+            {
+                FlushScratch(*batchTexture, state);
+            }
+            batchTexture = texture;
+        }
+
+        ++s_drawStats.surfaces;
+        for (const mod::ModelPoly * poly = surf->polys; poly != nullptr; poly = poly->next)
+        {
+            if (poly->numVerts >= 3)
+            {
+                GatherPolyTriangles(*poly, *texture, state);
+            }
+        }
+    }
+
+    if (batchTexture != nullptr)
+    {
+        FlushScratch(*batchTexture, state);
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
+// Sprite entities (.sp2: explosions, flashes, the power-up glows)
+// ------------------------------------------------------------------------------------------------
+
+// A sprite is one camera-facing quad, sized and anchored by its frame: the
+// frame's origin_x/origin_y say where in the image the entity's origin sits,
+// so the quad hangs off the view's right/up vectors from there. No culling -
+// it is two triangles, and the clipper rejects it if it is off screen anyway.
+void DrawSpriteEntity(const entity_t & entity)
+{
+    static const cvar_t * s_skipSprites = Cvar_Get("ps2_skip_sprites", "0", 0);
+
+    if (s_skipSprites->value != 0.0f)
+    {
+        return; // Debug: skip sprite entities.
+    }
+
+    const auto * model = reinterpret_cast<const mod::ModelInstance *>(entity.model);
+    PS2_Assert(model != nullptr && model->hunkBase != nullptr);
+
+    // The sprite hunk holds the SP2 file image verbatim (see model_load.cpp).
+    const auto * sprite = static_cast<const dsprite_t *>(model->hunkBase);
+    if (sprite->numframes <= 0)
+    {
+        return;
+    }
+
+    // The engine cycles entity.frame freely and expects the sprite to wrap.
+    const int frameNum = (entity.frame >= 0) ? (entity.frame % sprite->numframes) : 0;
+    const dsprframe_t & frame = sprite->frames[frameNum];
+
+    const tex::Texture * skin = model->skins[frameNum];
+    if (skin == nullptr)
+    {
+        skin = &tex::DebugTexture(); // Frame's .pcx failed to load.
+    }
+
+    ++s_drawStats.entities;
+
+    // Sprite images are rarely power-of-two (48x48, 144x144), and normalized
+    // ST spans the power-of-two TEX0 extent, not the image.
+    float stScaleS, stScaleT;
+    tex::StScaleFor(*skin, &stScaleS, &stScaleT);
+
+    // Clamped because the alpha is whatever the game code put on the entity;
+    // on the GS 0x80 is 1.0 and anything above it reads as overbright.
+    float alpha = (entity.flags & RF_TRANSLUCENT) ? entity.alpha : 1.0f;
+    alpha = (alpha < 0.0f) ? 0.0f : ((alpha > 1.0f) ? 1.0f : alpha);
+
+    const SurfaceDrawState state = {
+        &s_viewProjMatrix, // The quad is built in world space already.
+        vu1::PackColorRGBA(128, 128, 128, static_cast<u32>(alpha * 128.0f)),
+        (alpha < 1.0f) ? vu1::DrawFlags::Blended : vu1::DrawFlags::None
+    };
+
+    // The four corners, in ref_gl's order: bottom-left, top-left, top-right,
+    // bottom-right, with T running down the image the way the pixels are
+    // stored. 'right' and 'up' are the camera's, which is what makes the quad
+    // face it.
+    const float leftOffset   = -static_cast<float>(frame.origin_x);
+    const float rightOffset  =  static_cast<float>(frame.width - frame.origin_x);
+    const float bottomOffset = -static_cast<float>(frame.origin_y);
+    const float topOffset    =  static_cast<float>(frame.height - frame.origin_y);
+
+    const struct { float along, up, s, t; } layout[4] = {
+        { leftOffset,  bottomOffset, 0.0f, 1.0f },
+        { leftOffset,  topOffset,    0.0f, 0.0f },
+        { rightOffset, topOffset,    1.0f, 0.0f },
+        { rightOffset, bottomOffset, 1.0f, 1.0f },
+    };
+
+    ClipVertex quad[4];
+    for (int i = 0; i < 4; ++i)
+    {
+        quad[i].pos = {
+            entity.origin[0] + (s_rightVec[0] * layout[i].along) + (s_upVec[0] * layout[i].up),
+            entity.origin[1] + (s_rightVec[1] * layout[i].along) + (s_upVec[1] * layout[i].up),
+            entity.origin[2] + (s_rightVec[2] * layout[i].along) + (s_upVec[2] * layout[i].up),
+            1.0f
+        };
+        quad[i].st = { layout[i].s * stScaleS, layout[i].t * stScaleT, 0.0f, 0.0f };
+    }
+
+    ClipVertex triangle[3] = { quad[0], quad[1], quad[2] };
+    GatherTriangle(triangle, *skin, state);
+
+    triangle[0] = quad[0];
+    triangle[1] = quad[2];
+    triangle[2] = quad[3];
+    GatherTriangle(triangle, *skin, state);
+
+    FlushScratch(*skin, state);
+}
+
+// ------------------------------------------------------------------------------------------------
 // Entity pass
 // ------------------------------------------------------------------------------------------------
 
-void RenderEntities(const refdef_t & viewDef, const bool translucentPass)
+template<bool isTranslucentPass>
+void RenderEntities(const refdef_t & viewDef)
 {
     static const cvar_t * s_skipEntities = Cvar_Get("ps2_skip_entities", "0", 0);
 
@@ -871,7 +1147,6 @@ void RenderEntities(const refdef_t & viewDef, const bool translucentPass)
     for (int e = 0; e < numEntities; ++e)
     {
         const entity_t & entity = viewDef.entities[e];
-
         if (entity.flags & RF_BEAM)
         {
             continue; // TODO: beam cylinders (effects milestone).
@@ -880,7 +1155,7 @@ void RenderEntities(const refdef_t & viewDef, const bool translucentPass)
         // Translucents draw after every solid, so they blend over a finished
         // opaque scene rather than whatever happened to be drawn so far.
         const bool translucent = (entity.flags & RF_TRANSLUCENT) != 0;
-        if (translucent != translucentPass)
+        if (translucent != isTranslucentPass)
         {
             continue;
         }
@@ -900,8 +1175,11 @@ void RenderEntities(const refdef_t & viewDef, const bool translucentPass)
             break;
 
         case mod::ModelType::Brush:
+            DrawBrushModelEntity(viewDef, entity);
+            break;
+
         case mod::ModelType::Sprite:
-            // TODO: brush and sprite entity models (entity models milestone).
+            DrawSpriteEntity(entity);
             break;
         }
     }
@@ -927,6 +1205,16 @@ void BeginRegistration()
 DrawStats & GetDrawStats()
 {
     return s_drawStats;
+}
+
+math::Mat4 MakeEntityMatrix(const entity_t & entity, const bool flipPitchAngle)
+{
+    const float pitch = flipPitchAngle ? entity.angles[PITCH] : -entity.angles[PITCH];
+
+    return math::RotationX(math::DegToRad(-entity.angles[ROLL])) *
+           math::RotationY(math::DegToRad(pitch))                *
+           math::RotationZ(math::DegToRad(entity.angles[YAW]))   *
+           math::Translation(entity.origin[0], entity.origin[1], entity.origin[2]);
 }
 
 void CalcPointLightColor(const refdef_t & viewDef, const vec3_t point,
@@ -1005,15 +1293,14 @@ void RenderFrame(const refdef_t & viewDef)
     PS2_Assert(viewDef.width > 0 && viewDef.height > 0);
 
     s_drawStats = {};
-
     SetupFrame(viewDef);
 
     RenderWorldModel(viewDef);
-    RenderEntities(viewDef, /*translucentPass=*/false);
-    RenderEntities(viewDef, /*translucentPass=*/true);
+    RenderEntities</*isTranslucentPass=*/false>(viewDef);
+    RenderEntities</*isTranslucentPass=*/true>(viewDef);
 
     // Later milestones continue here: translucent world surfaces,
-    // particles, dynamic lights.
+    // particles, beams, null model, dynamic lights.
 }
 
 } // namespace ps2::view

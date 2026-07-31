@@ -7,6 +7,7 @@
  * ================================================================================================ */
 
 #include "ps2/common.h"
+#include "ps2/math/vec_mat.h"
 
 namespace ps2::view
 {
@@ -28,6 +29,15 @@ struct DrawStats
 
 // Stats of the most recent RenderFrame; all zeros before the first 3D frame.
 DrawStats & GetDrawStats();
+
+// Entity angles + origin as a world transform, in the row-vector convention
+// (rotations apply first, then the translation). 'flipPitchAngle' picks the sign
+// of the pitch rotation: ref_gl's R_RotateForEntity applies -pitch, which is
+// what brush models get, but gl_mesh.c negates the angle around that call for
+// meshes ("e->angles[PITCH] = -e->angles[PITCH];"), so alias models end
+// up with +pitch. Only shows on entities that actually pitch - most brush
+// models never leave yaw.
+math::Mat4 MakeEntityMatrix(const entity_t & entity, bool flipPitchAngle);
 
 // True when some frustum side plane has every one of the points on its
 // outside - the conservative cull test for rotated (non-axis-aligned)

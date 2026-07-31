@@ -134,16 +134,11 @@ inline void FlushScratchVULerp(const math::Mat4 & mvp, const tex::Texture & text
 // Entity transform and frustum cull
 // ------------------------------------------------------------------------------------------------
 
-// Entity angles + origin to a world transform, in the row-vector convention
-// (rotations apply first, then the translation). Alias models take +pitch
-// where brush models will take -pitch - ref_gl flips it around
-// R_RotateForEntity for meshes ("e->angles[PITCH] = -e->angles[PITCH]; sigh").
-inline math::Mat4 MakeEntityMatrix(const entity_t & entity)
+// The entity transform is shared with the brush model path;
+// alias models are the ones that take +pitch.
+inline math::Mat4 MakeAliasMatrix(const entity_t & entity)
 {
-    return math::RotationX(math::DegToRad(-entity.angles[ROLL]))  *
-           math::RotationY(math::DegToRad( entity.angles[PITCH])) *
-           math::RotationZ(math::DegToRad( entity.angles[YAW]))   *
-           math::Translation(entity.origin[0], entity.origin[1], entity.origin[2]);
+    return MakeEntityMatrix(entity, /*flipPitchAngle=*/true);
 }
 
 // RF_DEPTHHACK: squeeze the entity's whole depth range into the slice
@@ -562,7 +557,7 @@ void DrawAliasMD2Shadow(const entity_t & entity, const dmdl_t * hdr,
 
     // Compose first, fold second: the pose's 'move' must translate before
     // the squash, so its fold goes into the full shadow composite.
-    math::Mat4 mvp = shadowProj * MakeEntityMatrix(entity) * viewProj;
+    math::Mat4 mvp = shadowProj * MakeAliasMatrix(entity) * viewProj;
     const math::Vec4 row3 = math::Transform(math::Vec4{ lc.move.x, lc.move.y, lc.move.z, 1.0f }, mvp);
 
     mvp.m[3][0] = row3.x;
@@ -711,7 +706,7 @@ void DrawAliasMD2Entity(const refdef_t & viewDef, const entity_t & entity, const
     float stScaleS, stScaleT;
     tex::StScaleFor(skin, &stScaleS, &stScaleT);
 
-    math::Mat4 mvp = MakeEntityMatrix(entity) * viewProj;
+    math::Mat4 mvp = MakeAliasMatrix(entity) * viewProj;
     if (entity.flags & RF_DEPTHHACK)
     {
         ApplyDepthHack(mvp);
