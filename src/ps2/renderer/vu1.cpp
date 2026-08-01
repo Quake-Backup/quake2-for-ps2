@@ -217,6 +217,7 @@ void AddBatchGifTags(VifPacket & pkt, const tex::Texture & texture, int ctx,
 {
     const bool blended = HasDrawFlag(flags, DrawFlags::Blended);
     const int  tme     = HasDrawFlag(flags, DrawFlags::Untextured) ? 0 : 1;
+    const int  abe     = blended ? 1 : 0;
 
     // Five A+D register writes: pixel tests, the texture bind, the blend
     // function and the depth-write mask for this context...
@@ -229,8 +230,16 @@ void AddBatchGifTags(VifPacket & pkt, const tex::Texture & texture, int ctx,
 
     // ...then the drawing tag: gouraud triangle list, STQ mapping, with the
     // per-vertex registers of kVertexRegList.
-    const u128 prim = VU_GS_PRIM(PRIM_TRIANGLE, 1, tme, 0, blended ? 1 : 0, 0, 0, ctx, 0);
-    pkt.AddQword(VU_GS_GIFTAG(static_cast<u64>(vertCount), 1, 1, prim, 0, 3), kVertexRegList);
+    //
+    // Built with the gif_tags.h macros, not packet2_utils.h's VU_GS_PRIM /
+    // VU_GS_GIFTAG: those do not parenthesize their parameters, so an
+    // argument that is an expression silently mis-assembles. Passing
+    // 'blended ? 1 : 0' for ABE expanded to '(blended ? 1 : 0 << 6)', which
+    // parses as 'blended ? 1 : (0 << 6)' and drops the bit at position 0 -
+    // inside the PRIM field, where PRIM_TRIANGLE (3) already has that bit
+    // set. Nothing warned and the primitive still drew, just never blended.
+    const u64 prim = GIF_SET_PRIM(PRIM_TRIANGLE, 1, tme, 0, abe, 0, 0, ctx, 0);
+    pkt.AddQword(GIF_SET_TAG(vertCount, 1, 1, prim, GIF_FLG_PACKED, 3), kVertexRegList);
 }
 
 // Emits one chunk into the chain: batch header and GIF tags unpacked inline
