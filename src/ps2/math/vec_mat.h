@@ -254,4 +254,55 @@ inline Vec3 Lerp(const Vec3 & a, const Vec3 & b, float t)
     return { bits_to_f32(rx), bits_to_f32(ry), bits_to_f32(rz) };
 }
 
+// True when the triangle faces away from 'eye' and can be dropped. The
+// triangle's plane normal gives its orientation, compared against the
+// direction from the viewer:
+//
+//   const Vec3 d = Cross(v1 - v0, v2 - v0);
+//   const Vec3 c = v0 - eye;
+//   return Dot(c, d) <= 0.0f;
+//
+// This winds the other way from the usual textbook form: a triangle CLOCKWISE
+// as seen from 'eye' is the front-facing one, which is what Quake 2's data
+// uses - ref_gl leaves OpenGL's default counter-clockwise front face in place
+// and then culls GL_FRONT (gl_rmain.c), so its visible polygons are the
+// clockwise ones. Reverse the cross product for the opposite convention.
+//
+// All four points must be in the same space - for a transformed model that
+// means passing the eye in model space, not the world camera.
+//
+// The verdict leaves the coprocessor as raw float bits rather than through an
+// FPU compare: for any finite float, reading the bits as a signed integer
+// preserves ordering against zero (the sign bit lands in the integer's sign,
+// and both +0 and -0 test <= 0). That turns the caller's test into an integer
+// branch and drops the qmfc2 -> mtc1 -> c.le.s chain the float version needs.
+// The sll is not redundant - qmfc2 writes all 64 low bits of the GPR, and a
+// 32-bit compare on MIPS64 requires the value sign-extended from bit 31.
+inline bool CullBackFacingTriangle(const Vec4 & eye, const Vec4 & v0, const Vec4 & v1, const Vec4 & v2)
+{
+    s32 dotBits;
+    asm (
+        "lqc2        $vf4, 0x0(%1)     \n\t" // vf4 = eye
+        "lqc2        $vf5, 0x0(%2)     \n\t" // vf5 = v0
+        "lqc2        $vf6, 0x0(%3)     \n\t" // vf6 = v1
+        "lqc2        $vf7, 0x0(%4)     \n\t" // vf7 = v2
+        "vsub.xyz    $vf8, $vf6, $vf5  \n\t" // vf8 = v1 - v0
+        "vsub.xyz    $vf9, $vf7, $vf5  \n\t" // vf9 = v2 - v0
+        "vsub.xyz    $vf7, $vf5, $vf4  \n\t" // vf7 = v0 - eye; independent of the
+                                             // cross product, so it fills the FMAC
+                                             // latency shadow ahead of vopmula
+        "vopmula.xyz $ACC, $vf8, $vf9  \n\t" // vf6 = cross(vf8, vf9)
+        "vopmsub.xyz $vf6, $vf9, $vf8  \n\t"
+        "vmul.xyz    $vf5, $vf7, $vf6  \n\t" // vf5 = dot(vf7, vf6), summed into .x
+        "vaddy.x     $vf5, $vf5, $vf5  \n\t"
+        "vaddz.x     $vf5, $vf5, $vf5  \n\t"
+        "qmfc2       %0,   $vf5        \n\t" // low word = the dot product's bits
+        "sll         %0,   %0, 0       \n\t" // sign-extend it for the 32-bit compare
+        : "=r" (dotBits)
+        : "r" (&eye), "r" (&v0), "r" (&v1), "r" (&v2),
+          "m" (eye), "m" (v0), "m" (v1), "m" (v2)
+    );
+    return dotBits <= 0;
+}
+
 } // namespace ps2::math

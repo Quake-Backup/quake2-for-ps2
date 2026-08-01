@@ -39,6 +39,13 @@ constexpr float kZFar  = 4096.0f;
 // Vertex colour for the not-yet-lit world: GS modulate 128 = texels unchanged.
 constexpr u32 kFullBright = vu1::PackColorRGBA(128, 128, 128, 0x80);
 
+// Render view cvars:
+static const cvar_t * s_backFaceCull    = nullptr;
+static const cvar_t * s_skipWorld       = nullptr;
+static const cvar_t * s_skipBrushModels = nullptr;
+static const cvar_t * s_skipSprites     = nullptr;
+static const cvar_t * s_skipEntities    = nullptr;
+
 // ------------------------------------------------------------------------------------------------
 // Frame state
 // ------------------------------------------------------------------------------------------------
@@ -53,6 +60,10 @@ static int s_viewCluster      = kInvalidCluster;
 static int s_viewCluster2     = kInvalidCluster;
 static int s_oldViewCluster   = kInvalidCluster;
 static int s_oldViewCluster2  = kInvalidCluster;
+
+// World-space camera position for the frame, in the format the VU0 back-face
+// helper wants (16-byte aligned, w = 1).
+static math::Vec4 s_eyePosition = {};
 
 // Scene camera basis for the frame (Quake coordinates, from AngleVectors).
 static vec3_t s_forwardVec = {};
@@ -144,9 +155,20 @@ inline bool ShouldCullBBox(float * mins, float * maxs)
     return false;
 }
 
+// Whether the per-triangle back-face test runs at all. Note the world and
+// brush model passes already reject whole surfaces on the same side test
+// (their triangles are coplanar with the surface), so enabling this test
+// actually doesn't gain us anything. Left as a reference, disabled by default.
+inline bool WorldBackFaceCullEnabled()
+{
+    return s_backFaceCull->value != 0.0f;
+}
+
 void SetupFrame(const refdef_t & viewDef)
 {
     ++s_frameCount;
+
+    s_eyePosition = { viewDef.vieworg[0], viewDef.vieworg[1], viewDef.vieworg[2], 1.0f };
 
     // Animated walls flip frames at 2 Hz of game time (as in ref_gl).
     s_textureAnimFrame = static_cast<int>(viewDef.time * 2.0f);
@@ -491,8 +513,10 @@ void RecursiveWorldNode(const refdef_t & viewDef, const mod::ModelInstance & wor
 struct SurfaceDrawState
 {
     const math::Mat4 * mvp;   // Clips and draws with this; the world's is the plain view-projection.
+    math::Vec4         eye;   // Camera in the same space as the triangles, for the back-face test.
     u32                rgba;  // Packed vertex colour (GS modulate: 128 = unchanged, alpha 0x80 = 1.0).
     vu1::DrawFlags     flags; // Batch flags, i.e. whether the submission blends.
+    bool               cullBackFaces;
 };
 
 // Sends the gathered scratch triangles as one batch and empties the buffer.
@@ -614,6 +638,16 @@ void GatherTriangle(ClipVertex (&corners)[3],
                     const tex::Texture & texture,
                     const SurfaceDrawState & state)
 {
+    // Reject a triangle facing away from the camera before any clipping work.
+    // The test is cheaper than the six plane distances below, and a rejected
+    // triangle costs the clipper, the scratch buffer and the VU nothing.
+    if (state.cullBackFaces &&
+        math::CullBackFacingTriangle(state.eye, corners[0].pos, corners[1].pos, corners[2].pos))
+    {
+        ++s_drawStats.trisBackFacing;
+        return;
+    }
+
     int insidePerPlane[kNumClipPlanes] = {};
     for (ClipVertex & c : corners)
     {
@@ -728,8 +762,14 @@ void GatherPolyTriangles(const mod::ModelPoly & poly,
 void DrawTextureChains()
 {
     // World geometry sits in world space already, so its "model" transform is
-    // the plain view-projection.
-    const SurfaceDrawState state = { &s_viewProjMatrix, kFullBright, vu1::DrawFlags::None };
+    // the plain view-projection and the back-face test takes the world camera.
+    const SurfaceDrawState state = {
+        .mvp   = &s_viewProjMatrix,
+        .eye   = s_eyePosition,
+        .rgba  = kFullBright,
+        .flags = vu1::DrawFlags::None,
+        .cullBackFaces = WorldBackFaceCullEnabled()
+    };
 
     for (int i = 0; i < s_chainTextureCount; ++i)
     {
@@ -758,8 +798,6 @@ void DrawTextureChains()
 
 void RenderWorldModel(const refdef_t & viewDef)
 {
-    static const cvar_t * s_skipWorld = Cvar_Get("ps2_skip_world", "0", 0);
-
     s_alphaSurfaces = nullptr;
 
     if (viewDef.rdflags & RDF_NOWORLDMODEL)
@@ -907,8 +945,6 @@ constexpr float kBackFaceEpsilon = 0.01f;
 // and batched only across runs of the same texture.
 void DrawBrushModelEntity(const refdef_t & viewDef, const entity_t & entity)
 {
-    static const cvar_t * s_skipBrushModels = Cvar_Get("ps2_skip_brushmodels", "0", 0);
-
     if (s_skipBrushModels->value != 0.0f)
     {
         return; // Debug: skip brush model entities.
@@ -974,9 +1010,13 @@ void DrawBrushModelEntity(const refdef_t & viewDef, const entity_t & entity)
     // than the entity's own (glColor4f(1,1,1,0.25) in R_DrawBrushModel).
     const bool translucent = (entity.flags & RF_TRANSLUCENT) != 0;
     const SurfaceDrawState state = {
-        &mvp,
-        translucent ? vu1::PackColorRGBA(128, 128, 128, 0x80 / 4) : kFullBright,
-        translucent ? vu1::DrawFlags::Blended : vu1::DrawFlags::None
+        .mvp   = &mvp,
+        // The surfaces are model-space, so the back-face test takes the same
+        // model-space camera the plane-side test above uses.
+        .eye   = { modelOrigin[0], modelOrigin[1], modelOrigin[2], 1.0f },
+        .rgba  = translucent ? vu1::PackColorRGBA(128, 128, 128, 0x80 / 4) : kFullBright,
+        .flags = translucent ? vu1::DrawFlags::Blended : vu1::DrawFlags::None,
+        .cullBackFaces = WorldBackFaceCullEnabled()
     };
 
     // Consecutive surfaces usually share a texture, so the batch only breaks
@@ -1045,8 +1085,6 @@ void DrawBrushModelEntity(const refdef_t & viewDef, const entity_t & entity)
 // it is two triangles, and the clipper rejects it if it is off screen anyway.
 void DrawSpriteEntity(const entity_t & entity)
 {
-    static const cvar_t * s_skipSprites = Cvar_Get("ps2_skip_sprites", "0", 0);
-
     if (s_skipSprites->value != 0.0f)
     {
         return; // Debug: skip sprite entities.
@@ -1085,9 +1123,13 @@ void DrawSpriteEntity(const entity_t & entity)
     alpha = (alpha < 0.0f) ? 0.0f : ((alpha > 1.0f) ? 1.0f : alpha);
 
     const SurfaceDrawState state = {
-        &s_viewProjMatrix, // The quad is built in world space already.
-        vu1::PackColorRGBA(128, 128, 128, static_cast<u32>(alpha * 128.0f)),
-        (alpha < 1.0f) ? vu1::DrawFlags::Blended : vu1::DrawFlags::None
+        .mvp   = &s_viewProjMatrix, // The quad is built in world space already.
+        .eye   = s_eyePosition,
+        .rgba  = vu1::PackColorRGBA(128, 128, 128, static_cast<u32>(alpha * 128.0f)),
+        .flags = (alpha < 1.0f) ? vu1::DrawFlags::Blended : vu1::DrawFlags::None,
+        // Never back-face culled: the quad is built from the camera's own
+        // right/up vectors, so it cannot face away and the test would be useless.
+        .cullBackFaces = false
     };
 
     // The four corners, in ref_gl's order: bottom-left, top-left, top-right,
@@ -1136,8 +1178,6 @@ void DrawSpriteEntity(const entity_t & entity)
 template<bool isTranslucentPass>
 void RenderEntities(const refdef_t & viewDef)
 {
-    static const cvar_t * s_skipEntities = Cvar_Get("ps2_skip_entities", "0", 0);
-
     if (s_skipEntities->value != 0.0f)
     {
         return; // Debug: skip all entity models.
@@ -1190,6 +1230,15 @@ void RenderEntities(const refdef_t & viewDef)
 // ------------------------------------------------------------------------------------------------
 // Public API
 // ------------------------------------------------------------------------------------------------
+
+void InitViewRendering()
+{
+    s_backFaceCull    = Cvar_Get("ps2_backface_cull",    "0", 0); // NOTE: Off by default. BSP already culls backfacing surfaces.
+    s_skipWorld       = Cvar_Get("ps2_skip_world",       "0", 0);
+    s_skipBrushModels = Cvar_Get("ps2_skip_brushmodels", "0", 0);
+    s_skipSprites     = Cvar_Get("ps2_skip_sprites",     "0", 0);
+    s_skipEntities    = Cvar_Get("ps2_skip_entities",    "0", 0);
+}
 
 void BeginRegistration()
 {

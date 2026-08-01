@@ -321,6 +321,7 @@ qboolean PS2_RefInit(void * hinstance, void * wndproc)
     viddef.width  = ps2::gs::Width();
     viddef.height = ps2::gs::Height();
 
+    ps2::view::InitViewRendering();
     ps2::view::InitEntityRendering();
 
     Com_Printf("PS2 refresh initialised: %dx%d\n", viddef.width, viddef.height);
