@@ -9,7 +9,7 @@
  *  gathers each chain's triangles into a scratch buffer and submits them through
  *  vu1::DrawTriangles - one synchronous batch per texture. Translucent surfaces
  *  are routed aside and drawn back-to-front at the end of the frame by
- *  DrawAlphaSurfaces; sky still awaits the skybox milestone.
+ *  RenderAlphaSurfaces; sky still awaits the skybox milestone.
  *
  *  Camera mapping: Quake is Z-up with AngleVectors giving forward/right/up; those
  *  feed math::LookAt directly (its right = cross(up, -forward) lands on Quake's
@@ -29,6 +29,7 @@
 #include "ps2/math/vec_mat.h"
 #include "ps2/builtin/builtin.h" // global_palette (beam and particle colours)
 
+#include <cmath>
 #include <cstring>
 
 namespace ps2::view {
@@ -53,9 +54,17 @@ static const cvar_t * s_hdParticles       = nullptr;
 static const cvar_t * s_forceNullModels   = nullptr;
 static const cvar_t * s_skipWeaponModel   = nullptr;
 
+// Not ours to read: SetLightLevel writes the sampled light level back into it
+// every frame for the game code (hence non-const). Registered by the client
+// (cl_main.c), which forwards it to the server in each usercmd.
+static cvar_t * s_lightLevel = nullptr;
+
 // ------------------------------------------------------------------------------------------------
 // Frame state
 // ------------------------------------------------------------------------------------------------
+
+// Game time of the frame, in seconds; drives the water warp animation.
+static float s_frameTime = 0.0f;
 
 // Frame counters used to mark drawable surfaces:
 static int s_frameCount    = 0; // Bumped per RenderFrame; stamps surfaces marked for draw.
@@ -99,7 +108,7 @@ static int s_chainTextureCount = 0;
 
 // Surfaces with transparency (glass, water, lava, slime), collected while
 // walking the BSP and while drawing brush model entities, then drawn last by
-// DrawAlphaSurfaces over the finished opaque scene.
+// RenderAlphaSurfaces over the finished opaque scene.
 //
 // Recorded here rather than threaded through ModelSurface::textureChain like
 // the opaque chains because a brush model's surfaces have to remember the
@@ -138,7 +147,7 @@ static DrawStats s_drawStats = {};
 // Translucent surface collection
 // ------------------------------------------------------------------------------------------------
 
-// Defers one translucent surface to the DrawAlphaSurfaces pass at the end of
+// Defers one translucent surface to the RenderAlphaSurfaces pass at the end of
 // the frame, remembering the texture (the animation frame is the caller's) and
 // the transform it draws under.
 void PushAlphaSurface(const mod::ModelSurface & surf, const tex::Texture & texture, const math::Mat4 & mvp)
@@ -240,6 +249,7 @@ void SetupFrame(const refdef_t & viewDef)
     s_eyePosition = { viewDef.vieworg[0], viewDef.vieworg[1], viewDef.vieworg[2], 1.0f };
 
     // Animated walls flip frames at 2 Hz of game time (as in ref_gl).
+    s_frameTime        = viewDef.time;
     s_textureAnimFrame = static_cast<int>(viewDef.time * 2.0f);
 
     // Camera basis vectors from the view angles.
@@ -782,8 +792,6 @@ void GatherTriangle(ClipVertex (&corners)[3],
         return;
     }
 
-    // TODO: Cull and reject back-facing triangles.
-
     if (s_scratchVertCount + (count - 2) * 3 > kScratchMaxVerts)
     {
         FlushScratch(texture, state);
@@ -827,40 +835,101 @@ void GatherPolyTriangles(const mod::ModelPoly & poly,
     }
 }
 
-// The same, for a subdivided turbulent surface (water, lava, slime). Those
-// polygons are shaped differently by the loader: SubdivideSurface leaves each
-// one as a fan - a centre vertex, the ring, then a duplicate of the first to
-// close it - with no triangle list at all, and with texture coordinates still
-// in raw texel units. Both follow ref_gl, whose GL_SubdivideSurface builds fans
-// for glBegin(GL_TRIANGLE_FAN) and leaves the texel-to-image division to
-// EmitWaterPolys. So the fan is triangulated and the coordinates normalized
-// here rather than reusing GatherPolyTriangles, which would read a null
-// triangle array.
-//
-// TODO: the sine turbulence and the SURF_FLOWING scroll EmitWaterPolys applies
-// on top of these coordinates are still missing, so water sits perfectly
-// still. Deferred with the rest of the warp work.
-void GatherWarpPolyTriangles(const mod::ModelPoly & poly,
-                             const tex::Texture & texture,
-                             const SurfaceDrawState & state)
+// ------------------------------------------------------------------------------------------------
+// Turbulent (warped) surfaces: water, lava, slime
+// ------------------------------------------------------------------------------------------------
+
+// ref_gl's r_turbsin lookup (gl_warp.c, values in warpsin.h): 8*sin(i*2pi/256),
+// halved once at startup by R_Init, so the effective amplitude is 4 texels.
+// Built at init rather than copied in - it is a pure function of the index,
+// and this is more accurate than the 6-significant-digit literals ref_gl ships.
+constexpr int kTurbSinSize = 256;
+constexpr float kTurbSinAmplitude = 4.0f;
+static float s_turbSin[kTurbSinSize];
+
+// Phase to table index: the table spans exactly one period (ref_gl's TURBSCALE).
+constexpr float kTurbScale = static_cast<float>(kTurbSinSize) / (2.0f * math::kPI);
+
+// A subdivided warp polygon is a fan: a centre vertex, the ring, then a
+// duplicate of the first to close it. SubdividePolygon splits at 64-unit
+// boundaries, so a leaf never exceeds that many ring vertices.
+constexpr int kMaxWarpPolyVerts = 64 + 2;
+
+inline float TurbSin(const float phase)
 {
+    // Truncation toward zero and a two's complement mask, exactly as ref_gl
+    // indexes the table - negative phases included.
+    const int index = static_cast<int>(phase * kTurbScale) & (kTurbSinSize - 1);
+    return s_turbSin[index];
+}
+
+// Gathers a turbulent surface with ref_gl's warp animation (EmitWaterPolys):
+// every vertex's texture coordinates are pushed around by a sine of the
+// *other* axis plus time, which is what makes the surface ripple while the
+// geometry stays put.
+//
+// These polygons are shaped differently from ordinary ones, so this cannot go
+// through GatherPolyTriangles: the loader's SubdivideSurface leaves each as a
+// fan with no triangle list at all (reading poly.triangles would dereference
+// null), and with texture coordinates still in raw texel units. Both follow
+// ref_gl, whose GL_SubdivideSurface builds fans for glBegin(GL_TRIANGLE_FAN)
+// and leaves the texel-to-image division to EmitWaterPolys.
+//
+// TODO: Consider moving the polygon warping work to the VU1.
+void DrawAnimatedWaterPolys(const mod::ModelSurface & surf,
+                            const tex::Texture & texture,
+                            const SurfaceDrawState & state)
+{
+    // SURF_FLOWING drifts the surface along S by a whole 64-texel tile every
+    // two seconds. (ref_gl truncates with an int cast; the time is never
+    // negative, so this is the same fractional part.)
+    float scroll = 0.0f;
+    if (surf.texInfo->flags & SURF_FLOWING)
+    {
+        const float halfTime = s_frameTime * 0.5f;
+        scroll = -64.0f * (halfTime - std::floor(halfTime));
+    }
+
+    // ref_gl divides by a hardcoded 64 at this point. Every warp texture in
+    // pak0 is 64x64, so these agree on the real data, and this one stays
+    // right if some mod ships another size.
     const float invWidth  = 1.0f / static_cast<float>(texture.width);
     const float invHeight = 1.0f / static_cast<float>(texture.height);
 
-    for (int v = 1; v < poly.numVerts - 1; ++v)
+    for (const mod::ModelPoly * poly = surf.polys; poly != nullptr; poly = poly->next)
     {
-        const mod::PolyVertex * const fan[3] = { &poly.vertexes[0],
-                                                 &poly.vertexes[v],
-                                                 &poly.vertexes[v + 1] };
-
-        ClipVertex corners[3];
-        for (int c = 0; c < 3; ++c)
+        if (poly->numVerts < 3) // Need at least one triangle.
         {
-            corners[c].pos = { fan[c]->position.x, fan[c]->position.y, fan[c]->position.z, 1.0f };
-            corners[c].st  = { fan[c]->texture_s * invWidth, fan[c]->texture_t * invHeight, 0.0f, 0.0f };
+            continue;
+        }
+        PS2_AssertMsg(poly->numVerts <= kMaxWarpPolyVerts, "Warp polygon larger than a subdivision leaf!");
+
+        // Warped once per vertex: the fan below reads each of them twice.
+        float warpedS[kMaxWarpPolyVerts];
+        float warpedT[kMaxWarpPolyVerts];
+        for (int i = 0; i < poly->numVerts; ++i)
+        {
+            const float os = poly->vertexes[i].texture_s;
+            const float ot = poly->vertexes[i].texture_t;
+
+            warpedS[i] = (os + TurbSin((ot * 0.125f) + s_frameTime) + scroll) * invWidth;
+            warpedT[i] = (ot + TurbSin((os * 0.125f) + s_frameTime)) * invHeight;
         }
 
-        GatherTriangle(corners, texture, state);
+        for (int v = 1; v < poly->numVerts - 1; ++v)
+        {
+            const int fan[3] = { 0, v, v + 1 };
+
+            ClipVertex corners[3];
+            for (int c = 0; c < 3; ++c)
+            {
+                const mod::PolyVertex & src = poly->vertexes[fan[c]];
+                corners[c].pos = { src.position.x, src.position.y, src.position.z, 1.0f };
+                corners[c].st  = { warpedS[fan[c]], warpedT[fan[c]], 0.0f, 0.0f };
+            }
+
+            GatherTriangle(corners, texture, state);
+        }
     }
 }
 
@@ -896,6 +965,38 @@ void DrawTextureChains()
         texture->textureChain = nullptr; // Reset for the next frame.
     }
     s_chainTextureCount = 0;
+}
+
+// ------------------------------------------------------------------------------------------------
+// Light level readback
+// ------------------------------------------------------------------------------------------------
+
+// Quake 2's channel for telling the game code how brightly lit the player is:
+// the client reads r_lightlevel back out of the cvar system every frame and
+// packs it into the usercmd (cl_input.c), where the server uses it to decide
+// how visible the player is. Nothing about it is graphics - the renderer just
+// happens to be the only thing that can sample the lightmaps.
+//
+// The value is the largest of the three sampled colour components scaled by
+// 150, which is what the software renderer's mono light value worked out to.
+// Written straight into cvar_t::value, as ref_gl's R_SetLightLevel does: this
+// runs every frame and the cvar's string form is never read.
+void SetLightLevel(const refdef_t & viewDef)
+{
+    if (viewDef.rdflags & RDF_NOWORLDMODEL)
+    {
+        return; // No world to sample; leave the last value alone (ref_gl does).
+    }
+
+    vec3_t shadeLight = { 1.0f, 1.0f, 1.0f };
+    vec3_t lightSpot  = {}; // Unused here; the shadow anchor is for entity models.
+    CalcPointLightColor(viewDef, viewDef.vieworg, shadeLight, lightSpot);
+
+    float brightest = shadeLight[0];
+    if (shadeLight[1] > brightest) { brightest = shadeLight[1]; }
+    if (shadeLight[2] > brightest) { brightest = shadeLight[2]; }
+
+    s_lightLevel->value = 150.0f * brightest;
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -936,7 +1037,7 @@ inline u32 AlphaSurfaceColor(const int texFlags)
 // submodel sits behind translucent world geometry. Sorting the entries by
 // view distance would fix it, at the price of the depth order the BSP walk
 // hands us for free.
-void DrawAlphaSurfaces()
+void RenderAlphaSurfaces()
 {
     if (s_alphaSurfaceCount == 0 || s_skipAlphaSurfaces->value != 0.0f)
     {
@@ -976,18 +1077,16 @@ void DrawAlphaSurfaces()
             state.rgba   = rgba;
         }
 
+        if (texFlags & SURF_WARP)
+        {
+            // Turbulent: its own fan walk, its own animated coordinates.
+            DrawAnimatedWaterPolys(*entry.surf, *entry.texture, state);
+            continue;
+        }
+
         for (const mod::ModelPoly * poly = entry.surf->polys; poly != nullptr; poly = poly->next)
         {
-            if (poly->numVerts < 3) // Need at least one triangle.
-            {
-                continue;
-            }
-
-            if (texFlags & SURF_WARP)
-            {
-                GatherWarpPolyTriangles(*poly, *entry.texture, state);
-            }
-            else
+            if (poly->numVerts >= 3) // Need at least one triangle.
             {
                 GatherPolyTriangles(*poly, *entry.texture, state);
             }
@@ -1761,6 +1860,16 @@ void InitViewRendering()
     s_hdParticles       = Cvar_Get("ps2_hd_particles",        "1", 0); // 1 = soft round quads instead of the classic dot.
     s_forceNullModels   = Cvar_Get("ps2_force_null_models",   "0", 0); // Debug: draw every entity as the octahedron placeholder.
     s_skipWeaponModel   = Cvar_Get("ps2_skip_weapon_model",   "0", 0);
+
+    // Already registered by the client; this just resolves the same object.
+    s_lightLevel = Cvar_Get("r_lightlevel", "0", 0);
+
+    // ref_gl's r_turbsin, at full precision (see kTurbSinAmplitude).
+    constexpr float kRadiansPerStep = (2.0f * math::kPI) / static_cast<float>(kTurbSinSize);
+    for (int i = 0; i < kTurbSinSize; ++i)
+    {
+        s_turbSin[i] = kTurbSinAmplitude * std::sin(static_cast<float>(i) * kRadiansPerStep);
+    }
 }
 
 void BeginRegistration()
@@ -1880,9 +1989,13 @@ void RenderFrame(const refdef_t & viewDef)
 
     // Then the translucent world and brush model surfaces the passes above
     // set aside, blended over the whole finished scene.
-    DrawAlphaSurfaces();
+    RenderAlphaSurfaces();
 
-    // Later milestones continue here: dynamic lights, lightmapped surfaces.
+    // Nothing to draw: hands the light at the camera back to the game code.
+    // Where ref_gl's R_RenderFrame calls R_SetLightLevel.
+    SetLightLevel(viewDef);
+
+    // TODO: Later milestones continue here: dynamic lights, lightmapped surfaces.
 }
 
 } // namespace ps2::view
