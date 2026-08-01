@@ -20,7 +20,7 @@ struct DrawStats
 {
     int nodesWalked;    // BSP nodes + leafs visited by the world walk.
     int surfaces;       // Opaque world surfaces drawn.
-    int surfacesAlpha;  // Translucent surfaces deferred.
+    int surfacesAlpha;  // Translucent surfaces deferred to the final alpha pass.
     int trisDrawn;      // Triangles submitted to VU1 (after EE clipping).
     int trisClipped;    // Triangles re-cut against the VU clip volume.
     int trisCulled;     // Triangles dropped whole, entirely outside the view volume.

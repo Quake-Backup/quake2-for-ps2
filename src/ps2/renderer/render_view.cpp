@@ -7,8 +7,9 @@
  *  tree front-to-back culling against the view frustum and threads every visible
  *  opaque surface onto its texture's draw chain, and DrawTextureChains then
  *  gathers each chain's triangles into a scratch buffer and submits them through
- *  vu1::DrawTriangles - one synchronous batch per texture. Sky and translucent
- *  surfaces are routed aside for later passes (skybox / alpha-blend milestones).
+ *  vu1::DrawTriangles - one synchronous batch per texture. Translucent surfaces
+ *  are routed aside and drawn back-to-front at the end of the frame by
+ *  DrawAlphaSurfaces; sky still awaits the skybox milestone.
  *
  *  Camera mapping: Quake is Z-up with AngleVectors giving forward/right/up; those
  *  feed math::LookAt directly (its right = cross(up, -forward) lands on Quake's
@@ -41,15 +42,16 @@ constexpr float kZFar  = 4096.0f;
 constexpr u32 kFullBright = vu1::PackColorRGBA(128, 128, 128, 0x80);
 
 // Render view cvars:
-static const cvar_t * s_backFaceCull    = nullptr;
-static const cvar_t * s_skipWorld       = nullptr;
-static const cvar_t * s_skipBrushModels = nullptr;
-static const cvar_t * s_skipSprites     = nullptr;
-static const cvar_t * s_skipEntities    = nullptr;
-static const cvar_t * s_skipParticles   = nullptr;
-static const cvar_t * s_hdParticles     = nullptr;
-static const cvar_t * s_forceNullModels = nullptr;
-static const cvar_t * s_skipWeaponModel = nullptr;
+static const cvar_t * s_backFaceCull      = nullptr;
+static const cvar_t * s_skipWorld         = nullptr;
+static const cvar_t * s_skipAlphaSurfaces = nullptr;
+static const cvar_t * s_skipBrushModels   = nullptr;
+static const cvar_t * s_skipSprites       = nullptr;
+static const cvar_t * s_skipEntities      = nullptr;
+static const cvar_t * s_skipParticles     = nullptr;
+static const cvar_t * s_hdParticles       = nullptr;
+static const cvar_t * s_forceNullModels   = nullptr;
+static const cvar_t * s_skipWeaponModel   = nullptr;
 
 // ------------------------------------------------------------------------------------------------
 // Frame state
@@ -95,10 +97,31 @@ constexpr int kMaxChainTextures = 1024;
 static const tex::Texture * s_chainTextures[kMaxChainTextures];
 static int s_chainTextureCount = 0;
 
-// World surfaces with transparency (glass/water), chained back-to-front while
-// walking the BSP. Collected so they stay out of the opaque chains; the pass
-// that draws them lands with the alpha-blend milestone.
-static const mod::ModelSurface * s_alphaSurfaces = nullptr;
+// Surfaces with transparency (glass, water, lava, slime), collected while
+// walking the BSP and while drawing brush model entities, then drawn last by
+// DrawAlphaSurfaces over the finished opaque scene.
+//
+// Recorded here rather than threaded through ModelSurface::textureChain like
+// the opaque chains because a brush model's surfaces have to remember the
+// entity transform they were collected under. ref_gl loses it - its
+// R_DrawAlphaSurfaces reloads the world matrix, so a moving submodel's water
+// draws back at the map's rest position - and the records cost little.
+struct AlphaSurface
+{
+    const mod::ModelSurface * surf;
+    const tex::Texture *      texture; // Resolved on collection: the animation frame is the entity's.
+    const math::Mat4 *        mvp;     // &s_viewProjMatrix, or into s_alphaEntityMatrices below.
+};
+
+constexpr int kMaxAlphaSurfaces = 1024;
+static AlphaSurface s_alphaSurfaces[kMaxAlphaSurfaces];
+static int s_alphaSurfaceCount = 0;
+
+// One transform per brush model entity that contributed a translucent surface;
+// DrawBrushModelEntity's own is a local, long gone by the time the alpha pass
+// runs. MAX_ENTITIES is the hard ceiling on contributors, so it cannot overflow.
+alignas(16) static math::Mat4 s_alphaEntityMatrices[MAX_ENTITIES];
+static int s_alphaEntityMatrixCount = 0;
 
 // Triangle gather buffer: texture chains append here and flush through
 // vu1::DrawTriangles when full. DrawTriangles is synchronous, so one buffer
@@ -110,6 +133,47 @@ static int s_scratchVertCount = 0;
 // Performance counters for the frame, reset by RenderFrame and read through
 // GetDrawStats() by the ps2_show_drawstats overlay.
 static DrawStats s_drawStats = {};
+
+// ------------------------------------------------------------------------------------------------
+// Translucent surface collection
+// ------------------------------------------------------------------------------------------------
+
+// Defers one translucent surface to the DrawAlphaSurfaces pass at the end of
+// the frame, remembering the texture (the animation frame is the caller's) and
+// the transform it draws under.
+void PushAlphaSurface(const mod::ModelSurface & surf, const tex::Texture & texture, const math::Mat4 & mvp)
+{
+    PS2_AssertMsg(s_alphaSurfaceCount < kMaxAlphaSurfaces, "Out of alpha surface slots!");
+    if (s_alphaSurfaceCount == kMaxAlphaSurfaces)
+    {
+        Com_DPrintf("Out of alpha surface slots!\n");
+        return; // Fail and drop the overflow surface on no-asserts build.
+    }
+
+    AlphaSurface & entry = s_alphaSurfaces[s_alphaSurfaceCount++];
+    entry.surf    = &surf;
+    entry.texture = &texture;
+    entry.mvp     = &mvp;
+
+    ++s_drawStats.surfacesAlpha;
+}
+
+// Parks a brush model entity's transform where the deferred pass can still
+// reach it. One slot per contributing entity - callers hold on to the returned
+// pointer for the rest of their surfaces. Null only if the table is full.
+const math::Mat4 * StoreAlphaEntityMatrix(const math::Mat4 & mvp)
+{
+    PS2_AssertMsg(s_alphaEntityMatrixCount < MAX_ENTITIES, "Out of alpha entity matrix slots!");
+    if (s_alphaEntityMatrixCount == MAX_ENTITIES)
+    {
+        Com_DPrintf("Out of alpha entity matrix slots!\n");
+        return nullptr;
+    }
+
+    math::Mat4 & slot = s_alphaEntityMatrices[s_alphaEntityMatrixCount++];
+    slot = mvp;
+    return &slot;
+}
 
 // ------------------------------------------------------------------------------------------------
 // Frame setup: camera matrices and frustum
@@ -483,10 +547,10 @@ void RecursiveWorldNode(const refdef_t & viewDef, const mod::ModelInstance & wor
 
         if (texFlags & (SURF_TRANS33 | SURF_TRANS66 | SURF_WARP))
         {
-            // Translucent/warped: kept for a later back-to-front alpha pass.
-            surf->textureChain = s_alphaSurfaces;
-            s_alphaSurfaces = surf;
-            ++s_drawStats.surfacesAlpha;
+            // Translucent or turbulent: deferred to the back-to-front pass at
+            // the end of the frame. World geometry draws in world space, so
+            // the plain view-projection is transform enough.
+            PushAlphaSurface(*surf, *TextureAnimation(surf->texInfo, s_textureAnimFrame), s_viewProjMatrix);
             continue;
         }
 
@@ -763,6 +827,43 @@ void GatherPolyTriangles(const mod::ModelPoly & poly,
     }
 }
 
+// The same, for a subdivided turbulent surface (water, lava, slime). Those
+// polygons are shaped differently by the loader: SubdivideSurface leaves each
+// one as a fan - a centre vertex, the ring, then a duplicate of the first to
+// close it - with no triangle list at all, and with texture coordinates still
+// in raw texel units. Both follow ref_gl, whose GL_SubdivideSurface builds fans
+// for glBegin(GL_TRIANGLE_FAN) and leaves the texel-to-image division to
+// EmitWaterPolys. So the fan is triangulated and the coordinates normalized
+// here rather than reusing GatherPolyTriangles, which would read a null
+// triangle array.
+//
+// TODO: the sine turbulence and the SURF_FLOWING scroll EmitWaterPolys applies
+// on top of these coordinates are still missing, so water sits perfectly
+// still. Deferred with the rest of the warp work.
+void GatherWarpPolyTriangles(const mod::ModelPoly & poly,
+                             const tex::Texture & texture,
+                             const SurfaceDrawState & state)
+{
+    const float invWidth  = 1.0f / static_cast<float>(texture.width);
+    const float invHeight = 1.0f / static_cast<float>(texture.height);
+
+    for (int v = 1; v < poly.numVerts - 1; ++v)
+    {
+        const mod::PolyVertex * const fan[3] = { &poly.vertexes[0],
+                                                 &poly.vertexes[v],
+                                                 &poly.vertexes[v + 1] };
+
+        ClipVertex corners[3];
+        for (int c = 0; c < 3; ++c)
+        {
+            corners[c].pos = { fan[c]->position.x, fan[c]->position.y, fan[c]->position.z, 1.0f };
+            corners[c].st  = { fan[c]->texture_s * invWidth, fan[c]->texture_t * invHeight, 0.0f, 0.0f };
+        }
+
+        GatherTriangle(corners, texture, state);
+    }
+}
+
 // Draws every texture chain built by RecursiveWorldNode and resets them.
 void DrawTextureChains()
 {
@@ -798,13 +899,116 @@ void DrawTextureChains()
 }
 
 // ------------------------------------------------------------------------------------------------
+// Translucent surface pass
+// ------------------------------------------------------------------------------------------------
+
+// Vertex colour for a deferred surface: ref_gl's R_DrawAlphaSurfaces alphas on
+// the GS's 0x80 = 1.0 scale. Surfaces that are turbulent but not explicitly
+// translucent (lava, slime) still go through the blend at full opacity, as
+// they do there.
+inline u32 AlphaSurfaceColor(const int texFlags)
+{
+    u32 alpha = 0x80; // 1.0
+    if (texFlags & SURF_TRANS33)
+    {
+        alpha = 42; // 0.33
+    }
+    else if (texFlags & SURF_TRANS66)
+    {
+        alpha = 84; // 0.66
+    }
+    return vu1::PackColorRGBA(128, 128, 128, alpha);
+}
+
+// Draws everything RecursiveWorldNode and DrawBrushModelEntity set aside -
+// glass, water, lava, slime - blended over the finished opaque scene. Called
+// last in the frame, where ref_gl calls R_DrawAlphaSurfaces.
+//
+// Walked in reverse of collection order, which is back to front: the BSP walk
+// that collected them ran front to back (ref_gl reaches the same order by
+// prepending to a linked list). The entries are depth-ordered rather than
+// grouped by texture, so unlike the opaque pass the batch has to break
+// whenever the texture, the transform or the alpha changes.
+//
+// Brush model surfaces were collected after the whole world walk, so reversing
+// puts them ahead of even the farthest world surface. That is a real mis-sort
+// - and the same one ref_gl has - but it only shows when a translucent
+// submodel sits behind translucent world geometry. Sorting the entries by
+// view distance would fix it, at the price of the depth order the BSP walk
+// hands us for free.
+void DrawAlphaSurfaces()
+{
+    if (s_alphaSurfaceCount == 0 || s_skipAlphaSurfaces->value != 0.0f)
+    {
+        s_alphaSurfaceCount      = 0;
+        s_alphaEntityMatrixCount = 0;
+        return;
+    }
+
+    SurfaceDrawState state = {
+        .mvp   = nullptr, // Per entry, below; no entry ever carries null, so the first always switches.
+        .eye   = s_eyePosition,
+        .rgba  = 0,
+        .flags = vu1::DrawFlags::Blended,
+        // Both collectors already dropped the surfaces facing away from the
+        // camera - the world walk by plane side, brush models by the same
+        // test in model space - so the triangle test has nothing left to find here.
+        .cullBackFaces = false
+    };
+
+    const tex::Texture * batchTexture = nullptr;
+
+    for (int i = s_alphaSurfaceCount - 1; i >= 0; --i)
+    {
+        const AlphaSurface & entry = s_alphaSurfaces[i];
+
+        const int texFlags = entry.surf->texInfo->flags;
+        const u32 rgba     = AlphaSurfaceColor(texFlags);
+
+        if (entry.texture != batchTexture || entry.mvp != state.mvp || rgba != state.rgba)
+        {
+            if (batchTexture != nullptr)
+            {
+                FlushScratch(*batchTexture, state); // Still the outgoing state: flush before switching.
+            }
+            batchTexture = entry.texture;
+            state.mvp    = entry.mvp;
+            state.rgba   = rgba;
+        }
+
+        for (const mod::ModelPoly * poly = entry.surf->polys; poly != nullptr; poly = poly->next)
+        {
+            if (poly->numVerts < 3) // Need at least one triangle.
+            {
+                continue;
+            }
+
+            if (texFlags & SURF_WARP)
+            {
+                GatherWarpPolyTriangles(*poly, *entry.texture, state);
+            }
+            else
+            {
+                GatherPolyTriangles(*poly, *entry.texture, state);
+            }
+        }
+    }
+
+    if (batchTexture != nullptr)
+    {
+        FlushScratch(*batchTexture, state);
+    }
+
+    s_alphaSurfaceCount      = 0;
+    s_alphaEntityMatrixCount = 0;
+}
+
+// ------------------------------------------------------------------------------------------------
 // World model pass
 // ------------------------------------------------------------------------------------------------
 
 void RenderWorldModel(const refdef_t & viewDef)
 {
-    s_alphaSurfaces = nullptr;
-
     if (viewDef.rdflags & RDF_NOWORLDMODEL)
     {
         return; // Menu/loading screens render no world.
@@ -1028,6 +1232,10 @@ void DrawBrushModelEntity(const refdef_t & viewDef, const entity_t & entity)
     // when it actually changes.
     const tex::Texture * batchTexture = nullptr;
 
+    // This entity's transform, parked for the deferred alpha pass on the first
+    // translucent surface that needs it (most models have none at all).
+    const math::Mat4 * alphaMvp = nullptr;
+
     mod::ModelSurface * surf = model->surfaces + model->firstModelSurface;
     for (int i = 0; i < model->numModelSurfaces; ++i, ++surf)
     {
@@ -1043,14 +1251,19 @@ void DrawBrushModelEntity(const refdef_t & viewDef, const entity_t & entity)
 
         if (surf->texInfo->flags & (SURF_TRANS33 | SURF_TRANS66 | SURF_WARP))
         {
-            // Deferred to the (not yet implemented) back-to-front alpha pass.
-            // TODO: the chain carries no transform, so when that pass lands a
-            // moving submodel's water/glass would draw at its rest position -
-            // ref_gl has the same bug (R_DrawAlphaSurfaces reloads the world
-            // matrix). Needs the entity matrix stored alongside the surface.
-            surf->textureChain = s_alphaSurfaces;
-            s_alphaSurfaces = surf;
-            ++s_drawStats.surfacesAlpha;
+            // Deferred to the back-to-front alpha pass, along with this
+            // entity's transform: unlike ref_gl's, that pass draws a moving
+            // submodel's water/glass where the submodel actually is rather
+            // than at the map's rest position. Parked on the first such
+            // surface; every later one shares the slot.
+            if (alphaMvp == nullptr)
+            {
+                alphaMvp = StoreAlphaEntityMatrix(mvp);
+            }
+            if (alphaMvp != nullptr)
+            {
+                PushAlphaSurface(*surf, *TextureAnimation(surf->texInfo, entity.frame), *alphaMvp);
+            }
             continue;
         }
 
@@ -1538,15 +1751,16 @@ void RenderEntities(const refdef_t & viewDef)
 
 void InitViewRendering()
 {
-    s_backFaceCull    = Cvar_Get("ps2_backface_cull",     "0", 0); // NOTE: Off by default. BSP already culls backfacing surfaces.
-    s_skipWorld       = Cvar_Get("ps2_skip_world",        "0", 0);
-    s_skipBrushModels = Cvar_Get("ps2_skip_brushmodels",  "0", 0);
-    s_skipSprites     = Cvar_Get("ps2_skip_sprites",      "0", 0);
-    s_skipEntities    = Cvar_Get("ps2_skip_entities",     "0", 0);
-    s_skipParticles   = Cvar_Get("ps2_skip_particles",    "0", 0);
-    s_hdParticles     = Cvar_Get("ps2_hd_particles",      "1", 0); // 1 = soft round quads instead of the classic dot.
-    s_forceNullModels = Cvar_Get("ps2_force_null_models", "0", 0); // Debug: draw every entity as the octahedron placeholder.
-    s_skipWeaponModel = Cvar_Get("ps2_skip_weapon_model", "0", 0);
+    s_backFaceCull      = Cvar_Get("ps2_backface_cull",       "0", 0); // NOTE: Off by default. BSP already culls backfacing surfaces.
+    s_skipWorld         = Cvar_Get("ps2_skip_world",          "0", 0);
+    s_skipAlphaSurfaces = Cvar_Get("ps2_skip_alpha_surfaces", "0", 0); // Debug: drop the translucent glass/water pass.
+    s_skipBrushModels   = Cvar_Get("ps2_skip_brushmodels",    "0", 0);
+    s_skipSprites       = Cvar_Get("ps2_skip_sprites",        "0", 0);
+    s_skipEntities      = Cvar_Get("ps2_skip_entities",       "0", 0);
+    s_skipParticles     = Cvar_Get("ps2_skip_particles",      "0", 0);
+    s_hdParticles       = Cvar_Get("ps2_hd_particles",        "1", 0); // 1 = soft round quads instead of the classic dot.
+    s_forceNullModels   = Cvar_Get("ps2_force_null_models",   "0", 0); // Debug: draw every entity as the octahedron placeholder.
+    s_skipWeaponModel   = Cvar_Get("ps2_skip_weapon_model",   "0", 0);
 }
 
 void BeginRegistration()
@@ -1650,19 +1864,25 @@ void RenderFrame(const refdef_t & viewDef)
 {
     PS2_Assert(viewDef.width > 0 && viewDef.height > 0);
 
-    s_drawStats = {};
+    s_drawStats              = {};
+    s_alphaSurfaceCount      = 0;
+    s_alphaEntityMatrixCount = 0;
+
     SetupFrame(viewDef);
 
     RenderWorldModel(viewDef);
     RenderEntities</*isTranslucentPass=*/false>(viewDef);
     RenderEntities</*isTranslucentPass=*/true>(viewDef);
 
-    // Particles last, as ref_gl does: they are blended and depth-write
+    // Particles next, as ref_gl does: they are blended and depth-write
     // masked, so they need the opaque scene already laid down behind them.
     RenderParticles(viewDef);
 
-    // Later milestones continue here: translucent world surfaces,
-    // dynamic lights.
+    // Then the translucent world and brush model surfaces the passes above
+    // set aside, blended over the whole finished scene.
+    DrawAlphaSurfaces();
+
+    // Later milestones continue here: dynamic lights, lightmapped surfaces.
 }
 
 } // namespace ps2::view
