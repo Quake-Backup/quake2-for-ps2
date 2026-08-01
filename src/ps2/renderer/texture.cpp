@@ -177,6 +177,80 @@ const u16 * MakeCheckerPattern(int variant)
     return buffer;
 }
 
+// The two particle images, generated rather than loaded - Quake 2 never
+// shipped either as a file, ref_gl builds its own in R_InitParticleTexture.
+//
+// Both are RGBA32 with every texel's colour at the GS modulate identity (128),
+// so a particle's colour rides entirely on its vertex colour and the image
+// contributes only its shape through alpha. Alpha is 128 (= 1.0 on the GS) at
+// full opacity, so a fully opaque particle blends at exactly 1x rather than
+// the ~2x an 0xFF alpha would give. Texels at alpha 0 never reach the blender
+// at all - the batch's alpha test drops them.
+//
+// Both dimensions are powers of two, so no ST rescale is needed
+// (unlike the model skins - see StScaleFor).
+constexpr int kParticleDotDim = 8;
+constexpr int kParticleHdDim  = 32;
+
+constexpr u32 ParticleTexel(u32 alpha)
+{
+    return 128u | (128u << 8) | (128u << 16) | (alpha << 24);
+}
+
+// The classic blocky dot, exactly ref_gl's 8x8 pattern. It sits in the
+// top-left corner because the particle draws as a single triangle covering
+// only that half of the image.
+const u32 * MakeParticleDotPattern()
+{
+    constexpr u8 prtDot[kParticleDotDim][kParticleDotDim] = {
+        { 0,0,0,0,0,0,0,0 },
+        { 0,0,1,1,0,0,0,0 },
+        { 0,1,1,1,1,0,0,0 },
+        { 0,1,1,1,1,0,0,0 },
+        { 0,0,1,1,0,0,0,0 },
+        { 0,0,0,0,0,0,0,0 },
+        { 0,0,0,0,0,0,0,0 },
+        { 0,0,0,0,0,0,0,0 },
+    };
+
+    alignas(16) static u32 s_buffer[kParticleDotDim * kParticleDotDim];
+    for (int y = 0; y < kParticleDotDim; ++y)
+    {
+        for (int x = 0; x < kParticleDotDim; ++x)
+        {
+            s_buffer[x + (y * kParticleDotDim)] = ParticleTexel(prtDot[y][x] ? 128u : 0u);
+        }
+    }
+    return s_buffer;
+}
+
+// The soft round particle: alpha falling off smoothly from the centre to
+// nothing at the edge, drawn as a full quad. The falloff is 1 - d^2 over the
+// radius, squared again, which keeps a bright core and a long thin tail
+// instead of the linear ramp's visible disc edge.
+const u32 * MakeParticleHdPattern()
+{
+    constexpr float kCentre = (kParticleHdDim - 1) * 0.5f;
+    constexpr float kRadius = kParticleHdDim * 0.5f;
+
+    alignas(16) static u32 s_buffer[kParticleHdDim * kParticleHdDim];
+    for (int y = 0; y < kParticleHdDim; ++y)
+    {
+        for (int x = 0; x < kParticleHdDim; ++x)
+        {
+            const float dx = (static_cast<float>(x) - kCentre) / kRadius;
+            const float dy = (static_cast<float>(y) - kCentre) / kRadius;
+
+            float falloff = 1.0f - ((dx * dx) + (dy * dy));
+            falloff = (falloff <= 0.0f) ? 0.0f : (falloff * falloff);
+
+            const u32 alpha = static_cast<u32>(falloff * 128.0f);
+            s_buffer[x + (y * kParticleHdDim)] = ParticleTexel((alpha > 128u) ? 128u : alpha);
+        }
+    }
+    return s_buffer;
+}
+
 // Owns the texture pool and the name lookup. Internal singleton (s_cache);
 // the module API below is the public face.
 class TextureCache final
@@ -185,6 +259,7 @@ public:
     void Init();
     const Texture * Find(const char * name, const ImageType type);
     const Texture & DebugTexture(int variant) const;
+    const Texture & ParticleTexture(bool highQuality) const;
 
     void BeginRegistration();
     void EndRegistration();
@@ -211,6 +286,7 @@ private:
 
     TexturePool m_texturePool;
     const Texture * m_debugTextures[kNumDebugTextures] = {};
+    const Texture * m_particleTextures[2] = {}; // [0] = classic dot, [1] = HD
 
     // Level load/change cycle counter; textures stamped with an older value
     // are the ones EndRegistration() frees. See tex::BeginRegistration().
@@ -356,6 +432,11 @@ const Texture & TextureCache::DebugTexture(int variant) const
     return *m_debugTextures[variant];
 }
 
+const Texture & TextureCache::ParticleTexture(bool highQuality) const
+{
+    return *m_particleTextures[highQuality ? 1 : 0];
+}
+
 Texture & TextureCache::Register(const char * name, const void * pixels, int width, int height,
                                  PixelFormat format, TexComponents components,
                                  ImageType type, TexFlags flags)
@@ -458,6 +539,26 @@ void TextureCache::Init()
         PS2_Assert(m_debugTextures[i] != nullptr);
     }
 
+    // The particle images are registered outside the table above so their
+    // filtering can be set per image: the classic dot wants nearest, keeping
+    // it the hard-edged blocky square Quake 2 draws, while the HD one is a
+    // smooth falloff that would band badly without bilinear.
+    Texture & particleDot = Register("pics/particle.pcx", MakeParticleDotPattern(),
+                                     kParticleDotDim, kParticleDotDim,
+                                     PixelFormat::RGBA32, TexComponents::RGBA,
+                                     ImageType::Pic, TexFlags::Builtin);
+    particleDot.magFilter = TexFilter::Nearest;
+    particleDot.minFilter = TexFilter::Nearest;
+    m_particleTextures[0] = &particleDot;
+
+    Texture & particleHd = Register("pics/particle_hd.pcx", MakeParticleHdPattern(),
+                                    kParticleHdDim, kParticleHdDim,
+                                    PixelFormat::RGBA32, TexComponents::RGBA,
+                                    ImageType::Pic, TexFlags::Builtin);
+    particleHd.magFilter = TexFilter::Linear;
+    particleHd.minFilter = TexFilter::Linear;
+    m_particleTextures[1] = &particleHd;
+
     Com_Printf("Texture cache initialised: %u built-in images registered.\n", m_texturePool.UsedCount());
 }
 
@@ -497,6 +598,11 @@ void TouchTexture(const Texture & texture)
 const Texture & DebugTexture(int variant)
 {
     return s_cache.DebugTexture(variant);
+}
+
+const Texture & ParticleTexture(bool highQuality)
+{
+    return s_cache.ParticleTexture(highQuality);
 }
 
 } // namespace ps2::tex

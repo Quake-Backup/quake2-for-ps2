@@ -28,6 +28,7 @@ struct DrawStats
     int boxesCulled;    // Whole meshes culled via bounding box checks.
     int drawBatches;    // vu1::DrawTriangles calls (one or more per texture).
     int entities;       // Entity models drawn (after frustum culling).
+    int particles;      // Particle billboards drawn.
 };
 
 // Stats of the most recent RenderFrame; all zeros before the first 3D frame.

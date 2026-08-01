@@ -255,11 +255,12 @@ void DrawDrawStatsOverlay()
         { "Surfs",   stats.surfaces      },
         { "Alpha",   stats.surfacesAlpha },
         { "Tris",    stats.trisDrawn     },
+        { "Ents",    stats.entities      },
+        { "Prts",    stats.particles     },
+        { "Batches", stats.drawBatches   },
         { "Clipped", stats.trisClipped   },
         { "Culled",  stats.trisCulled    },
-        { "Batches", stats.drawBatches   },
         { "BoxCull", stats.boxesCulled   },
-        { "Ents",    stats.entities      },
     };
 
     constexpr int kLineHeight = kGlyphSize + 2; // Matches DrawInternalString spacing.

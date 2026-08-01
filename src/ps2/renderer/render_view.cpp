@@ -26,6 +26,7 @@
 #include "ps2/renderer/vu1.h"
 #include "ps2/renderer/gs.h"
 #include "ps2/math/vec_mat.h"
+#include "ps2/builtin/builtin.h" // global_palette (beam and particle colours)
 
 #include <cstring>
 
@@ -45,6 +46,10 @@ static const cvar_t * s_skipWorld       = nullptr;
 static const cvar_t * s_skipBrushModels = nullptr;
 static const cvar_t * s_skipSprites     = nullptr;
 static const cvar_t * s_skipEntities    = nullptr;
+static const cvar_t * s_skipParticles   = nullptr;
+static const cvar_t * s_hdParticles     = nullptr;
+static const cvar_t * s_forceNullModels = nullptr;
+static const cvar_t * s_skipWeaponModel = nullptr;
 
 // ------------------------------------------------------------------------------------------------
 // Frame state
@@ -1172,6 +1177,295 @@ void DrawSpriteEntity(const entity_t & entity)
 }
 
 // ------------------------------------------------------------------------------------------------
+// Beam entities (RF_BEAM: the lightning/railgun cylinders)
+// ------------------------------------------------------------------------------------------------
+
+// A beam is a cylinder spanning entity.origin -> entity.oldorigin, built as a
+// ring of segments around that axis. It has no model and no texture: the
+// colour is a palette index in skinnum and the diameter is entity.frame
+// (ref_gl's R_DrawBeam).
+constexpr int kNumBeamSegs = 6;
+
+void DrawBeamEntity(const entity_t & entity)
+{
+    vec3_t direction, normalizedDirection;
+    VectorSubtract(entity.oldorigin, entity.origin, direction);
+    VectorCopy(direction, normalizedDirection);
+
+    if (VectorNormalize(normalizedDirection) == 0.0f)
+    {
+        return; // Zero length. Also how the client's ex_flash explosions - which
+                // borrow RF_BEAM purely as a "don't draw me" marker, comment and
+                // all - end up drawing nothing.
+    }
+
+    vec3_t perpVec;
+    PerpendicularVector(perpVec, normalizedDirection);
+    VectorScale(perpVec, static_cast<float>(entity.frame) / 2.0f, perpVec);
+
+    ++s_drawStats.entities;
+
+    const float alpha = (entity.alpha > 0.0f && entity.alpha <= 1.0f) ? entity.alpha : 1.0f;
+
+    const SurfaceDrawState state = {
+        .mvp   = &s_viewProjMatrix, // Built in world space.
+        .eye   = s_eyePosition,
+        .rgba  = (global_palette[entity.skinnum & 0xFF] & 0x00FFFFFF) |
+                 (static_cast<u32>(alpha * 128.0f) << 24),
+        .flags = vu1::DrawFlags::Blended | vu1::DrawFlags::Untextured,
+        // A cylinder does have a far half, but keeping it only makes the blend
+        // slightly denser - whereas culling it with the ring's winding guessed
+        // wrong would turn the beam inside out.
+        .cullBackFaces = false
+    };
+
+    math::Vec4 startPoints[kNumBeamSegs];
+    math::Vec4 endPoints[kNumBeamSegs];
+
+    for (int i = 0; i < kNumBeamSegs; ++i)
+    {
+        vec3_t start;
+        RotatePointAroundVector(start, normalizedDirection, perpVec,
+                                (360.0f / kNumBeamSegs) * static_cast<float>(i));
+        VectorAdd(start, entity.origin, start);
+
+        startPoints[i] = { start[0], start[1], start[2], 1.0f };
+        endPoints[i]   = { start[0] + direction[0],
+                           start[1] + direction[1],
+                           start[2] + direction[2], 1.0f };
+    }
+
+    // Untextured, but a batch still binds one.
+    const tex::Texture & texture = tex::DebugTexture();
+    const math::Vec4 zero = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+    // ref_gl walks the ring as one triangle strip of (start[i], end[i],
+    // start[i+1], end[i+1]) groups; expanded to the triangle lists the VU
+    // path takes, each group is the two triangles closing one wall quad.
+    for (int i = 0; i < kNumBeamSegs; ++i)
+    {
+        const int next = (i + 1) % kNumBeamSegs;
+
+        ClipVertex quad[4];
+        quad[0].pos = startPoints[i];
+        quad[1].pos = endPoints[i];
+        quad[2].pos = startPoints[next];
+        quad[3].pos = endPoints[next];
+        for (ClipVertex & c : quad)
+        {
+            c.st = zero;
+        }
+
+        ClipVertex triangle[3] = { quad[0], quad[1], quad[2] };
+        GatherTriangle(triangle, texture, state);
+
+        triangle[0] = quad[2];
+        triangle[1] = quad[1];
+        triangle[2] = quad[3];
+        GatherTriangle(triangle, texture, state);
+    }
+
+    FlushScratch(texture, state);
+}
+
+// ------------------------------------------------------------------------------------------------
+// Null models (placeholder for an entity whose model is missing)
+// ------------------------------------------------------------------------------------------------
+
+// ref_gl's R_DrawNullModel: a small octahedron lit by the world at the
+// entity's position, so a model that failed to load is loudly visible instead
+// of silently absent.
+void DrawNullModelEntity(const refdef_t & viewDef, const entity_t & entity)
+{
+    vec3_t color = { 1.0f, 1.0f, 1.0f };
+    if (!(entity.flags & RF_FULLBRIGHT))
+    {
+        vec3_t lightSpot = {};
+        CalcPointLightColor(viewDef, entity.origin, color, lightSpot);
+    }
+
+    ++s_drawStats.entities;
+
+    const auto channel = [](float c) -> u32
+    {
+        const float scaled = c * 128.0f; // 128 = the GS modulate identity.
+        return (scaled >= 255.0f) ? 255u : ((scaled <= 0.0f) ? 0u : static_cast<u32>(scaled));
+    };
+
+    // Null models take the brush convention: ref_gl calls R_RotateForEntity
+    // directly here, without the pitch flip the alias path wraps it in.
+    const math::Mat4 mvp = MakeEntityMatrix(entity, /*flipPitchAngle=*/false) * s_viewProjMatrix;
+
+    const SurfaceDrawState state = {
+        .mvp   = &mvp,
+        .eye   = s_eyePosition, // Unused; the octahedron is not culled (below).
+        .rgba  = vu1::PackColorRGBA(channel(color[0]), channel(color[1]), channel(color[2]), 0x80),
+        .flags = vu1::DrawFlags::None,
+        // Eight triangles for a debug marker: not worth risking the fans
+        // coming out inside-out and hiding the very thing they exist to show.
+        .cullBackFaces = false
+    };
+
+    constexpr float kRadius = 16.0f;
+    constexpr float kApex   = 16.0f;
+
+    // The square ring in the entity's XY plane both fans close over.
+    math::Vec4 ring[5];
+    for (int i = 0; i <= 4; ++i)
+    {
+        const float angle = static_cast<float>(i) * math::kHalfPI;
+        ring[i] = { kRadius * math::Cosf(angle), kRadius * math::Sinf(angle), 0.0f, 1.0f };
+    }
+
+    // The pink checkerboard doubles as the "this model is missing" signal;
+    // ref_gl draws the octahedron untextured, in flat shadelight.
+    const tex::Texture & texture = tex::DebugTexture();
+
+    for (int half = 0; half < 2; ++half)
+    {
+        ClipVertex apex;
+        apex.pos = { 0.0f, 0.0f, (half == 0) ? -kApex : kApex, 1.0f };
+        apex.st  = { 0.5f, 0.5f, 0.0f, 0.0f };
+
+        for (int i = 0; i < 4; ++i)
+        {
+            // The top half walks the ring backwards, so both cones wind the
+            // same way seen from outside.
+            const int a = (half == 0) ? i : (4 - i);
+            const int b = (half == 0) ? (i + 1) : (3 - i);
+
+            ClipVertex triangle[3];
+            triangle[0] = apex;
+            triangle[1].pos = ring[a];
+            triangle[1].st  = { 0.0f, 1.0f, 0.0f, 0.0f };
+            triangle[2].pos = ring[b];
+            triangle[2].st  = { 1.0f, 1.0f, 0.0f, 0.0f };
+
+            GatherTriangle(triangle, texture, state);
+        }
+    }
+
+    FlushScratch(texture, state);
+}
+
+// ------------------------------------------------------------------------------------------------
+// Particles
+// ------------------------------------------------------------------------------------------------
+
+// The client's particle list as camera-facing billboards. Two shapes, picked
+// by ps2_hd_particles:
+//
+//  - The classic Quake 2 particle is a SINGLE triangle whose UVs run
+//    0.0625 .. 1.0625 across an 8x8 image with a dot in its top-left corner.
+//    The triangle covers exactly the half of the image holding the dot, and
+//    the half-texel offset centres it. Three vertices per particle.
+//  - The HD particle is a full quad over the soft round sprite: six vertices
+//    and twice the fill, but no hard pixel edges when it scales up close.
+//
+// Both are blended, and DrawFlags::Blended masks depth writes, which is what
+// keeps a cloud of them from z-fighting itself (ref_gl's glDepthMask(FALSE)).
+//
+// TODO: Potential candidate to be moved to the VU1. Could submit a single
+// vertex with particle colour and expand to a triangle/quad on the VU.
+void RenderParticles(const refdef_t & viewDef)
+{
+    const int numParticles = viewDef.num_particles;
+    if (numParticles <= 0 || s_skipParticles->value != 0.0f)
+    {
+        return;
+    }
+
+    const bool highQuality = (s_hdParticles->value != 0.0f);
+    const tex::Texture & texture = tex::ParticleTexture(highQuality);
+
+    // ref_gl's 1.5x blow-up of the camera basis.
+    vec3_t up, right;
+    VectorScale(s_upVec,    1.5f, up);
+    VectorScale(s_rightVec, 1.5f, right);
+
+    SurfaceDrawState state = {
+        .mvp   = &s_viewProjMatrix, // Billboards are built in world space.
+        .eye   = s_eyePosition,
+        .rgba  = 0, // Per particle; filled in below.
+        .flags = vu1::DrawFlags::Blended,
+        .cullBackFaces = false // Camera-facing, like sprites: nothing to cull.
+    };
+
+    for (int i = 0; i < numParticles; ++i)
+    {
+        const particle_t & p = viewDef.particles[i];
+
+        // ref_gl's "hack a scale up to keep particles from disappearing":
+        // past 20 units the billboard grows with distance so it stays wide
+        // enough to cover a pixel.
+        const float distance = ((p.origin[0] - viewDef.vieworg[0]) * s_forwardVec[0]) +
+                               ((p.origin[1] - viewDef.vieworg[1]) * s_forwardVec[1]) +
+                               ((p.origin[2] - viewDef.vieworg[2]) * s_forwardVec[2]);
+        const float scale = (distance < 20.0f) ? 1.0f : (1.0f + (distance * 0.004f));
+
+        const float alpha = (p.alpha < 0.0f) ? 0.0f : ((p.alpha > 1.0f) ? 1.0f : p.alpha);
+        state.rgba = (global_palette[p.color & 0xFF] & 0x00FFFFFF) |
+                     (static_cast<u32>(alpha * 128.0f) << 24);
+
+        ++s_drawStats.particles;
+
+        if (highQuality)
+        {
+            // Corner offsets along (up, right), and the matching UVs.
+            static const struct { float u, r, s, t; } kQuad[4] = {
+                { 0.0f, 0.0f, 0.0f, 0.0f },
+                { 1.0f, 0.0f, 0.0f, 1.0f },
+                { 1.0f, 1.0f, 1.0f, 1.0f },
+                { 0.0f, 1.0f, 1.0f, 0.0f },
+            };
+
+            ClipVertex quad[4];
+            for (int c = 0; c < 4; ++c)
+            {
+                quad[c].pos = {
+                    p.origin[0] + (((up[0] * kQuad[c].u) + (right[0] * kQuad[c].r)) * scale),
+                    p.origin[1] + (((up[1] * kQuad[c].u) + (right[1] * kQuad[c].r)) * scale),
+                    p.origin[2] + (((up[2] * kQuad[c].u) + (right[2] * kQuad[c].r)) * scale),
+                    1.0f
+                };
+                quad[c].st = { kQuad[c].s, kQuad[c].t, 0.0f, 0.0f };
+            }
+
+            ClipVertex triangle[3] = { quad[0], quad[1], quad[2] };
+            GatherTriangle(triangle, texture, state);
+
+            triangle[0] = quad[2];
+            triangle[1] = quad[3];
+            triangle[2] = quad[0];
+            GatherTriangle(triangle, texture, state);
+        }
+        else
+        {
+            constexpr float kUvLo = 0.0625f; // Half a texel into the 8x8 image...
+            constexpr float kUvHi = 1.0625f; // ...and one whole image across.
+
+            ClipVertex triangle[3];
+            triangle[0].pos = { p.origin[0], p.origin[1], p.origin[2], 1.0f };
+            triangle[0].st  = { kUvLo, kUvLo, 0.0f, 0.0f };
+
+            triangle[1].pos = { p.origin[0] + (up[0] * scale),
+                                p.origin[1] + (up[1] * scale),
+                                p.origin[2] + (up[2] * scale), 1.0f };
+            triangle[1].st  = { kUvHi, kUvLo, 0.0f, 0.0f };
+
+            triangle[2].pos = { p.origin[0] + (right[0] * scale),
+                                p.origin[1] + (right[1] * scale),
+                                p.origin[2] + (right[2] * scale), 1.0f };
+            triangle[2].st  = { kUvLo, kUvHi, 0.0f, 0.0f };
+
+            GatherTriangle(triangle, texture, state);
+        }
+    }
+
+    FlushScratch(texture, state);
+}
+
+// ------------------------------------------------------------------------------------------------
 // Entity pass
 // ------------------------------------------------------------------------------------------------
 
@@ -1187,10 +1481,6 @@ void RenderEntities(const refdef_t & viewDef)
     for (int e = 0; e < numEntities; ++e)
     {
         const entity_t & entity = viewDef.entities[e];
-        if (entity.flags & RF_BEAM)
-        {
-            continue; // TODO: beam cylinders (effects milestone).
-        }
 
         // Translucents draw after every solid, so they blend over a finished
         // opaque scene rather than whatever happened to be drawn so far.
@@ -1200,11 +1490,26 @@ void RenderEntities(const refdef_t & viewDef)
             continue;
         }
 
+        // Debug: Skip drawing the weapon model.
+        if ((entity.flags & RF_WEAPONMODEL) && s_skipWeaponModel->value != 0.0f)
+        {
+            continue;
+        }
+
+        // RF_BEAM wins over whatever model the entity carries - the client
+        // attaches one to its ex_flash explosions and still expects a beam
+        // (a degenerate, invisible one) rather than that model.
+        if (entity.flags & RF_BEAM)
+        {
+            DrawBeamEntity(entity);
+            continue;
+        }
+
         // entity_t::model is opaque outside the refresh module, hence the cast.
         const auto * model = reinterpret_cast<const mod::ModelInstance *>(entity.model);
-        if (model == nullptr)
+        if (model == nullptr || s_forceNullModels->value != 0.0f)
         {
-            // TODO: null-model placeholder (entity models milestone).
+            DrawNullModelEntity(viewDef, entity);
             continue;
         }
 
@@ -1233,11 +1538,15 @@ void RenderEntities(const refdef_t & viewDef)
 
 void InitViewRendering()
 {
-    s_backFaceCull    = Cvar_Get("ps2_backface_cull",    "0", 0); // NOTE: Off by default. BSP already culls backfacing surfaces.
-    s_skipWorld       = Cvar_Get("ps2_skip_world",       "0", 0);
-    s_skipBrushModels = Cvar_Get("ps2_skip_brushmodels", "0", 0);
-    s_skipSprites     = Cvar_Get("ps2_skip_sprites",     "0", 0);
-    s_skipEntities    = Cvar_Get("ps2_skip_entities",    "0", 0);
+    s_backFaceCull    = Cvar_Get("ps2_backface_cull",     "0", 0); // NOTE: Off by default. BSP already culls backfacing surfaces.
+    s_skipWorld       = Cvar_Get("ps2_skip_world",        "0", 0);
+    s_skipBrushModels = Cvar_Get("ps2_skip_brushmodels",  "0", 0);
+    s_skipSprites     = Cvar_Get("ps2_skip_sprites",      "0", 0);
+    s_skipEntities    = Cvar_Get("ps2_skip_entities",     "0", 0);
+    s_skipParticles   = Cvar_Get("ps2_skip_particles",    "0", 0);
+    s_hdParticles     = Cvar_Get("ps2_hd_particles",      "1", 0); // 1 = soft round quads instead of the classic dot.
+    s_forceNullModels = Cvar_Get("ps2_force_null_models", "0", 0); // Debug: draw every entity as the octahedron placeholder.
+    s_skipWeaponModel = Cvar_Get("ps2_skip_weapon_model", "0", 0);
 }
 
 void BeginRegistration()
@@ -1348,8 +1657,12 @@ void RenderFrame(const refdef_t & viewDef)
     RenderEntities</*isTranslucentPass=*/false>(viewDef);
     RenderEntities</*isTranslucentPass=*/true>(viewDef);
 
+    // Particles last, as ref_gl does: they are blended and depth-write
+    // masked, so they need the opaque scene already laid down behind them.
+    RenderParticles(viewDef);
+
     // Later milestones continue here: translucent world surfaces,
-    // particles, beams, null model, dynamic lights.
+    // dynamic lights.
 }
 
 } // namespace ps2::view
