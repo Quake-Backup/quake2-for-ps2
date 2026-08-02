@@ -35,6 +35,10 @@
 namespace ps2::view {
 namespace {
 
+// ------------------------------------------------------------------------------------------------
+// Cvars / common constants
+// ------------------------------------------------------------------------------------------------
+
 // Depth range for the world projection (ref_gl's values).
 constexpr float kZNear = 4.0f;
 constexpr float kZFar  = 4096.0f;
@@ -53,6 +57,7 @@ static const cvar_t * s_skipParticles     = nullptr;
 static const cvar_t * s_hdParticles       = nullptr;
 static const cvar_t * s_forceNullModels   = nullptr;
 static const cvar_t * s_skipWeaponModel   = nullptr;
+static const cvar_t * s_dynamicLightmaps  = nullptr;
 
 // Not ours to read: SetLightLevel writes the sampled light level back into it
 // every frame for the game code (hence non-const). Registered by the client
@@ -529,8 +534,8 @@ void RecursiveWorldNode(const refdef_t & viewDef, const mod::ModelInstance & wor
         break;
     }
 
-    const int  side          = (dot >= 0.0f) ? 0 : 1;
-    const bool cameraOnBack  = (side == 1);
+    const int  side         = (dot >= 0.0f) ? 0 : 1;
+    const bool cameraOnBack = (side == 1);
 
     // Recurse down the camera side first (front-to-back order)...
     RecursiveWorldNode(viewDef, world, node->children[side]);
@@ -604,8 +609,7 @@ inline void FlushScratch(const tex::Texture & texture, const SurfaceDrawState & 
     if (s_scratchVertCount > 0)
     {
         ++s_drawStats.drawBatches;
-        vu1::DrawTriangles(*state.mvp, texture, s_scratchVerts, s_scratchVertCount,
-                           state.flags);
+        vu1::DrawTriangles(*state.mvp, texture, s_scratchVerts, s_scratchVertCount, state.flags);
         s_scratchVertCount = 0;
     }
 }
@@ -933,6 +937,10 @@ void DrawAnimatedWaterPolys(const mod::ModelSurface & surf,
     }
 }
 
+// ------------------------------------------------------------------------------------------------
+// DrawTextureChains
+// ------------------------------------------------------------------------------------------------
+
 // Draws every texture chain built by RecursiveWorldNode and resets them.
 void DrawTextureChains()
 {
@@ -1103,6 +1111,121 @@ void RenderAlphaSurfaces()
 }
 
 // ------------------------------------------------------------------------------------------------
+// Dynamic Lights (dlights)
+// ------------------------------------------------------------------------------------------------
+
+constexpr float kDLightCutoff = 64.0f;
+
+// A Quake2 Dynamic Light (dlight) is a point light simulated with a circular billboarded
+// sprite that follows the light source. This is used to simulate gunshot flares for example.
+// The sprite is rendered with additive blending (e.g. glBlendFunc(GL_ONE, GL_ONE) in ref_gl).
+// This is the fallback codepath for when dynamic lightmaps are not enabled.
+void RenderDLights(const refdef_t & viewDef)
+{
+    if (s_dynamicLightmaps->value != 0.0f)
+    {
+        // Dynamic lights are simulated via the dynamic lightmap texture instead.
+        return;
+    }
+
+    const int numDlights = viewDef.num_dlights;
+    const dlight_t * light = viewDef.dlights;
+
+    for (int l = 0; l < numDlights; ++l, ++light)
+    {
+        vu1::DrawVertex vert = {};
+
+        vert.rgba = vu1::PackColorRGBA(
+            static_cast<u32>((light->color[0] * 0.2f) * 128.0f),
+            static_cast<u32>((light->color[1] * 0.2f) * 128.0f),
+            static_cast<u32>((light->color[2] * 0.2f) * 128.0f), 0x80);
+
+        const float radius = light->intensity * 0.35f;
+        vert.x = light->origin[0] - (s_forwardVec[0] * radius);
+        vert.y = light->origin[1] - (s_forwardVec[1] * radius);
+        vert.z = light->origin[2] - (s_forwardVec[2] * radius);
+
+        // TODO set triangle fan first vertex = vert
+        (void)vert;
+
+        vert.rgba = vu1::PackColorRGBA(0, 0, 0, 0x80);
+
+        for (int i = 16; i >= 0; --i)
+        {
+            const float a = static_cast<float>(i) / 16.0f * math::kPI * 2.0f;
+            const float sin = math::Sinf(a) * radius;
+            const float cos = math::Cosf(a) * radius;
+
+            vert.x = light->origin[0] + (s_rightVec[0] * cos) + (s_upVec[0] * sin);
+            vert.y = light->origin[1] + (s_rightVec[1] * cos) + (s_upVec[1] * sin);
+            vert.z = light->origin[2] + (s_rightVec[2] * cos) + (s_upVec[2] * sin);
+
+            // TODO push vert to batch
+            (void)vert;
+        }
+    }
+}
+
+void MarkDLights(const dlight_t * light, const int bit, const mod::ModelInstance & world, const mod::ModelNode * node)
+{
+    PS2_Assert(s_dynamicLightmaps->value != 0.0f);
+
+    if (node->contents != -1)
+    {
+        return;
+    }
+
+    const cplane_t * splitPlane = node->plane;
+    const float dist = DotProduct(light->origin, splitPlane->normal) - splitPlane->dist;
+
+    if (dist > light->intensity - kDLightCutoff)
+    {
+        MarkDLights(light, bit, world, node->children[0]);
+        return;
+    }
+    if (dist < -light->intensity + kDLightCutoff)
+    {
+        MarkDLights(light, bit, world, node->children[1]);
+        return;
+    }
+
+    mod::ModelSurface * surf = world.surfaces + node->firstSurface;
+    const int numSurfaces = node->numSurfaces;
+
+    // Mark the polygons:
+    for (int i = 0; i < numSurfaces; ++i, ++surf)
+    {
+        if (surf->dlightFrame != s_frameCount)
+        {
+            surf->dlightBits  = 0;
+            surf->dlightFrame = s_frameCount;
+        }
+        surf->dlightBits |= bit;
+    }
+
+    MarkDLights(light, bit, world, node->children[0]);
+    MarkDLights(light, bit, world, node->children[1]);
+}
+
+void PushDLights(const refdef_t & viewDef, const mod::ModelInstance & world)
+{
+    if (s_dynamicLightmaps->value == 0.0f)
+    {
+        // Dynamic lights are rendered as semi-transparent sprites instead.
+        // Below is the dynamic lightmaps code path.
+        return;
+    }
+
+    const dlight_t * light = viewDef.dlights;
+    const int numDlights = viewDef.num_dlights;
+
+    for (int l = 0; l < numDlights; ++l, ++light)
+    {
+        MarkDLights(light, 1 << l, world, world.nodes);
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
 // World model pass
 // ------------------------------------------------------------------------------------------------
 
@@ -1117,9 +1240,10 @@ void RenderWorldModel(const refdef_t & viewDef)
         return; // Debug: skip the world pass entirely.
     }
 
-    const mod::ModelInstance * world = mod::GetWorldModel();
+    const mod::ModelInstance * const world = mod::GetWorldModel();
     PS2_AssertMsg(world != nullptr, "RenderFrame without a world model!");
 
+    PushDLights(viewDef, *world);
     SetUpViewClusters(viewDef, *world);
     MarkLeaves(*world);
     RecursiveWorldNode(viewDef, *world, world->nodes);
@@ -1313,6 +1437,21 @@ void DrawBrushModelEntity(const refdef_t & viewDef, const entity_t & entity)
     }
 
     const math::Mat4 mvp = MakeEntityMatrix(entity, /*flipPitchAngle=*/false) * s_viewProjMatrix;
+
+    // Calculate dynamic lighting for bmodel
+    if (s_dynamicLightmaps->value != 0.0f)
+    {
+        const mod::ModelInstance * const world = mod::GetWorldModel();
+        PS2_Assert(world != nullptr);
+
+        const int numDlights = viewDef.num_dlights;
+        const dlight_t * light = viewDef.dlights;
+
+        for (int l = 0; l < numDlights; ++l, ++light)
+        {
+            MarkDLights(light, 1 << l, *world, model->nodes + model->firstNode);
+        }
+    }
 
     // ref_gl draws translucent brush models at a flat quarter alpha rather
     // than the entity's own (glColor4f(1,1,1,0.25) in R_DrawBrushModel).
@@ -1860,6 +1999,7 @@ void InitViewRendering()
     s_hdParticles       = Cvar_Get("ps2_hd_particles",        "1", 0); // 1 = soft round quads instead of the classic dot.
     s_forceNullModels   = Cvar_Get("ps2_force_null_models",   "0", 0); // Debug: draw every entity as the octahedron placeholder.
     s_skipWeaponModel   = Cvar_Get("ps2_skip_weapon_model",   "0", 0);
+    s_dynamicLightmaps  = Cvar_Get("ps2_dynamic_lightmaps",   "0", 0); // Uses the RenderDLights fallback path when = 0.
 
     // Already registered by the client; this just resolves the same object.
     s_lightLevel = Cvar_Get("r_lightlevel", "0", 0);
@@ -1868,7 +2008,7 @@ void InitViewRendering()
     constexpr float kRadiansPerStep = (2.0f * math::kPI) / static_cast<float>(kTurbSinSize);
     for (int i = 0; i < kTurbSinSize; ++i)
     {
-        s_turbSin[i] = kTurbSinAmplitude * std::sin(static_cast<float>(i) * kRadiansPerStep);
+        s_turbSin[i] = kTurbSinAmplitude * math::Sinf(static_cast<float>(i) * kRadiansPerStep);
     }
 }
 
@@ -1990,6 +2130,9 @@ void RenderFrame(const refdef_t & viewDef)
     // Then the translucent world and brush model surfaces the passes above
     // set aside, blended over the whole finished scene.
     RenderAlphaSurfaces();
+
+    // Simulated light sources with additive blending.
+    RenderDLights(viewDef);
 
     // Nothing to draw: hands the light at the camera back to the game code.
     // Where ref_gl's R_RenderFrame calls R_SetLightLevel.
