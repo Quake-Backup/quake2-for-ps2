@@ -88,6 +88,101 @@ void CoalesceFreeAt(int index)
     }
 }
 
+// Enum names for the debug dump below.
+const char * ImageTypeName(tex::ImageType type)
+{
+    switch (type)
+    {
+    case tex::ImageType::Null   : return "null";
+    case tex::ImageType::Pic    : return "pic";
+    case tex::ImageType::Skin   : return "skin";
+    case tex::ImageType::Sprite : return "sprite";
+    case tex::ImageType::Wall   : return "wall";
+    case tex::ImageType::Sky    : return "sky";
+    }
+    return "???"; // Unreachable; keeps GCC's -Wreturn-type happy.
+}
+
+const char * PixelFormatName(tex::PixelFormat format)
+{
+    switch (format)
+    {
+    case tex::PixelFormat::RGBA32   : return "rgba32";
+    case tex::PixelFormat::RGB16    : return "rgb16";
+    case tex::PixelFormat::Palette8 : return "pal8";
+    }
+    return "???"; // Unreachable; keeps GCC's -Wreturn-type happy.
+}
+
+// Prints the whole block list plus the current Stats to stdout, so a failed
+// allocation can be diagnosed from the EE emulog: which textures were holding
+// VRAM, how much each took and how recently they were bound. Blocks marked
+// [pinned] were bound this frame and so cannot be evicted; when every used
+// block is pinned the frame's working set simply does not fit. A large free
+// total next to a small largest-free-block means fragmentation instead.
+void DumpAllBlocks()
+{
+    Com_Printf("---- GS VRAM texture heap dump (frame %u) ----\n", s_frame);
+    Com_Printf("idx  addrWords  sizeWords  sizeKB  lastBound  texture\n");
+
+    int usedBlocks       = 0;
+    int pinnedBlocks     = 0;
+    int largestFreeWords = 0;
+
+    for (int i = 0; i < s_blockCount; ++i)
+    {
+        const Block & block = s_blocks[i];
+        const int addrWords = static_cast<int>(block.addrWords);
+        const int sizeKb    = block.sizeWords * 4 / 1024;
+
+        if (block.owner == nullptr)
+        {
+            if (block.sizeWords > largestFreeWords)
+            {
+                largestFreeWords = block.sizeWords;
+            }
+
+            Com_Printf("%3d  %9d  %9d  %6d  %9s  <free>\n",
+                       i, addrWords, block.sizeWords, sizeKb, "-");
+            continue;
+        }
+
+        ++usedBlocks;
+
+        const bool pinned = (block.lastBoundFrame == s_frame);
+        if (pinned)
+        {
+            ++pinnedBlocks;
+        }
+
+        const tex::Texture & texture = *block.owner;
+        Com_Printf("%3d  %9d  %9d  %6d  %9u  %s (%dx%d, %s, %s)%s%s\n",
+                   i, addrWords, block.sizeWords, sizeKb, block.lastBoundFrame,
+                   texture.name, texture.width, texture.height,
+                   PixelFormatName(texture.format), ImageTypeName(texture.type),
+                   pinned ? " [pinned]" : "", texture.dirtyPixels ? " [dirty]" : "");
+    }
+
+    const Stats stats = GetStats();
+
+    Com_Printf("Blocks   : %d used (%d pinned this frame), %d free, %d of %d descriptors\n",
+               usedBlocks,
+               pinnedBlocks,
+               s_blockCount - usedBlocks,
+               s_blockCount,
+               kMaxBlocks);
+
+    Com_Printf("Heap     : %d KB total, %d KB used, %d KB free (largest free block %d KB)\n",
+               stats.totalWords * 4 / 1024,
+               (stats.totalWords - stats.freeWords) * 4 / 1024,
+               stats.freeWords * 4 / 1024,
+               largestFreeWords * 4 / 1024);
+
+    Com_Printf("Textures : %d resident, %d uploads this frame\n",
+               stats.residentTextures,
+               stats.uploadsThisFrame);
+}
+
 } // namespace
 
 // ------------------------------------------------------------------------------------------------
@@ -210,7 +305,12 @@ Address Allocate(const tex::Texture & texture, int sizeWords, bool * outEvicted)
                 victim = i;
             }
         }
-        PS2_AssertMsg(victim >= 0, "GS texture heap too small for this frame's working set!");
+
+        if (victim < 0)
+        {
+            DumpAllBlocks();
+            Sys_Error("GS texture heap too small for this frame's working set! Failed request of %d words.", sizeWords);
+        }
 
         Com_DPrintf("VRAM: evicting '%s' (%d KB)\n",
                     s_blocks[victim].owner->name, s_blocks[victim].sizeWords * 4 / 1024);
