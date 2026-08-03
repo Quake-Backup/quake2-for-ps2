@@ -318,6 +318,19 @@ math::Vec3 ShadeEntity(const refdef_t & viewDef, const entity_t & entity, vec3_t
     return { color[0], color[1], color[2] };
 }
 
+// Clamps a shaded colour onto the 0-255 byte range. Overshoot is routine (the
+// shade dots exceed 1.0 by design); undershoot is narrower but real, since
+// CalcPointLightColor sums dlight contributions and the client emits
+// negative-colour dlights for the tracker effects (cl_ents.c's
+// V_AddLight(..., -1, -1, -1)). Both ends must be caught before the unsigned
+// cast: converting a negative float to u32 is undefined, and the value it
+// produces would flood every channel through PackColorRGBA's shifts rather
+// than just darkening one.
+inline u32 ClampColorChannel(float c)
+{
+    return (c >= 255.0f) ? 255u : ((c <= 0.0f) ? 0u : static_cast<u32>(c));
+}
+
 const u32 * BuildColorLUT(const entity_t & entity, const math::Vec3 & shadeLight, const float alpha)
 {
     // Per-entity packed vertex colours, indexed by the current frame's
@@ -327,17 +340,27 @@ const u32 * BuildColorLUT(const entity_t & entity, const math::Vec3 & shadeLight
     // malformed model must land inside the table rather than past its end.
     static u32 s_colorLUT[256];
 
-    const u32 a = static_cast<u32>(alpha * 128.0f);
+    // 0x80 is the GS's 1.0. Clamped because 'alpha' is whatever the game put
+    // on the entity, and the same unsigned-cast hazard applies.
+    const float scaledAlpha = alpha * 128.0f;
+    const u32   a = (scaledAlpha >= 128.0f) ? 128u
+                  : (scaledAlpha <= 0.0f)   ? 0u
+                                            : static_cast<u32>(scaledAlpha);
 
     if (entity.flags & kShellFlags)
     {
         // Shells shade flat - no normal-based modulation (ref_gl draws them
         // untextured in pure shell colour; the full effect lands with the
         // powersuit step).
-        const auto clamp255 = [](float c) { return (c > 255.0f) ? 255u : static_cast<u32>(c); };
-        const u32 packed = vu1::PackColorRGBA(clamp255(shadeLight.x * 128.0f),
-                                              clamp255(shadeLight.y * 128.0f),
-                                              clamp255(shadeLight.z * 128.0f), a);
+        //
+        // Scaled by 255, not the 128 the skin path below uses: this is the one
+        // branch whose batch draws with PRIM's TME bit clear, so there is no
+        // texture for a modulate identity to preserve and the byte reaches the
+        // framebuffer as-is. At 128 every shell came out at half ref_gl's
+        // brightness - a green shell (0,128,0) where GL gives (0,255,0).
+        const u32 packed = vu1::PackColorRGBA(ClampColorChannel(shadeLight.x * 255.0f),
+                                              ClampColorChannel(shadeLight.y * 255.0f),
+                                              ClampColorChannel(shadeLight.z * 255.0f), a);
         for (u32 & entry : s_colorLUT)
         {
             entry = packed;
@@ -349,15 +372,9 @@ const u32 * BuildColorLUT(const entity_t & entity, const math::Vec3 & shadeLight
     for (int i = 0; i < ArrayLength(s_colorLUT); ++i)
     {
         const float l = shadeDots[i] * 128.0f;
-        float r = l * shadeLight.x;
-        float g = l * shadeLight.y;
-        float b = l * shadeLight.z;
-        if (r > 255.0f) { r = 255.0f; }
-        if (g > 255.0f) { g = 255.0f; }
-        if (b > 255.0f) { b = 255.0f; }
-        s_colorLUT[i] = vu1::PackColorRGBA(static_cast<u32>(r),
-                                           static_cast<u32>(g),
-                                           static_cast<u32>(b), a);
+        s_colorLUT[i] = vu1::PackColorRGBA(ClampColorChannel(l * shadeLight.x),
+                                           ClampColorChannel(l * shadeLight.y),
+                                           ClampColorChannel(l * shadeLight.z), a);
     }
 
     return s_colorLUT;
