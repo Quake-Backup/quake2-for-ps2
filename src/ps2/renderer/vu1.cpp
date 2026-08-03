@@ -199,11 +199,23 @@ inline u64 MakeTestData()
                        DRAW_ENABLE, gs::DepthTestMethod());
 }
 
-// Blend function for batches drawn with the PRIM ABE bit on: the standard
-// source-alpha blend (Cs - Cd) * As / 128 + Cd. Opaque batches write it too -
-// deterministic register state, ignored while ABE is off.
-inline u64 MakeAlphaData()
+// Blend function for batches drawn with the PRIM ABE bit on. Opaque batches
+// write it too - deterministic register state, ignored while ABE is off.
+//
+// The additive form keeps C = As rather than the fixed 0x80 that would spell
+// GL_ONE literally: at As = 0x80 the two are identical, and routing the
+// source alpha through the equation lets a caller fade an additive primitive
+// per vertex (the dynamic light flares rely on it) without a third mode.
+inline u64 MakeAlphaData(bool additive)
 {
+    if (additive)
+    {
+        // (Cs - 0) * As / 128 + Cd
+        return GS_SET_ALPHA(BLEND_COLOR_SOURCE, BLEND_COLOR_ZERO,
+                            BLEND_ALPHA_SOURCE, BLEND_COLOR_DEST, 0x80);
+    }
+
+    // (Cs - Cd) * As / 128 + Cd
     return GS_SET_ALPHA(BLEND_COLOR_SOURCE, BLEND_COLOR_DEST,
                         BLEND_ALPHA_SOURCE, BLEND_COLOR_DEST, 0x80);
 }
@@ -215,7 +227,13 @@ inline u64 MakeAlphaData()
 void AddBatchGifTags(VifPacket & pkt, const tex::Texture & texture, int ctx,
                      int vertCount, DrawFlags flags)
 {
-    const bool blended = HasDrawFlag(flags, DrawFlags::Blended);
+    // Additive is a second blend equation, not a second blend switch: it
+    // brings the ABE bit and the depth-write mask along with it.
+    const bool additive = HasDrawFlag(flags, DrawFlags::Additive);
+    PS2_AssertMsg(!(additive && HasDrawFlag(flags, DrawFlags::Blended)),
+                  "Pick one blend mode - Blended and Additive are exclusive!");
+
+    const bool blended = additive || HasDrawFlag(flags, DrawFlags::Blended);
     const int  tme     = HasDrawFlag(flags, DrawFlags::Untextured) ? 0 : 1;
     const int  abe     = blended ? 1 : 0;
 
@@ -225,7 +243,7 @@ void AddBatchGifTags(VifPacket & pkt, const tex::Texture & texture, int ctx,
     pkt.AddQword(MakeTestData(), static_cast<u64>(GS_REG_TEST + ctx));
     pkt.AddQword(MakeTex1Data(texture), static_cast<u64>(GS_REG_TEX1 + ctx));
     pkt.AddQword(MakeTex0Data(texture), static_cast<u64>(GS_REG_TEX0 + ctx));
-    pkt.AddQword(MakeAlphaData(), static_cast<u64>(GS_REG_ALPHA + ctx));
+    pkt.AddQword(MakeAlphaData(additive), static_cast<u64>(GS_REG_ALPHA + ctx));
     pkt.AddQword(gs::ZBufData(blended), static_cast<u64>(GS_REG_ZBUF + ctx));
 
     // ...then the drawing tag: gouraud triangle list, STQ mapping, with the

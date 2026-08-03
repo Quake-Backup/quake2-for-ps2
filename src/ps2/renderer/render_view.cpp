@@ -601,6 +601,13 @@ struct SurfaceDrawState
     u32                rgba;  // Packed vertex colour (GS modulate: 128 = unchanged, alpha 0x80 = 1.0).
     vu1::DrawFlags     flags; // Batch flags, i.e. whether the submission blends.
     bool               cullBackFaces;
+
+    // Gouraud alpha: take each vertex's alpha from its own ClipVertex::st.z
+    // (0..1) instead of from 'rgba', whose RGB is still used for all three
+    // corners. The gather path is otherwise flat-shaded - one colour per
+    // batch - and this is the cheapest way out of that, since st is already
+    // a whole quadword the clipper interpolates and .z was spare.
+    bool               vertexAlpha;
 };
 
 // Sends the gathered scratch triangles as one batch and empties the buffer.
@@ -652,7 +659,8 @@ union ClipDists
 struct alignas(16) ClipVertex
 {
     math::Vec4 pos; // world position, w = 1
-    math::Vec4 st;  // diffuse texture coords in xy; zw unused
+    math::Vec4 st;  // diffuse texture coords in xy; .z is the vertex alpha under
+                    // SurfaceDrawState::vertexAlpha (ignored otherwise), .w unused
     ClipDists  d;
 };
 static_assert(sizeof(ClipVertex) == 64, "ClipVertex must be exactly four quadwords");
@@ -684,14 +692,25 @@ int ClipAgainstPlane(const ClipVertex * in, const int inCount, ClipVertex * out,
     return outCount;
 }
 
-inline void EmitScratchVertex(const ClipVertex & v, u32 rgba)
+// Swaps the batch colour's alpha for this vertex's own, clamped onto the GS's
+// 0..0x80 = 0..1.0 alpha scale.
+inline u32 WithVertexAlpha(u32 rgba, float alpha)
+{
+    const float scaled = alpha * 128.0f;
+    const u32   packed = (scaled >= 128.0f) ? 128u
+                       : (scaled <= 0.0f)   ? 0u
+                                            : static_cast<u32>(scaled);
+    return (rgba & 0x00FFFFFFu) | (packed << 24);
+}
+
+inline void EmitScratchVertex(const ClipVertex & v, const SurfaceDrawState & state)
 {
     vu1::DrawVertex & dst = s_scratchVerts[s_scratchVertCount++];
     dst.x    = v.pos.x;
     dst.y    = v.pos.y;
     dst.z    = v.pos.z;
     dst.w    = 1.0f;
-    dst.rgba = rgba;
+    dst.rgba = state.vertexAlpha ? WithVertexAlpha(state.rgba, v.st.z) : state.rgba;
     dst.s    = v.st.x;
     dst.t    = v.st.y;
     dst.q    = 1.0f;
@@ -765,7 +784,7 @@ void GatherTriangle(ClipVertex (&corners)[3],
         }
         for (const ClipVertex & c : corners)
         {
-            EmitScratchVertex(c, state.rgba);
+            EmitScratchVertex(c, state);
         }
         return;
     }
@@ -802,9 +821,9 @@ void GatherTriangle(ClipVertex (&corners)[3],
     }
     for (int v = 1; v < count - 1; ++v)
     {
-        EmitScratchVertex(in[0],     state.rgba);
-        EmitScratchVertex(in[v],     state.rgba);
-        EmitScratchVertex(in[v + 1], state.rgba);
+        EmitScratchVertex(in[0],     state);
+        EmitScratchVertex(in[v],     state);
+        EmitScratchVertex(in[v + 1], state);
     }
     s_drawStats.trisDrawn += count - 2;
 }
@@ -951,7 +970,8 @@ void DrawTextureChains()
         .eye   = s_eyePosition,
         .rgba  = kFullBright,
         .flags = vu1::DrawFlags::None,
-        .cullBackFaces = WorldBackFaceCullEnabled()
+        .cullBackFaces = WorldBackFaceCullEnabled(),
+        .vertexAlpha   = false
     };
 
     for (int i = 0; i < s_chainTextureCount; ++i)
@@ -1062,7 +1082,8 @@ void RenderAlphaSurfaces()
         // Both collectors already dropped the surfaces facing away from the
         // camera - the world walk by plane side, brush models by the same
         // test in model space - so the triangle test has nothing left to find here.
-        .cullBackFaces = false
+        .cullBackFaces = false,
+        .vertexAlpha   = false
     };
 
     const tex::Texture * batchTexture = nullptr;
@@ -1116,10 +1137,44 @@ void RenderAlphaSurfaces()
 
 constexpr float kDLightCutoff = 64.0f;
 
+// Rim points around a flare. ref_gl walks i = 16 down to 0, whose first and
+// last points coincide (a = 2*PI and a = 0) purely to close the fan, so there
+// are 16 distinct ones and 16 wedges.
+constexpr int kNumFlareSegs = 16;
+
+// ref_gl's 0.2 dimming of the light colour, on the 0-255 scale an untextured
+// vertex needs. Not the 128 modulate identity the textured paths use: with
+// PRIM's TME bit clear there is no texture function to be the identity of, so
+// the vertex byte lands on screen as-is and 128 would halve every flare.
+//
+// Clamped at both ends because neither is guaranteed: dlight colours are 0..1
+// by convention, but nothing bounds the top, and the client hands out negative
+// ones for its "dark light" effects (cl_ents.c's V_AddLight(..., -1, -1, -1)),
+// which would wrap catastrophically through the unsigned cast. OpenGL clamps
+// these for free in glColor3f; we do it by hand.
+inline u32 FlareChannel(float colorComponent)
+{
+    const float scaled = colorComponent * 0.2f * 255.0f;
+    return (scaled >= 255.0f) ? 255u : ((scaled <= 0.0f) ? 0u : static_cast<u32>(scaled));
+}
+
 // A Quake2 Dynamic Light (dlight) is a point light simulated with a circular billboarded
 // sprite that follows the light source. This is used to simulate gunshot flares for example.
 // The sprite is rendered with additive blending (e.g. glBlendFunc(GL_ONE, GL_ONE) in ref_gl).
 // This is the fallback codepath for when dynamic lightmaps are not enabled.
+//
+// Geometry is ref_gl's R_RenderDlight: a fan whose rim lies on the camera
+// plane and whose centre is pulled one radius *towards* the camera, so it is
+// really a shallow cone pointed at the eye rather than a flat disc.
+//
+// ref_gl fades the flare out by interpolating the vertex colour from the light
+// colour at the centre to black at the rim, and adding that. We interpolate
+// the vertex *alpha* from 1 to 0 over a flat-coloured fan instead, which the
+// additive blend (Cs * As + Cd) makes arithmetically identical - both add
+// colour * (1 - r) at radius fraction r - and which the flat-shaded gather
+// path can actually express, since only the alpha has to vary per vertex.
+// It also lets the batch's alpha test discard the invisible outer rim rather
+// than blending zeroes over it.
 void RenderDLights(const refdef_t & viewDef)
 {
     if (s_dynamicLightmaps->value != 0.0f)
@@ -1129,41 +1184,71 @@ void RenderDLights(const refdef_t & viewDef)
     }
 
     const int numDlights = viewDef.num_dlights;
-    const dlight_t * light = viewDef.dlights;
+    if (numDlights <= 0)
+    {
+        return;
+    }
 
+    // Untextured, but a batch still binds one.
+    const tex::Texture & texture = tex::DebugTexture();
+
+    SurfaceDrawState state = {
+        .mvp   = &s_viewProjMatrix, // Billboards are built in world space.
+        .eye   = s_eyePosition,
+        .rgba  = 0, // Per light; filled in below.
+        .flags = vu1::DrawFlags::Additive | vu1::DrawFlags::Untextured,
+        // Camera-facing, and the wedges of one flare never overlap, so there
+        // is nothing to cull. Culling them would actively hurt: the apex sits
+        // a full radius off the rim plane, tilting each wedge ~45 degrees off
+        // the view axis, so a light near the camera and off to one side would
+        // lose whole wedges and show a pie-slice notch.
+        .cullBackFaces = false,
+        .vertexAlpha   = true // The centre-to-rim fade rides in st.z.
+    };
+
+    const dlight_t * light = viewDef.dlights;
     for (int l = 0; l < numDlights; ++l, ++light)
     {
-        vu1::DrawVertex vert = {};
-
-        vert.rgba = vu1::PackColorRGBA(
-            static_cast<u32>((light->color[0] * 0.2f) * 128.0f),
-            static_cast<u32>((light->color[1] * 0.2f) * 128.0f),
-            static_cast<u32>((light->color[2] * 0.2f) * 128.0f), 0x80);
-
         const float radius = light->intensity * 0.35f;
-        vert.x = light->origin[0] - (s_forwardVec[0] * radius);
-        vert.y = light->origin[1] - (s_forwardVec[1] * radius);
-        vert.z = light->origin[2] - (s_forwardVec[2] * radius);
 
-        // TODO set triangle fan first vertex = vert
-        (void)vert;
+        state.rgba = vu1::PackColorRGBA(FlareChannel(light->color[0]),
+                                        FlareChannel(light->color[1]),
+                                        FlareChannel(light->color[2]), 0x80);
 
-        vert.rgba = vu1::PackColorRGBA(0, 0, 0, 0x80);
+        // The cone apex, at full alpha.
+        ClipVertex centre;
+        centre.pos = { light->origin[0] - (s_forwardVec[0] * radius),
+                       light->origin[1] - (s_forwardVec[1] * radius),
+                       light->origin[2] - (s_forwardVec[2] * radius), 1.0f };
+        centre.st  = { 0.0f, 0.0f, 1.0f, 0.0f };
 
-        for (int i = 16; i >= 0; --i)
+        // The rim, at zero alpha. ref_gl's descending loop is the same ring
+        // walked the other way round, which is why the sine is negated -
+        // keeping that preserves its winding.
+        ClipVertex rim[kNumFlareSegs];
+        for (int i = 0; i < kNumFlareSegs; ++i)
         {
-            const float a = static_cast<float>(i) / 16.0f * math::kPI * 2.0f;
-            const float sin = math::Sinf(a) * radius;
-            const float cos = math::Cosf(a) * radius;
+            const float angle = (static_cast<float>(i) / kNumFlareSegs) * (math::kPI * 2.0f);
+            const float c     =  math::Cosf(angle) * radius;
+            const float s     = -math::Sinf(angle) * radius;
 
-            vert.x = light->origin[0] + (s_rightVec[0] * cos) + (s_upVec[0] * sin);
-            vert.y = light->origin[1] + (s_rightVec[1] * cos) + (s_upVec[1] * sin);
-            vert.z = light->origin[2] + (s_rightVec[2] * cos) + (s_upVec[2] * sin);
-
-            // TODO push vert to batch
-            (void)vert;
+            rim[i].pos = { light->origin[0] + (s_rightVec[0] * c) + (s_upVec[0] * s),
+                           light->origin[1] + (s_rightVec[1] * c) + (s_upVec[1] * s),
+                           light->origin[2] + (s_rightVec[2] * c) + (s_upVec[2] * s), 1.0f };
+            rim[i].st  = { 0.0f, 0.0f, 0.0f, 0.0f };
         }
+
+        // Fan to triangle list, the only topology the VU path takes.
+        for (int i = 0; i < kNumFlareSegs; ++i)
+        {
+            ClipVertex wedge[3] = { centre, rim[i], rim[(i + 1) % kNumFlareSegs] };
+            GatherTriangle(wedge, texture, state);
+        }
+
+        ++s_drawStats.dlights;
     }
+
+    FlushScratch(texture, state);
 }
 
 void MarkDLights(const dlight_t * light, const int bit, const mod::ModelInstance & world, const mod::ModelNode * node)
@@ -1463,7 +1548,8 @@ void DrawBrushModelEntity(const refdef_t & viewDef, const entity_t & entity)
         .eye   = { modelOrigin[0], modelOrigin[1], modelOrigin[2], 1.0f },
         .rgba  = translucent ? vu1::PackColorRGBA(128, 128, 128, 0x80 / 4) : kFullBright,
         .flags = translucent ? vu1::DrawFlags::Blended : vu1::DrawFlags::None,
-        .cullBackFaces = WorldBackFaceCullEnabled()
+        .cullBackFaces = WorldBackFaceCullEnabled(),
+        .vertexAlpha   = false
     };
 
     // Consecutive surfaces usually share a texture, so the batch only breaks
@@ -1585,7 +1671,8 @@ void DrawSpriteEntity(const entity_t & entity)
         .flags = (alpha < 1.0f) ? vu1::DrawFlags::Blended : vu1::DrawFlags::None,
         // Never back-face culled: the quad is built from the camera's own
         // right/up vectors, so it cannot face away and the test would be useless.
-        .cullBackFaces = false
+        .cullBackFaces = false,
+        .vertexAlpha   = false
     };
 
     // The four corners, in ref_gl's order: bottom-left, top-left, top-right,
@@ -1667,7 +1754,8 @@ void DrawBeamEntity(const entity_t & entity)
         // A cylinder does have a far half, but keeping it only makes the blend
         // slightly denser - whereas culling it with the ring's winding guessed
         // wrong would turn the beam inside out.
-        .cullBackFaces = false
+        .cullBackFaces = false,
+        .vertexAlpha   = false
     };
 
     math::Vec4 startPoints[kNumBeamSegs];
@@ -1754,7 +1842,8 @@ void DrawNullModelEntity(const refdef_t & viewDef, const entity_t & entity)
         .flags = vu1::DrawFlags::None,
         // Eight triangles for a debug marker: not worth risking the fans
         // coming out inside-out and hiding the very thing they exist to show.
-        .cullBackFaces = false
+        .cullBackFaces = false,
+        .vertexAlpha   = false
     };
 
     constexpr float kRadius = 16.0f;
@@ -1839,7 +1928,8 @@ void RenderParticles(const refdef_t & viewDef)
         .eye   = s_eyePosition,
         .rgba  = 0, // Per particle; filled in below.
         .flags = vu1::DrawFlags::Blended,
-        .cullBackFaces = false // Camera-facing, like sprites: nothing to cull.
+        .cullBackFaces = false, // Camera-facing, like sprites: nothing to cull.
+        .vertexAlpha   = false
     };
 
     for (int i = 0; i < numParticles; ++i)
@@ -2123,6 +2213,12 @@ void RenderFrame(const refdef_t & viewDef)
     RenderEntities</*isTranslucentPass=*/false>(viewDef);
     RenderEntities</*isTranslucentPass=*/true>(viewDef);
 
+    // Simulated light sources with additive blending. Before the two passes
+    // below, where ref_gl's R_RenderView puts R_RenderDlights: all three are
+    // depth-write masked, so what the order decides is which of them get to
+    // blend *over* a flare. Water and particles in front of one should dim it.
+    RenderDLights(viewDef);
+
     // Particles next, as ref_gl does: they are blended and depth-write
     // masked, so they need the opaque scene already laid down behind them.
     RenderParticles(viewDef);
@@ -2131,14 +2227,11 @@ void RenderFrame(const refdef_t & viewDef)
     // set aside, blended over the whole finished scene.
     RenderAlphaSurfaces();
 
-    // Simulated light sources with additive blending.
-    RenderDLights(viewDef);
-
     // Nothing to draw: hands the light at the camera back to the game code.
     // Where ref_gl's R_RenderFrame calls R_SetLightLevel.
     SetLightLevel(viewDef);
 
-    // TODO: Later milestones continue here: dynamic lights, lightmapped surfaces.
+    // TODO: lightmapped surfaces.
 }
 
 } // namespace ps2::view

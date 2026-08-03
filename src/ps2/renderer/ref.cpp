@@ -257,6 +257,7 @@ void DrawDrawStatsOverlay()
         { "Tris",    stats.trisDrawn     },
         { "Ents",    stats.entities      },
         { "Prts",    stats.particles     },
+        { "DLights", stats.dlights       },
         { "Batches", stats.drawBatches   },
         { "Clipped", stats.trisClipped   },
         { "Culled",  stats.trisCulled    },

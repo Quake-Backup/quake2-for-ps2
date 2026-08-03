@@ -59,11 +59,21 @@ constexpr float kGuardBandNdcLimit = 0.8f;
 // depth writes - the z-test still reads, so they sort against opaque
 // geometry but never occlude. Untextured batches draw pure gouraud colour
 // (the texture argument is still bound, just not sampled).
+//
+// Additive replaces Blended's equation with Cs * As + Cd - the source colour
+// added to the framebuffer instead of interpolated with it - and implies
+// everything else Blended does, including the depth-write mask. The two are
+// mutually exclusive; passing both asserts. Note the alpha still scales the
+// contribution, so a fully opaque (As = 0x80) additive batch is exactly
+// OpenGL's glBlendFunc(GL_ONE, GL_ONE) while a fading one needs no second
+// blend mode. Additive results saturate rather than wrap: gs::Init leaves
+// the GS COLCLAMP register enabled.
 enum class DrawFlags : u32
 {
     None       = 0,
     Blended    = 1 << 0,
     Untextured = 1 << 1,
+    Additive   = 1 << 2,
 };
 
 constexpr DrawFlags operator|(DrawFlags a, DrawFlags b)
