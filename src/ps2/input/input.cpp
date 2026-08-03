@@ -64,10 +64,10 @@ constexpr ButtonMapping kButtonMap[] = {
     { PAD_CIRCLE,   K_ESCAPE,     K_JOY2,   "+movedown"  }, // crouch
     { PAD_SQUARE,   K_ENTER,      K_JOY3,   "+use"       },
     { PAD_TRIANGLE, K_ESCAPE,     K_JOY4,   "cmd help"   },
-    { PAD_L1,       K_PGUP,       K_AUX2,   "+speed"     },
-    { PAD_R1,       K_PGDN,       K_AUX1,   "+attack"    },
-    { PAD_L2,       K_AUX4,       K_AUX4,   "weapprev"   },
-    { PAD_R2,       K_AUX3,       K_AUX3,   "weapnext"   },
+    { PAD_L2,       K_PGUP,       K_AUX2,   "+speed"     },
+    { PAD_R2,       K_PGDN,       K_AUX1,   "+attack"    },
+    { PAD_R1,       K_AUX4,       K_AUX4,   "weapprev"   },
+    { PAD_L1,       K_AUX3,       K_AUX3,   "weapnext"   },
     { PAD_L3,       K_AUX9,       K_AUX9,   nullptr      },
     { PAD_R3,       K_AUX10,      K_AUX10,  "centerview" },
     { PAD_START,    K_ESCAPE,     K_ESCAPE, nullptr      },
@@ -92,14 +92,14 @@ static int s_heldKeys[kNumButtons] = {};
 
 // Stick tuning (cvar names and defaults follow the original win32 joystick code;
 // negate a sensitivity to invert that axis).
-static cvar_t * s_yawSensitivity;
-static cvar_t * s_pitchSensitivity;
-static cvar_t * s_forwardSensitivity;
-static cvar_t * s_sideSensitivity;
-static cvar_t * s_yawThreshold;
-static cvar_t * s_pitchThreshold;
-static cvar_t * s_forwardThreshold;
-static cvar_t * s_sideThreshold;
+static const cvar_t * s_yawSensitivity;
+static const cvar_t * s_pitchSensitivity;
+static const cvar_t * s_forwardSensitivity;
+static const cvar_t * s_sideSensitivity;
+static const cvar_t * s_yawThreshold;
+static const cvar_t * s_pitchThreshold;
+static const cvar_t * s_forwardThreshold;
+static const cvar_t * s_sideThreshold;
 
 // ------------------------------------------------------------------------------------------------
 // Helpers
@@ -219,30 +219,30 @@ void IN_Move(usercmd_t * cmd)
     const float speed = running ? 2.0f : 1.0f;
     const float angleSpeed = speed * cls.frametime;
 
-    // Left stick rotates the camera. Stick right = turn right (yaw decreases),
+    // Right stick rotates the camera. Stick right = turn right (yaw decreases),
     // stick up = look up (pitch decreases); flip a sensitivity cvar to invert.
-    const float yaw = s_gamepad.LeftStickX();
+    const float yaw = s_gamepad.RightStickX();
     if (std::fabs(yaw) > s_yawThreshold->value)
     {
         cl.viewangles[YAW] -= yaw * s_yawSensitivity->value * angleSpeed * cl_yawspeed->value;
     }
 
-    const float pitch = s_gamepad.LeftStickY();
+    const float pitch = s_gamepad.RightStickY();
     if (std::fabs(pitch) > s_pitchThreshold->value)
     {
         cl.viewangles[PITCH] += pitch * s_pitchSensitivity->value * angleSpeed * cl_pitchspeed->value;
     }
 
-    // Right stick moves the player. CL_FinishMove clamps the pitch and packs the
+    // Left stick moves the player. CL_FinishMove clamps the pitch and packs the
     // final angles/moves after IN_Move returns.
-    const float forward = s_gamepad.RightStickY();
+    const float forward = s_gamepad.LeftStickY();
     if (std::fabs(forward) > s_forwardThreshold->value)
     {
         cmd->forwardmove = static_cast<short>(static_cast<float>(cmd->forwardmove) -
             (forward * s_forwardSensitivity->value * speed * cl_forwardspeed->value));
     }
 
-    const float side = s_gamepad.RightStickX();
+    const float side = s_gamepad.LeftStickX();
     if (std::fabs(side) > s_sideThreshold->value)
     {
         cmd->sidemove = static_cast<short>(static_cast<float>(cmd->sidemove) +
