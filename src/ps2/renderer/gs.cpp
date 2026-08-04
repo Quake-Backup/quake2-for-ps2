@@ -502,6 +502,20 @@ void ReleaseTexture(const tex::Texture & texture)
     s_vramReuseHazard = true;
 }
 
+void DefragVramHeap()
+{
+    if (!vram::Defragment())
+    {
+        return;
+    }
+
+    // Every texture is non-resident now: the 2D dedupe would otherwise skip the
+    // rebind of the current one and sample VRAM it no longer owns, and queued
+    // draws may still reference the recycled heap, same as ReleaseTexture.
+    s_currentTex      = nullptr;
+    s_vramReuseHazard = true;
+}
+
 void SetTextureFor2D(const tex::Texture & texture)
 {
     PS2_Assert(texture.type != tex::ImageType::Null && texture.pixels != nullptr);

@@ -53,6 +53,19 @@ bool BoundThisFrame(const tex::Texture & texture);
 // caller must treat it like evicted VRAM: sync the GS before writing over it.
 void Free(const tex::Texture & texture);
 
+// Compacts the heap the cheap way: evicts every resident texture and remakes it
+// as one contiguous free range. Nothing is lost - as with any eviction the pixels
+// stay in EE RAM and re-upload on the next bind, which repacks the live set from
+// the heap base with no holes, and only for the textures actually bound again.
+// Returns true when anything was evicted; the caller must then sync the GS before
+// the recycled VRAM is written, exactly like Allocate's *outEvicted.
+//
+// Meant for level changes: freeing the previous level's textures leaves holes
+// between the surviving textures, and the new level's first frame binds its whole
+// working set at once - every block pinned, nothing evictable - so an allocation
+// can fail there with plenty of free VRAM left, just not contiguous.
+bool Defragment();
+
 // Records one texture DMA upload for the per-frame counter. Called by
 // gs::EnsureTextureResident each time it transfers a texture's pixels into VRAM
 // (a first upload or a dirty re-upload); reset each frame by BeginFrame().

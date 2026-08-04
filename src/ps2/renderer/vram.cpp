@@ -2,7 +2,7 @@
  * File: vram.cpp
  * Brief: GS VRAM texture heap. See vram.h.
  *
- *  The heap is tracked as a small, address-ordered array of blocks, each either
+ *  The heap is tracked as an address-ordered linked list of blocks, each either
  *  free or owned by one texture (modelled on gsKit's TexManager block list).
  *  Allocation is first-fit, splitting off the free remainder; when nothing fits,
  *  the least-recently-bound texture is evicted and its block coalesced with free
@@ -41,51 +41,134 @@ struct Block
     int                  sizeWords;
     const tex::Texture * owner;          // nullptr = free block
     u32                  lastBoundFrame; // LRU stamp; valid while owned
+    Block *              next;           // neighbours by address; null at the heap ends
+    Block *              prev;
 };
 
-static Block s_blocks[kMaxBlocks];
-static int   s_blockCount = 0;
-static u32   s_frame      = 0;
+// Block descriptors are handed out from s_unusedBlocks - the pool's free-list,
+// threaded through 'next' - and linked into s_blockList, which stays sorted by
+// address, so a block's list neighbours are always its VRAM neighbours. That is
+// what makes splitting and coalescing a pointer fixup instead of an array shift,
+// and it keeps Block pointers stable for as long as the block lives.
+static Block   s_blockPool[kMaxBlocks];
+static Block * s_unusedBlocks = nullptr;
+static Block * s_blockList    = nullptr; // null until Init()
+static int     s_blockCount   = 0;       // blocks currently in s_blockList
+static u32     s_frame        = 0;
 
-// Debug-overlay stats: the heap's total size and this frame's upload count.
-static int s_heapTotalWords    = 0;
-static int s_uploadsThisFrame  = 0;
+// The heap extent Init() took over (Defragment() remakes the list from it) and
+// the debug-overlay stat for this frame's upload count.
+static int s_heapBaseWords    = 0;
+static int s_heapTotalWords   = 0;
+static int s_uploadsThisFrame = 0;
 
-void InsertBlockAt(int index)
+// Takes a descriptor from the pool and fills it in as a free block. The caller
+// links it into the heap list (LinkAfter); ResetHeap makes the list head.
+Block * NewBlock(Address addrWords, int sizeWords)
 {
-    PS2_AssertMsg(s_blockCount < kMaxBlocks, "Out of VRAM block descriptors!");
-    for (int i = s_blockCount; i > index; --i)
-    {
-        s_blocks[i] = s_blocks[i - 1];
-    }
+    PS2_AssertMsg(s_unusedBlocks != nullptr, "Out of VRAM block descriptors!");
+
+    Block * block  = s_unusedBlocks;
+    s_unusedBlocks = block->next;
+
+    block->addrWords      = addrWords;
+    block->sizeWords      = sizeWords;
+    block->owner          = nullptr;
+    block->lastBoundFrame = 0;
+    block->next           = nullptr;
+    block->prev           = nullptr;
+
     ++s_blockCount;
+    return block;
 }
 
-void RemoveBlockAt(int index)
+// Unlinks the block from the heap list and returns its descriptor to the pool.
+// The caller's pointer dangles afterwards.
+void DeleteBlock(Block * block)
 {
-    for (int i = index; i < s_blockCount - 1; ++i)
+    if (block->prev != nullptr)
     {
-        s_blocks[i] = s_blocks[i + 1];
+        block->prev->next = block->next;
     }
+    else
+    {
+        s_blockList = block->next; // it was the list head
+    }
+
+    if (block->next != nullptr)
+    {
+        block->next->prev = block->prev;
+    }
+
+    block->owner   = nullptr;
+    block->prev    = nullptr;
+    block->next    = s_unusedBlocks;
+    s_unusedBlocks = block;
+
     --s_blockCount;
 }
 
-// Merges the free block at 'index' with free neighbours, keeping the invariant
-// that no two adjacent blocks are both free.
-void CoalesceFreeAt(int index)
+// Links a block into the heap list right after 'after'.
+void LinkAfter(Block * after, Block * block)
 {
-    PS2_Assert(s_blocks[index].owner == nullptr);
+    block->prev = after;
+    block->next = after->next;
 
-    if (index + 1 < s_blockCount && s_blocks[index + 1].owner == nullptr)
+    if (after->next != nullptr)
     {
-        s_blocks[index].sizeWords += s_blocks[index + 1].sizeWords;
-        RemoveBlockAt(index + 1);
+        after->next->prev = block;
     }
-    if (index > 0 && s_blocks[index - 1].owner == nullptr)
+    after->next = block;
+}
+
+// Drops the whole list and remakes the heap as one free block spanning it all.
+// Callers deal with the owners first - this only rebuilds the bookkeeping.
+void ResetHeap()
+{
+    for (int i = 0; i < kMaxBlocks; ++i)
     {
-        s_blocks[index - 1].sizeWords += s_blocks[index].sizeWords;
-        RemoveBlockAt(index);
+        s_blockPool[i].owner = nullptr; // no stale Texture pointers left in the pool
+        s_blockPool[i].next  = (i + 1 < kMaxBlocks) ? &s_blockPool[i + 1] : nullptr;
     }
+
+    s_unusedBlocks = &s_blockPool[0];
+    s_blockCount   = 0;
+    s_blockList    = NewBlock(Address(s_heapBaseWords), s_heapTotalWords);
+}
+
+// Merges the free block with its free neighbours, keeping the invariant that no
+// two adjacent blocks are both free. 'block' itself may be merged away into its
+// predecessor, so the caller must not touch it afterwards.
+void CoalesceFree(Block * block)
+{
+    PS2_Assert(block->owner == nullptr);
+
+    Block * next = block->next;
+    if (next != nullptr && next->owner == nullptr)
+    {
+        block->sizeWords += next->sizeWords;
+        DeleteBlock(next);
+    }
+
+    Block * prev = block->prev;
+    if (prev != nullptr && prev->owner == nullptr)
+    {
+        prev->sizeWords += block->sizeWords;
+        DeleteBlock(block);
+    }
+}
+
+// The block a texture owns, or null when it holds none.
+Block * FindBlockFor(const tex::Texture & texture)
+{
+    for (Block * block = s_blockList; block != nullptr; block = block->next)
+    {
+        if (block->owner == &texture)
+        {
+            return block;
+        }
+    }
+    return nullptr;
 }
 
 // Enum names for the debug dump below.
@@ -125,39 +208,39 @@ void DumpAllBlocks()
     Com_Printf("---- GS VRAM texture heap dump (frame %u) ----\n", s_frame);
     Com_Printf("idx  addrWords  sizeWords  sizeKB  lastBound  texture\n");
 
+    int index            = 0;
     int usedBlocks       = 0;
     int pinnedBlocks     = 0;
     int largestFreeWords = 0;
 
-    for (int i = 0; i < s_blockCount; ++i)
+    for (const Block * block = s_blockList; block != nullptr; block = block->next, ++index)
     {
-        const Block & block = s_blocks[i];
-        const int addrWords = static_cast<int>(block.addrWords);
-        const int sizeKb    = block.sizeWords * 4 / 1024;
+        const int addrWords = static_cast<int>(block->addrWords);
+        const int sizeKb    = block->sizeWords * 4 / 1024;
 
-        if (block.owner == nullptr)
+        if (block->owner == nullptr)
         {
-            if (block.sizeWords > largestFreeWords)
+            if (block->sizeWords > largestFreeWords)
             {
-                largestFreeWords = block.sizeWords;
+                largestFreeWords = block->sizeWords;
             }
 
             Com_Printf("%3d  %9d  %9d  %6d  %9s  <free>\n",
-                       i, addrWords, block.sizeWords, sizeKb, "-");
+                       index, addrWords, block->sizeWords, sizeKb, "-");
             continue;
         }
 
         ++usedBlocks;
 
-        const bool pinned = (block.lastBoundFrame == s_frame);
+        const bool pinned = (block->lastBoundFrame == s_frame);
         if (pinned)
         {
             ++pinnedBlocks;
         }
 
-        const tex::Texture & texture = *block.owner;
+        const tex::Texture & texture = *block->owner;
         Com_Printf("%3d  %9d  %9d  %6d  %9u  %s (%dx%d, %s, %s)%s%s\n",
-                   i, addrWords, block.sizeWords, sizeKb, block.lastBoundFrame,
+                   index, addrWords, block->sizeWords, sizeKb, block->lastBoundFrame,
                    texture.name, texture.width, texture.height,
                    PixelFormatName(texture.format), ImageTypeName(texture.type),
                    pinned ? " [pinned]" : "", texture.dirtyPixels ? " [dirty]" : "");
@@ -169,8 +252,7 @@ void DumpAllBlocks()
                usedBlocks,
                pinnedBlocks,
                s_blockCount - usedBlocks,
-               s_blockCount,
-               kMaxBlocks);
+               s_blockCount, kMaxBlocks);
 
     Com_Printf("Heap     : %d KB total, %d KB used, %d KB free (largest free block %d KB)\n",
                stats.totalWords * 4 / 1024,
@@ -191,7 +273,7 @@ void DumpAllBlocks()
 
 void Init(int heapBaseWords)
 {
-    PS2_AssertMsg(s_blockCount == 0, "vram::Init called twice!");
+    PS2_AssertMsg(s_blockList == nullptr, "vram::Init called twice!");
     PS2_Assert(heapBaseWords > 0 && heapBaseWords < kVramTotalWords);
 
     int heapEndWords = kVramTotalWords;
@@ -201,11 +283,11 @@ void Init(int heapBaseWords)
         PS2_Assert(heapEndWords <= kVramTotalWords);
     }
 
-    s_blocks[0] = { Address(heapBaseWords), heapEndWords - heapBaseWords, nullptr, 0 };
-    s_blockCount = 1;
-    s_heapTotalWords = s_blocks[0].sizeWords;
+    s_heapBaseWords  = heapBaseWords;
+    s_heapTotalWords = heapEndWords - heapBaseWords;
+    ResetHeap();
 
-    Com_Printf("GS texture heap: %d KB of VRAM.\n", s_blocks[0].sizeWords * 4 / 1024);
+    Com_Printf("GS texture heap: %d KB of VRAM.\n", s_heapTotalWords * 4 / 1024);
 }
 
 void BeginFrame()
@@ -256,7 +338,7 @@ int TextureFootprintWords(int width, int height, int psm)
 
 Address Allocate(const tex::Texture & texture, int sizeWords, bool * outEvicted)
 {
-    PS2_AssertMsg(s_blockCount > 0, "vram::Init not called!");
+    PS2_AssertMsg(s_blockList != nullptr, "vram::Init not called!");
     PS2_AssertMsg(texture.vramAddr == tex::Texture::kNotResident, "Texture already resident!");
     PS2_Assert(sizeWords > 0 && outEvicted != nullptr);
 
@@ -265,60 +347,56 @@ Address Allocate(const tex::Texture & texture, int sizeWords, bool * outEvicted)
     for (;;)
     {
         // First fit among the free blocks.
-        for (int i = 0; i < s_blockCount; ++i)
+        for (Block * block = s_blockList; block != nullptr; block = block->next)
         {
-            if (s_blocks[i].owner != nullptr || s_blocks[i].sizeWords < sizeWords)
+            if (block->owner != nullptr || block->sizeWords < sizeWords)
             {
                 continue;
             }
 
-            if (s_blocks[i].sizeWords > sizeWords)
+            if (block->sizeWords > sizeWords)
             {
                 // Split off the free remainder.
-                InsertBlockAt(i + 1);
-                s_blocks[i + 1] = {
-                    Address(static_cast<int>(s_blocks[i].addrWords) + sizeWords),
-                    s_blocks[i].sizeWords - sizeWords,
-                    nullptr,
-                    0
-                };
-                s_blocks[i].sizeWords = sizeWords;
+                Block * remainder = NewBlock(Address(static_cast<int>(block->addrWords) + sizeWords),
+                                             block->sizeWords - sizeWords);
+                LinkAfter(block, remainder);
+                block->sizeWords = sizeWords;
             }
 
-            s_blocks[i].owner = &texture;
-            s_blocks[i].lastBoundFrame = s_frame;
-            return s_blocks[i].addrWords;
+            block->owner          = &texture;
+            block->lastBoundFrame = s_frame;
+            return block->addrWords;
         }
 
         // Nothing fits: evict the least-recently-bound texture and retry.
         // Textures bound this frame are off-limits - their draws may still be
         // queued in the frame packet or in flight on the GS.
-        int victim = -1;
-        for (int i = 0; i < s_blockCount; ++i)
+        Block * victim = nullptr;
+        for (Block * block = s_blockList; block != nullptr; block = block->next)
         {
-            if (s_blocks[i].owner == nullptr || s_blocks[i].lastBoundFrame == s_frame)
+            if (block->owner == nullptr || block->lastBoundFrame == s_frame)
             {
                 continue;
             }
-            if (victim < 0 || s_blocks[i].lastBoundFrame < s_blocks[victim].lastBoundFrame)
+            if (victim == nullptr || block->lastBoundFrame < victim->lastBoundFrame)
             {
-                victim = i;
+                victim = block;
             }
         }
 
-        if (victim < 0)
+        if (victim == nullptr)
         {
             DumpAllBlocks();
             Sys_Error("GS texture heap too small for this frame's working set! Failed request of %d words.", sizeWords);
+            return Address::Invalid; // unreachable; Sys_Error halts.
         }
 
-        Com_DPrintf("VRAM: evicting '%s' (%d KB)\n",
-                    s_blocks[victim].owner->name, s_blocks[victim].sizeWords * 4 / 1024);
+        Com_DPrintf("VRAM: evicting '%s' (%d KB)\n", victim->owner->name, victim->sizeWords * 4 / 1024);
 
-        s_blocks[victim].owner->vramAddr = tex::Texture::kNotResident;
-        s_blocks[victim].owner = nullptr;
+        victim->owner->vramAddr = tex::Texture::kNotResident;
+        victim->owner = nullptr;
         *outEvicted = true;
-        CoalesceFreeAt(victim);
+        CoalesceFree(victim);
     }
 }
 
@@ -326,31 +404,27 @@ void Touch(const tex::Texture & texture)
 {
     PS2_AssertMsg(texture.vramAddr != tex::Texture::kNotResident, "Touch on a non-resident texture!");
 
-    for (int i = 0; i < s_blockCount; ++i)
+    Block * block = FindBlockFor(texture);
+    if (block != nullptr)
     {
-        if (s_blocks[i].owner == &texture)
-        {
-            s_blocks[i].lastBoundFrame = s_frame;
-            return;
-        }
+        block->lastBoundFrame = s_frame;
+        return;
     }
 
-    PS2_AssertMsg(false, "Resident texture has no VRAM block!");
+    Sys_Error("Resident texture has no VRAM block!");
 }
 
 bool BoundThisFrame(const tex::Texture & texture)
 {
     PS2_AssertMsg(texture.vramAddr != tex::Texture::kNotResident, "BoundThisFrame on a non-resident texture!");
 
-    for (int i = 0; i < s_blockCount; ++i)
+    const Block * block = FindBlockFor(texture);
+    if (block != nullptr)
     {
-        if (s_blocks[i].owner == &texture)
-        {
-            return s_blocks[i].lastBoundFrame == s_frame;
-        }
+        return block->lastBoundFrame == s_frame;
     }
 
-    PS2_AssertMsg(false, "Resident texture has no VRAM block!");
+    Sys_Error("Resident texture has no VRAM block!");
     return false;
 }
 
@@ -361,18 +435,41 @@ void Free(const tex::Texture & texture)
         return;
     }
 
-    for (int i = 0; i < s_blockCount; ++i)
+    Block * block = FindBlockFor(texture);
+    if (block != nullptr)
     {
-        if (s_blocks[i].owner == &texture)
+        texture.vramAddr = tex::Texture::kNotResident;
+        block->owner     = nullptr;
+        CoalesceFree(block);
+        return;
+    }
+
+    Sys_Error("Resident texture has no VRAM block!");
+}
+
+bool Defragment()
+{
+    PS2_AssertMsg(s_blockList != nullptr, "vram::Init not called!");
+
+    if (s_blockList->next == nullptr)
+    {
+        return false; // a single block is unfragmented by definition
+    }
+
+    int evicted = 0;
+    for (Block * block = s_blockList; block != nullptr; block = block->next)
+    {
+        if (block->owner != nullptr)
         {
-            texture.vramAddr  = tex::Texture::kNotResident;
-            s_blocks[i].owner = nullptr;
-            CoalesceFreeAt(i);
-            return;
+            block->owner->vramAddr = tex::Texture::kNotResident;
+            ++evicted;
         }
     }
 
-    PS2_AssertMsg(false, "Resident texture has no VRAM block!");
+    ResetHeap();
+
+    Com_DPrintf("VRAM: heap defragmented, %d resident textures evicted.\n", evicted);
+    return evicted > 0;
 }
 
 void NoteTextureUpload()
@@ -386,11 +483,11 @@ Stats GetStats()
     stats.totalWords       = s_heapTotalWords;
     stats.uploadsThisFrame = s_uploadsThisFrame;
 
-    for (int i = 0; i < s_blockCount; ++i)
+    for (const Block * block = s_blockList; block != nullptr; block = block->next)
     {
-        if (s_blocks[i].owner == nullptr)
+        if (block->owner == nullptr)
         {
-            stats.freeWords += s_blocks[i].sizeWords;
+            stats.freeWords += block->sizeWords;
         }
         else
         {

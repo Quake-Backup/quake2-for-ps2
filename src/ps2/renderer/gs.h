@@ -84,6 +84,12 @@ void EnsureTextureResident(const tex::Texture & texture);
 // playback stops); it self-heals via re-upload if bound again later.
 void ReleaseTexture(const tex::Texture & texture);
 
+// Compacts the GS texture heap by evicting everything resident (see
+// vram::Defragment); the textures re-upload packed on their next bind. Call on
+// level changes, after releasing the outgoing level's textures - the holes they
+// leave behind can otherwise fail an allocation while free VRAM remains.
+void DefragVramHeap();
+
 // Selects the texture sampled by subsequent DrawTexturedRect calls, uploading
 // it first if needed (which may flush the accumulated 2D packet when reusing
 // evicted VRAM). Redundant sets are dropped, so calling per-draw is fine.
@@ -94,6 +100,7 @@ void SetTextureFor2D(const tex::Texture & texture);
 // colour: 128 = unchanged, 255 = ~2x. Texels with alpha 0 are cut out by the
 // alpha test (console font transparency).
 void DrawTexturedRect(int x, int y, int w, int h,
-                      int u0, int v0, int u1, int v1, u8 brightness);
+                      int u0, int v0, int u1, int v1,
+                      u8 brightness);
 
 } // namespace ps2::gs

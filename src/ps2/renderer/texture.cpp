@@ -7,7 +7,7 @@
 
 #include "ps2/renderer/texture.h"
 #include "ps2/renderer/image_load.h"
-#include "ps2/renderer/gs.h" // gs::ReleaseTexture (end-of-level eviction)
+#include "ps2/renderer/gs.h" // gs::ReleaseTexture / gs::DefragVramHeap (end-of-level eviction)
 #include "ps2/builtin/builtin.h"
 #include "ps2/small_pool.h"
 #include "ps2/hash.h" // HashStr64 / kFnvPrime (shared with the model cache)
@@ -420,6 +420,7 @@ void TextureCache::EndRegistration()
     if (freedCount > 0)
     {
         Com_DPrintf("Texture cache: freed %d unused textures.\n", freedCount);
+        gs::DefragVramHeap();
     }
 }
 
