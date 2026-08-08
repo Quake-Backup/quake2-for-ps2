@@ -17,9 +17,9 @@ namespace ps2::debug {
 // HOST->LOCAL transfers, which the scissor does not clip: anything drawn past
 // the buffer width wraps around in VRAM to the next 32-scanline page row and
 // shows up at the left edge a few text rows below.
-constexpr int ScrCharSize = 8;
-constexpr int ScrMaxX = 64;
-constexpr int ScrMaxY = 22;
+constexpr int kScrCharSize = 8;
+constexpr int kScrMaxX = 64;
+constexpr int kScrMaxY = 22;
 
 // Lazily initialized by first print if not done explicitly.
 void ScrInit();
