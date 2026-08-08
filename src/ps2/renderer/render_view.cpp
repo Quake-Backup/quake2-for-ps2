@@ -24,6 +24,7 @@
 #include "ps2/renderer/render_md2.h"
 #include "ps2/renderer/texture.h"
 #include "ps2/renderer/model.h"
+#include "ps2/renderer/lightmap.h"
 #include "ps2/renderer/vu1.h"
 #include "ps2/renderer/gs.h"
 #include "ps2/math/vec_mat.h"
@@ -58,6 +59,8 @@ static const cvar_t * s_hdParticles       = nullptr;
 static const cvar_t * s_forceNullModels   = nullptr;
 static const cvar_t * s_skipWeaponModel   = nullptr;
 static const cvar_t * s_dynamicLightmaps  = nullptr;
+static const cvar_t * s_lightmaps         = nullptr;
+static const cvar_t * s_lightmapOnly      = nullptr;
 
 // Not ours to read: SetLightLevel writes the sampled light level back into it
 // every frame for the game code (hence non-const). Registered by the client
@@ -580,6 +583,15 @@ void RecursiveWorldNode(const refdef_t & viewDef, const mod::ModelInstance & wor
         }
         surf->textureChain    = texture->textureChain;
         texture->textureChain = surf;
+
+        // Rebuild the surface's luxels if its lighting moved since they were
+        // baked, and thread it onto its atlas's chain for the lightmap pass.
+        // Here rather than at draw time because this walk reaches each visible
+        // surface exactly once, so the rebuild cannot be done twice over.
+        if (surf->lightmapTextureNum != mod::kNotLightmapped)
+        {
+            lm::ChainSurface(*surf, viewDef, s_frameCount);
+        }
     }
 
     // ...and finally recurse down the far side.
@@ -608,6 +620,17 @@ struct SurfaceDrawState
     // batch - and this is the cheapest way out of that, since st is already
     // a whole quadword the clipper interpolates and .z was spare.
     bool               vertexAlpha;
+
+    // Feed the gather the vertices' lightmap UVs instead of their diffuse
+    // ones - the second pass over the same geometry that modulates in the
+    // lightmap. Defaulted because only that one pass wants it; every other
+    // draw leaves it alone.
+    bool               lightmapUVs = false;
+
+    // TODO (coloured lighting): the switch that turns per-vertex lightmap
+    // colour on would go here, defaulted off the same way - the diffuse world
+    // pass wants it and nothing else does. Note it is mutually exclusive with
+    // vertexAlpha, which already owns the vertex colour's alpha byte.
 };
 
 // Sends the gathered scratch triangles as one batch and empties the buffer.
@@ -656,6 +679,13 @@ union ClipDists
 
 // Everything a clipped vertex carries, laid out as four quadwords so a plane cut
 // interpolates it with four aligned vector lerps and no scalar float math at all.
+//
+// TODO (coloured lighting): a per-vertex colour would have to ride along here so
+// the clipper interpolates it with everything else. There is no room left - .z is
+// spoken for by vertexAlpha and .w alone cannot hold three channels - so this
+// grows to five quadwords, ClipAgainstPlane gains a fifth math::LerpTo, and the
+// static_assert below moves to 80. Everything else about the clipper is agnostic
+// to what a vertex carries, so that is the whole structural cost.
 struct alignas(16) ClipVertex
 {
     math::Vec4 pos; // world position, w = 1
@@ -703,6 +733,11 @@ inline u32 WithVertexAlpha(u32 rgba, float alpha)
     return (rgba & 0x00FFFFFFu) | (packed << 24);
 }
 
+// TODO (coloured lighting): the vertex colour is flat per batch here, straight
+// out of state.rgba. Per-vertex lightmap colour would come off the ClipVertex
+// instead - already interpolated by the clipper - packed with PackColorRGBA.
+// Keep the alpha byte at 0x80: the diffuse pass is opaque, and the lightmap pass
+// that follows needs the modulate identity there.
 inline void EmitScratchVertex(const ClipVertex & v, const SurfaceDrawState & state)
 {
     vu1::DrawVertex & dst = s_scratchVerts[s_scratchVertCount++];
@@ -850,8 +885,17 @@ void GatherPolyTriangles(const mod::ModelPoly & poly,
         for (int v = 0; v < 3; ++v)
         {
             const mod::PolyVertex & src = poly.vertexes[tri.vertexes[v]];
+            const float uvS = state.lightmapUVs ? src.lightmap_s : src.texture_s;
+            const float uvT = state.lightmapUVs ? src.lightmap_t : src.texture_t;
+
+            // TODO (coloured lighting): this is where a vertex would pick up its
+            // lightmap colour, sampled from the manager's EE-side mirror. The
+            // lightmap UVs above already address it - they are normalised over
+            // the atlas, so scaling by the atlas dimensions gives the luxel to
+            // read. Note this runs per vertex per frame on surfaces the dynamic
+            // lights are rebuilding, so it wants to stay a cheap point sample.
             corners[v].pos = { src.position.x, src.position.y, src.position.z, 1.0f };
-            corners[v].st  = { src.texture_s, src.texture_t, 0.0f, 0.0f };
+            corners[v].st  = { uvS, uvT, 0.0f, 0.0f };
         }
 
         GatherTriangle(corners, texture, state);
@@ -960,12 +1004,14 @@ void DrawAnimatedWaterPolys(const mod::ModelSurface & surf,
 // DrawTextureChains
 // ------------------------------------------------------------------------------------------------
 
-// Draws every texture chain built by RecursiveWorldNode and resets them.
-void DrawTextureChains()
+// The transform and culling the world pass draws with. World geometry sits in
+// world space already, so its "model" transform is the plain view-projection
+// and the back-face test takes the world camera. Shared by the diffuse and
+// lightmap passes, which must agree on all of it or their triangles would not
+// land on the same pixels.
+inline SurfaceDrawState WorldSurfaceDrawState()
 {
-    // World geometry sits in world space already, so its "model" transform is
-    // the plain view-projection and the back-face test takes the world camera.
-    const SurfaceDrawState state = {
+    return SurfaceDrawState {
         .mvp   = &s_viewProjMatrix,
         .eye   = s_eyePosition,
         .rgba  = kFullBright,
@@ -973,6 +1019,20 @@ void DrawTextureChains()
         .cullBackFaces = WorldBackFaceCullEnabled(),
         .vertexAlpha   = false
     };
+}
+
+// Draws every texture chain built by RecursiveWorldNode and resets them.
+void DrawTextureChains(const SurfaceDrawState & base)
+{
+    SurfaceDrawState state = base;
+
+    // Lightmap-only debug view: drop the diffuse texture and lay down flat
+    // white, so what survives the lightmap pass over it is the lighting alone.
+    if (s_lightmapOnly->value != 0.0f)
+    {
+        state.flags = vu1::DrawFlags::Untextured;
+        state.rgba  = vu1::PackColorRGBA(255, 255, 255, 0x80);
+    }
 
     for (int i = 0; i < s_chainTextureCount; ++i)
     {
@@ -993,6 +1053,62 @@ void DrawTextureChains()
         texture->textureChain = nullptr; // Reset for the next frame.
     }
     s_chainTextureCount = 0;
+}
+
+// ------------------------------------------------------------------------------------------------
+// Lightmap pass
+// ------------------------------------------------------------------------------------------------
+
+// Modulates the surfaces the diffuse pass just laid down by their luxel
+// intensity, one batch per lightmap atlas. This is the second half of the two
+// pass lightmapping: same geometry, same transform, but sampling the atlas
+// through the vertices' second UV set and blending with Cd * As, so each pixel
+// is scaled by how lit it is (see vu1::DrawFlags::Modulate for why the GS can
+// only express the intensity and not the colour).
+//
+// 'base' is the draw state of the pass being lit - the world's or a brush model
+// entity's - so the two agree on transform and culling and their triangles land
+// on the same pixels. Depth writes are masked and the z-test is GREATER_EQUAL,
+// so the pass re-covers exactly what pass one wrote without fighting it.
+void DrawLightmapChains(const SurfaceDrawState & base)
+{
+    if (s_lightmaps->value == 0.0f)
+    {
+        lm::ClearChains(); // Chained anyway while walking; drop them unlit.
+        return;
+    }
+
+    SurfaceDrawState state = base;
+    state.rgba        = kFullBright; // alpha 0x80 keeps the luxel's own alpha
+    state.flags       = vu1::DrawFlags::Modulate;
+    state.vertexAlpha = false;
+    state.lightmapUVs = true;
+
+    const int numLightmaps = lm::NumAtlases();
+    for (int i = 0; i < numLightmaps; ++i)
+    {
+        const mod::ModelSurface * const chain = lm::AtlasChain(i);
+        if (chain == nullptr)
+        {
+            continue; // Nothing visible packed into this atlas.
+        }
+
+        const tex::Texture & atlas = lm::AtlasTexture(i);
+
+        for (const mod::ModelSurface * surf = chain; surf != nullptr; surf = surf->lightmapChain)
+        {
+            for (const mod::ModelPoly * poly = surf->polys; poly != nullptr; poly = poly->next)
+            {
+                if (poly->numVerts >= 3) // Need at least one triangle.
+                {
+                    GatherPolyTriangles(*poly, atlas, state);
+                }
+            }
+        }
+        FlushScratch(atlas, state);
+    }
+
+    lm::ClearChains();
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1332,7 +1448,13 @@ void RenderWorldModel(const refdef_t & viewDef)
     SetUpViewClusters(viewDef, *world);
     MarkLeaves(*world);
     RecursiveWorldNode(viewDef, *world, world->nodes);
-    DrawTextureChains();
+
+    // Diffuse first, then the lightmap over it - ref_gl's DrawTextureChains()
+    // followed by R_BlendLightmaps(). Both passes draw the same triangles with
+    // the same transform, so they share one draw state.
+    const SurfaceDrawState state = WorldSurfaceDrawState();
+    DrawTextureChains(state);
+    DrawLightmapChains(state);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1609,11 +1731,28 @@ void DrawBrushModelEntity(const refdef_t & viewDef, const entity_t & entity)
                 GatherPolyTriangles(*poly, *texture, state);
             }
         }
+
+        // Chain it for this entity's lightmap pass below. Skipped entirely for
+        // a translucent submodel: its surfaces are blended into the scene at a
+        // flat quarter alpha, so modulating the framebuffer afterwards would
+        // darken whatever shows through them as well.
+        if (!translucent && surf->lightmapTextureNum != mod::kNotLightmapped)
+        {
+            lm::ChainSurface(*surf, viewDef, s_frameCount);
+        }
     }
 
     if (batchTexture != nullptr)
     {
         FlushScratch(*batchTexture, state);
+    }
+
+    // Light the surfaces just drawn, in this entity's own space. The chains are
+    // per-atlas and shared with the world pass, but that one has already drawn
+    // and cleared them, so what is queued here is only this model's.
+    if (!translucent)
+    {
+        DrawLightmapChains(state);
     }
 }
 
@@ -2089,7 +2228,9 @@ void InitViewRendering()
     s_hdParticles       = Cvar_Get("ps2_hd_particles",        "1", 0); // 1 = soft round quads instead of the classic dot.
     s_forceNullModels   = Cvar_Get("ps2_force_null_models",   "0", 0); // Debug: draw every entity as the octahedron placeholder.
     s_skipWeaponModel   = Cvar_Get("ps2_skip_weapon_model",   "0", 0);
-    s_dynamicLightmaps  = Cvar_Get("ps2_dynamic_lightmaps",   "0", 0); // Uses the RenderDLights fallback path when = 0.
+    s_dynamicLightmaps  = Cvar_Get("ps2_dynamic_lightmaps",   "1", 0); // Uses the RenderDLights flare fallback path when = 0.
+    s_lightmaps         = Cvar_Get("ps2_lightmaps",           "1", 0); // Debug: 0 drops the lightmap pass, leaving the world fullbright.
+    s_lightmapOnly      = Cvar_Get("ps2_lightmap_only",       "0", 0); // Debug: 1 drops the diffuse textures, showing the lighting alone.
 
     // Already registered by the client; this just resolves the same object.
     s_lightLevel = Cvar_Get("r_lightlevel", "0", 0);
@@ -2206,6 +2347,7 @@ void RenderFrame(const refdef_t & viewDef)
     s_drawStats              = {};
     s_alphaSurfaceCount      = 0;
     s_alphaEntityMatrixCount = 0;
+    lm::BeginFrame();
 
     SetupFrame(viewDef);
 
@@ -2230,8 +2372,6 @@ void RenderFrame(const refdef_t & viewDef)
     // Nothing to draw: hands the light at the camera back to the game code.
     // Where ref_gl's R_RenderFrame calls R_SetLightLevel.
     SetLightLevel(viewDef);
-
-    // TODO: lightmapped surfaces.
 }
 
 } // namespace ps2::view

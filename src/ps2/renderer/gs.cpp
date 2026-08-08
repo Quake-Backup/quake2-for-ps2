@@ -29,6 +29,7 @@
 
 #include "ps2/common.h"
 #include "ps2/renderer/gs.h"
+#include "ps2/renderer/clut.h"
 #include "ps2/renderer/render_packet.h"
 #include "ps2/renderer/texture.h"
 #include "ps2/renderer/vram.h"
@@ -86,13 +87,15 @@ static bool s_vramReuseHazard = false;
 // Texture bound in the current 2D section.
 static const tex::Texture * s_currentTex = nullptr;
 
-// The global-palette CLUT: Quake's shared 8-bit palette, uploaded once at Init
-// to a fixed VRAM spot (16x16 PSMCT32 image = 4 blocks) that every Palette8
-// texture's TEX0 points at. s_clutData holds the entries in the GS's CSM1
-// arrangement: within each 32-entry group the two middle 8-entry blocks swap
-// (index bits 3 and 4 exchange).
-alignas(16) static u32 s_clutData[256];
-static vram::Address s_clutVramAddr = vram::Address::Invalid;
+// The two CLUTs, both built and uploaded once at Init to fixed VRAM spots
+// outside the texture heap (see clut.h for their layout).
+//
+// The global palette is Quake's shared 8-bit palette, which every Palette8
+// texture's TEX0 points at. The alpha ramp backs PixelFormat::Alpha8: the
+// lightmap atlases (luxel intensity) and the generated particle images (their
+// shape) both carry only an alpha signal and take their colour from the primitive.
+static tex::Clut s_globalPaletteClut;
+static tex::Clut s_alphaRampClut;
 
 // Pixel stride the texture occupies VRAM with (the TEX0 TBW and transfer DBW).
 // 8-bit textures must use a multiple of 128 (TBW must be even for PSMT8/4);
@@ -176,13 +179,20 @@ void Init()
     s_zbuffer.zsm     = GS_ZBUF_16S;
     s_zbuffer.address = static_cast<unsigned int>(graph_vram_allocate(kWidth, kHeight, GS_ZBUF_16S, GRAPH_ALIGN_PAGE));
 
-    // The global-palette CLUT lives with the fixed allocations (a 16x16
-    // PSMCT32 image, 256 words); the streamed texture heap takes everything
-    // after it, rounded up to a page so its footprint math stays page-aligned
-    // (the rest of the CLUT's page is unused).
-    const int clutVramAddr = graph_vram_allocate(16, 16, GS_PSM_32, GRAPH_ALIGN_BLOCK);
-    vram::Init((clutVramAddr + ArrayLength(s_clutData) + 2047) & ~2047);
-    s_clutVramAddr = vram::Address(clutVramAddr);
+    // Both CLUTs live with the fixed allocations; the streamed texture heap
+    // takes everything after them, rounded up to a page so its footprint math
+    // stays page-aligned (the rest of the second CLUT's page is unused).
+    // graph_vram_allocate hands out increasing addresses, so the heap starts
+    // past the later of the two.
+    const int clutVramAddr      = graph_vram_allocate(tex::Clut::kImageWidth, tex::Clut::kImageHeight,
+                                                      GS_PSM_32, GRAPH_ALIGN_BLOCK);
+    const int alphaRampClutAddr = graph_vram_allocate(tex::Clut::kImageWidth, tex::Clut::kImageHeight,
+                                                      GS_PSM_32, GRAPH_ALIGN_BLOCK);
+    PS2_Assert(alphaRampClutAddr > clutVramAddr);
+
+    vram::Init((alphaRampClutAddr + tex::Clut::kNumEntries + 2047) & ~2047);
+    s_globalPaletteClut.vramAddr = vram::Address(clutVramAddr);
+    s_alphaRampClut.vramAddr     = vram::Address(alphaRampClutAddr);
 
     // Display framebuffer 0 first; auto-detects NTSC/PAL.
     graph_initialize(static_cast<int>(s_frame[0].address), kWidth, kHeight, GS_PSM_32, 0, 0);
@@ -209,33 +219,38 @@ void Init()
     pkt.Finish();
 
     pkt.SendNormal();
-    dma_wait_fast();
-    draw_wait_finish();
+    pkt.Wait();
+    pkt.WaitFinish();
 
-    // Build and upload the global-palette CLUT (it never changes). The CSM1
-    // reorder swaps entry index bits 3 and 4 - the arrangement the GS reads
-    // the CLUT buffer with (see ps2stuff GS::ReorderClut).
-    for (int i = 0; i < ArrayLength(s_clutData); ++i)
-    {
-        const int csm1 = (i & ~0x18) | ((i & 0x08) << 1) | ((i & 0x10) >> 1);
-        s_clutData[csm1] = global_palette[i];
-    }
+    // Build and upload both CLUTs (resident; neither ever changes).
+    s_globalPaletteClut.BuildFromPalette(global_palette);
+    s_alphaRampClut.BuildAlphaRamp();
 
     RenderPacket & upload = s_texUploadPacket;
     upload.Reset();
-    upload.TextureTransfer(s_clutData, 16, 16, GS_PSM_32, s_clutVramAddr, 64);
+    const tex::Clut * const cluts[] = { &s_globalPaletteClut, &s_alphaRampClut };
+    for (const tex::Clut * clut : cluts)
+    {
+        upload.TextureTransfer(clut->entries, tex::Clut::kImageWidth, tex::Clut::kImageHeight,
+                               GS_PSM_32, clut->vramAddr, tex::Clut::kTransferWidth);
+    }
     upload.TextureFlush();
 
     upload.SendChain();
-    dma_wait_fast();
+    upload.Wait();
 
     s_drawCtx   = 1;
     s_packetIdx = 0;
 }
 
-vram::Address GlobalClutAddress()
+vram::Address ClutAddressFor(tex::PixelFormat format)
 {
-    return s_clutVramAddr;
+    switch (format)
+    {
+    case tex::PixelFormat::Palette8 : return s_globalPaletteClut.vramAddr;
+    case tex::PixelFormat::Alpha8   : return s_alphaRampClut.vramAddr;
+    default                         : return vram::Address::Invalid;
+    }
 }
 
 void BeginFrame()
@@ -269,8 +284,8 @@ void BeginFrame()
     clear.Finish();
 
     clear.SendNormal();
-    dma_wait_fast();
-    draw_wait_finish();
+    clear.Wait();
+    clear.WaitFinish();
 
     // The GS is idle now, so nothing queued can reference reused VRAM anymore.
     s_vramReuseHazard = false;
@@ -309,9 +324,9 @@ void FlushPending2D()
     RenderPacket & pkt = FramePacket();
     pkt.Finish();
 
-    dma_wait_fast();
+    pkt.Wait();
     pkt.SendNormal();
-    draw_wait_finish();
+    pkt.WaitFinish();
 
     s_vramReuseHazard = false; // GS idle again
 }
@@ -380,9 +395,9 @@ static void SyncGsBeforeVramReuse()
         RenderPacket & pkt = FramePacket();
         pkt.Finish();
 
-        dma_wait_fast();
+        pkt.Wait();
         pkt.SendNormal();
-        draw_wait_finish();
+        pkt.WaitFinish();
 
         pkt.Reset(); // GS registers persist; keep accumulating into the same packet
     }
@@ -392,9 +407,9 @@ static void SyncGsBeforeVramReuse()
         pkt.Reset();
         pkt.Finish();
 
-        dma_wait_fast();
+        pkt.Wait();
         pkt.SendNormal();
-        draw_wait_finish();
+        pkt.WaitFinish();
     }
     s_vramReuseHazard = false;
 }
@@ -475,7 +490,7 @@ void EnsureTextureResident(const tex::Texture & texture)
     pkt.TextureFlush();
 
     pkt.SendChain();
-    dma_wait_fast();
+    pkt.Wait();
 
     vram::NoteTextureUpload(); // for the debug overlay's per-frame upload count
 }
@@ -542,12 +557,13 @@ void SetTextureFor2D(const tex::Texture & texture)
     lod.k             = 0.0f;
 
     clutbuffer_t clut;
-    if (texture.format == tex::PixelFormat::Palette8)
+    const vram::Address clutAddr = ClutAddressFor(texture.format);
+    if (clutAddr != vram::Address::Invalid)
     {
-        // Reload the on-chip CLUT cache from the global palette on every bind:
-        // cheap (1 KB) at the 2D path's bind rate. TODO: CLUT_COMPARE_CBP0
-        // skips redundant reloads - worthwhile once world textures bind per-surface.
-        clut.address      = static_cast<unsigned int>(s_clutVramAddr);
+        // Reload the on-chip CLUT cache on every bind: cheap (1 KB) at the 2D
+        // path's bind rate. TODO: CLUT_COMPARE_CBP0 skips redundant reloads -
+        // worthwhile once world textures bind per-surface.
+        clut.address      = static_cast<unsigned int>(clutAddr);
         clut.psm          = GS_PSM_32;
         clut.storage_mode = CLUT_STORAGE_MODE1;
         clut.start        = 0;

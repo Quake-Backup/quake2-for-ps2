@@ -13,7 +13,7 @@
 #include "ps2/renderer/vram.h"
 #include <tamtypes.h>
 
-namespace ps2::tex { struct Texture; }
+namespace ps2::tex { struct Texture; enum class PixelFormat : u8; }
 
 namespace ps2::gs {
 
@@ -39,10 +39,13 @@ int DepthTestMethod();
 // occlude (projected shadows, translucent surfaces).
 u64 ZBufData(bool maskDepthWrites);
 
-// GS VRAM word address of the 256-entry global-palette CLUT (Quake's shared
-// 8-bit palette), uploaded once by Init() to a fixed spot outside the texture
-// heap. PixelFormat::Palette8 textures sample through it.
-vram::Address GlobalClutAddress();
+// GS VRAM word address of the 256-entry CLUT a texture of this pixel format
+// samples through: the global palette (Quake's shared 8-bit palette) for
+// Palette8, and the alpha ramp (index = alpha, colour pinned at the modulate
+// identity) for Alpha8. Both are uploaded once by Init() to fixed spots outside
+// the texture heap. Returns vram::Address::Invalid for the direct-colour
+// formats, which sample no CLUT.
+vram::Address ClutAddressFor(tex::PixelFormat format);
 
 // Background colour used by BeginFrame()'s screen clear.
 void SetClearColor(u8 r, u8 g, u8 b);

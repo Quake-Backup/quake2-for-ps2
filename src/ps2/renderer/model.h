@@ -67,6 +67,10 @@ constexpr int kMaxMD2SkinHeight = 480;
 constexpr int kMaxMD2Skins  = 32;
 constexpr int kMaxLightmaps = 4;
 
+// ModelSurface::lightmapTextureNum when the surface has no lightmap at all -
+// sky, turbulent and translucent surfaces, which the lightmap builder skips.
+constexpr int kNotLightmapped = -1;
+
 // ------------------------------------------------------------------------------------------------
 // In-memory representation of 3D models (world and entities)
 // ------------------------------------------------------------------------------------------------
@@ -161,16 +165,22 @@ struct ModelSurface
 
     ModelPoly * polys; // multiple if warped.
     const ModelSurface * textureChain;
+    const ModelSurface * lightmapChain; // next surface sharing this one's lightmap atlas.
     ModelTexInfo * texInfo;
 
     // dynamic lighting info:
     int dlightFrame;
     int dlightBits;
 
-    int lightmapTextureNum; // -1 if not lightmapped.
+    int lightmapTextureNum; // kNotLightmapped if the surface has no lightmap.
     u8 styles[kMaxLightmaps];
     float cachedLight[kMaxLightmaps]; // values currently used in lightmap.
     u8 * samples; // [numstyles * surfsize]
+
+    // Frame whose dynamic-light contribution is currently baked into this
+    // surface's block of the atlas. Non-zero means the atlas holds dlit luxels
+    // that must be rebuilt from 'samples' once the light stops touching it.
+    int lightmapDynamicFrame;
 };
 
 //

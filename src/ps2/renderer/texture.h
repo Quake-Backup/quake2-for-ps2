@@ -54,10 +54,15 @@ constexpr bool HasFlag(TexFlags flags, TexFlags test)
 // Pixel storage formats we support, mapped to GS PSMs by GsPsm().
 enum class PixelFormat : u8
 {
-    RGBA32,  // 4 bytes/texel, 8888.
-    RGB16,   // 2 bytes/texel, 5551 (alpha bit present but unused as TexComponents::RGB).
-    Palette8 // 1 byte/texel: PSMT8 indices into the shared global-palette CLUT
-             // (gs::Init uploads it once; color and alpha come from the palette entry).
+    RGBA32,   // 4 bytes/texel, 8888.
+    RGB16,    // 2 bytes/texel, 5551 (alpha bit present but unused as TexComponents::RGB).
+    Palette8, // 1 byte/texel: PSMT8 indices into the shared global-palette CLUT
+              // (gs::Init uploads it once; color and alpha come from the palette entry).
+    Alpha8    // 1 byte/texel: PSMT8 indices into the shared alpha-ramp CLUT, where the
+              // index *is* the alpha and the color is pinned at the modulate identity.
+              // For images that carry only a coverage/intensity signal and take their
+              // color from the primitive: the particle sprites and the lightmap atlases.
+              // Needs TexComponents::RGBA, or the texture function drops the alpha.
 };
 
 // Whether the texture's own alpha participates in the texture function (GS TCC bit).

@@ -19,6 +19,7 @@
 #include "ps2/renderer/model.h"
 #include "ps2/renderer/model_load.h"
 #include "ps2/renderer/texture.h"
+#include "ps2/renderer/lightmap.h"
 
 #include <cmath>
 #include <cstdio>
@@ -47,10 +48,6 @@ constexpr u32 AlignUp(u32 value, u32 alignment)
 {
     return (value + (alignment - 1)) & ~(alignment - 1);
 }
-
-// Lightmap atlas dimensions the lightmap UVs are normalised against.
-constexpr int kLightmapTextureWidth  = 128;
-constexpr int kLightmapTextureHeight = 128;
 
 constexpr float kTriangulationEpsilon  = 0.001f;
 constexpr int   kTriangulationMaxVerts = 128; // Per polygon.
@@ -585,14 +582,24 @@ void BuildPolygonFromSurface(ModelInstance & mdl, HunkAllocator & hunk, ModelSur
         poly->vertexes[i].texture_s = TexProject(pos, tex->vecs[0]) / texW;
         poly->vertexes[i].texture_t = TexProject(pos, tex->vecs[1]) / texH;
 
-        // Lightmap texture coordinates (light_s/light_t stay 0 while lightmaps
-        // are stubbed, but the UVs are baked so the vertex format is complete).
+        // Lightmap texture coordinates. The vertex projects into texture space
+        // the same way, then shifts to where CreateSurfaceLightmap packed this
+        // surface's luxels: relative to the face's own lightmap origin
+        // (- textureMins), over to its block in the atlas (+ light_s/t luxels),
+        // and half a luxel in so bilinear sampling lands on texel centres
+        // instead of block edges. The atlas spans kLuxelSizeUnits world units
+        // per luxel, which is what normalises the whole thing.
+        constexpr float kHalfLuxel  = static_cast<float>(lm::kLuxelSizeUnits) * 0.5f;
+        constexpr float kAtlasSpanS = static_cast<float>(lm::kLightmapTextureWidth  * lm::kLuxelSizeUnits);
+        constexpr float kAtlasSpanT = static_cast<float>(lm::kLightmapTextureHeight * lm::kLuxelSizeUnits);
+
         const float lms = TexProject(pos, tex->vecs[0]) - static_cast<float>(surf.textureMins[0])
-                        + static_cast<float>(surf.light_s * 16) + 8.0f;
+                        + static_cast<float>(surf.light_s * lm::kLuxelSizeUnits) + kHalfLuxel;
         const float lmt = TexProject(pos, tex->vecs[1]) - static_cast<float>(surf.textureMins[1])
-                        + static_cast<float>(surf.light_t * 16) + 8.0f;
-        poly->vertexes[i].lightmap_s = lms / static_cast<float>(kLightmapTextureWidth  * 16);
-        poly->vertexes[i].lightmap_t = lmt / static_cast<float>(kLightmapTextureHeight * 16);
+                        + static_cast<float>(surf.light_t * lm::kLuxelSizeUnits) + kHalfLuxel;
+
+        poly->vertexes[i].lightmap_s = lms / kAtlasSpanS;
+        poly->vertexes[i].lightmap_t = lmt / kAtlasSpanT;
     }
 
     TriangulatePolygon(*poly);
@@ -765,6 +772,10 @@ void LoadFaces(ModelInstance & mdl, HunkAllocator & hunk, const void * const fil
     mdl.surfaces    = out;
     mdl.numSurfaces = count;
 
+    // Drops the previous map's lightmap atlases and opens a fresh one to pack
+    // this map's faces into (ref_gl's GL_BeginBuildingLightmaps).
+    lm::BeginBuildingLightmaps();
+
     for (int surfNum = 0; surfNum < count; ++surfNum)
     {
         ModelSurface & surf = out[surfNum];
@@ -773,7 +784,7 @@ void LoadFaces(ModelInstance & mdl, HunkAllocator & hunk, const void * const fil
         surf.color     = 0xFFFFFFFF; // <-- NOTE: Can add a debug color here.
         surf.flags     = SurfaceFlags::None;
         surf.polys     = nullptr;
-        surf.lightmapTextureNum = -1; // Not lightmapped (lightmaps stubbed).
+        surf.lightmapTextureNum = kNotLightmapped;
 
         if (in[surfNum].side)
         {
@@ -798,6 +809,17 @@ void LoadFaces(ModelInstance & mdl, HunkAllocator & hunk, const void * const fil
         const int lightOfs = in[surfNum].lightofs;
         surf.samples = (lightOfs == -1) ? nullptr : (mdl.lightData + lightOfs);
 
+        // Pack the surface's luxels into a lightmap atlas before its polygon is
+        // built: BuildPolygonFromSurface bakes where they landed into the second
+        // UV set, so this has to run first. Sky, turbulent and translucent faces
+        // are never lightmapped and keep kNotLightmapped - the same exclusion
+        // ref_gl's Mod_LoadFaces makes.
+        constexpr int kUnlitSurfaceFlags = (SURF_SKY | SURF_TRANS33 | SURF_TRANS66 | SURF_WARP);
+        if (!(surf.texInfo->flags & kUnlitSurfaceFlags))
+        {
+            lm::CreateSurfaceLightmap(surf);
+        }
+
         // Turbulent water surfaces: fixed extents, then subdivided for the warp.
         if (surf.texInfo->flags & SURF_WARP)
         {
@@ -814,6 +836,8 @@ void LoadFaces(ModelInstance & mdl, HunkAllocator & hunk, const void * const fil
             BuildPolygonFromSurface(mdl, hunk, surf);
         }
     }
+
+    lm::EndBuildingLightmaps();
 }
 
 void LoadMarkSurfaces(ModelInstance & mdl, HunkAllocator & hunk, const void * const fileData, const lump_t & l)

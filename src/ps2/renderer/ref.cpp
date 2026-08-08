@@ -16,6 +16,7 @@
 #include "ps2/renderer/vu1.h"
 #include "ps2/renderer/model.h"
 #include "ps2/renderer/texture.h"
+#include "ps2/renderer/lightmap.h"
 #include "ps2/renderer/cinematic.h"
 #include "ps2/renderer/render_view.h"
 #include "ps2/renderer/render_md2.h"
@@ -249,6 +250,7 @@ void DrawDrawStatsOverlay()
     }
 
     const ps2::view::DrawStats & stats = ps2::view::GetDrawStats();
+    const ps2::lm::Stats lmStats = ps2::lm::GetStats();
 
     const struct { const char * label; int value; } rows[] = {
         { "Nodes",   stats.nodesWalked   },
@@ -262,6 +264,14 @@ void DrawDrawStatsOverlay()
         { "Clipped", stats.trisClipped   },
         { "Culled",  stats.trisCulled    },
         { "BoxCull", stats.boxesCulled   },
+        // Lightmap rebuilds this frame. LmDyn tracks moving dynamic lights and
+        // LmRest the surfaces they have just left; both should fall back to
+        // zero once the lights stop moving. A stuck LmRest means the restore
+        // path is not settling.
+        { "LmAtlas", lmStats.atlases        },
+        { "LmStyle", lmStats.styleUpdates   },
+        { "LmDyn",   lmStats.dynamicUpdates },
+        { "LmRest",  lmStats.restoreUpdates },
     };
 
     constexpr int kLineHeight = kGlyphSize + 2; // Matches DrawInternalString spacing.
@@ -305,6 +315,7 @@ qboolean PS2_RefInit(void * hinstance, void * wndproc)
     ps2::gs::Init();
     ps2::tex::Init();
     ps2::vu1::Init();
+    ps2::lm::Init();
     ps2::mod::Init();
 
     s_showFpsCount  = Cvar_Get("ps2_show_fps",       "1", 0);

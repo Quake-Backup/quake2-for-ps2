@@ -75,6 +75,7 @@ static const char * const s_memTagNames[MEMTAG_COUNT] = {
     "Mdl_Alias",
     "Mdl_Sprite",
     "Mdl_World",
+    "Lightmap",
 };
 
 static inline size_t MemTagToIndex(PS2MemTag tag)

@@ -193,6 +193,7 @@ const char * PixelFormatName(tex::PixelFormat format)
     case tex::PixelFormat::RGBA32   : return "rgba32";
     case tex::PixelFormat::RGB16    : return "rgb16";
     case tex::PixelFormat::Palette8 : return "pal8";
+    case tex::PixelFormat::Alpha8   : return "alpha8";
     }
     return "???"; // Unreachable; keeps GCC's -Wreturn-type happy.
 }

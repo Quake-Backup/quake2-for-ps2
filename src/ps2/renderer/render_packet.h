@@ -155,6 +155,12 @@ public:
         m_ptr = draw_finish(m_ptr);
     }
 
+    // Wait until FINISH event occurs.
+    static void WaitFinish()
+    {
+        draw_wait_finish();
+    }
+
     // --------------------------------------------------------------------------------------------
     // DMA kick-off over the GIF channel. Fire and forget; waits stay with the caller.
     // --------------------------------------------------------------------------------------------
@@ -169,6 +175,13 @@ public:
     void SendChain()
     {
         dma_channel_send_chain(DMA_CHANNEL_GIF, m_packet->data, QwordCount(), 0, 0);
+    }
+
+    // Waits until channel is usable based on coprocessor status.
+    // NOTE: Assumes fast waits are enabled for the GIF DMA channel.
+    static void Wait()
+    {
+        dma_wait_fast();
     }
 
 private:

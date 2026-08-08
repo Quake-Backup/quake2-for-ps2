@@ -164,10 +164,12 @@ static u32 s_texturedTrisProgAddr = 0;
 // GS context 0 and this renderer alternates contexts per frame.
 inline u64 MakeTex0Data(const tex::Texture & texture)
 {
-    // Palettized textures sample through the global-palette CLUT; reloading
-    // the on-chip CLUT cache on every bind is cheap (1 KB). Everything else
-    // leaves the CLUT fields zero (as gs::SetTextureFor2D).
-    const bool palettized = (texture.format == tex::PixelFormat::Palette8);
+    // Indexed textures sample through one of the two fixed CLUTs (the global
+    // palette or the alpha ramp, by format); reloading the on-chip CLUT cache
+    // on every bind is cheap (1 KB). Everything else leaves the CLUT fields
+    // zero (as gs::SetTextureFor2D).
+    const vram::Address clutAddr = gs::ClutAddressFor(texture.format);
+    const bool palettized = (clutAddr != vram::Address::Invalid);
 
     return GS_SET_TEX0(texture.texbuf.address >> 6,
                        texture.texbuf.width >> 6,
@@ -176,7 +178,7 @@ inline u64 MakeTex0Data(const tex::Texture & texture)
                        texture.texbuf.info.height,
                        texture.texbuf.info.components,
                        texture.texbuf.info.function,
-                       palettized ? ((int)gs::GlobalClutAddress() >> 6) : 0,
+                       palettized ? ((int)clutAddr >> 6) : 0,
                        GS_PSM_32, // CPSM; only read for palettized PSMs (and == 0 anyway)
                        CLUT_STORAGE_MODE1, 0,
                        palettized ? CLUT_LOAD : CLUT_NO_LOAD);
@@ -206,13 +208,21 @@ inline u64 MakeTestData()
 // GL_ONE literally: at As = 0x80 the two are identical, and routing the
 // source alpha through the equation lets a caller fade an additive primitive
 // per vertex (the dynamic light flares rely on it) without a third mode.
-inline u64 MakeAlphaData(bool additive)
+inline u64 MakeAlphaData(DrawFlags flags)
 {
-    if (additive)
+    if (HasDrawFlag(flags, DrawFlags::Additive))
     {
         // (Cs - 0) * As / 128 + Cd
         return GS_SET_ALPHA(BLEND_COLOR_SOURCE, BLEND_COLOR_ZERO,
                             BLEND_ALPHA_SOURCE, BLEND_COLOR_DEST, 0x80);
+    }
+
+    if (HasDrawFlag(flags, DrawFlags::Modulate))
+    {
+        // (Cd - 0) * As / 128 + 0: scales the framebuffer by the source alpha
+        // and adds nothing, so the batch's own colour never reaches the pixel.
+        return GS_SET_ALPHA(BLEND_COLOR_DEST, BLEND_COLOR_ZERO,
+                            BLEND_ALPHA_SOURCE, BLEND_COLOR_ZERO, 0x80);
     }
 
     // (Cs - Cd) * As / 128 + Cd
@@ -227,13 +237,15 @@ inline u64 MakeAlphaData(bool additive)
 void AddBatchGifTags(VifPacket & pkt, const tex::Texture & texture, int ctx,
                      int vertCount, DrawFlags flags)
 {
-    // Additive is a second blend equation, not a second blend switch: it
-    // brings the ABE bit and the depth-write mask along with it.
-    const bool additive = HasDrawFlag(flags, DrawFlags::Additive);
-    PS2_AssertMsg(!(additive && HasDrawFlag(flags, DrawFlags::Blended)),
-                  "Pick one blend mode - Blended and Additive are exclusive!");
+    // The blend flags select alternative equations, they are not switches to
+    // combine: each one brings the ABE bit and the depth-write mask with it.
+    const int blendModes = static_cast<int>(HasDrawFlag(flags, DrawFlags::Blended))
+                         + static_cast<int>(HasDrawFlag(flags, DrawFlags::Additive))
+                         + static_cast<int>(HasDrawFlag(flags, DrawFlags::Modulate));
+    PS2_AssertMsg(blendModes <= 1,
+                  "Pick one blend mode - Blended, Additive and Modulate are exclusive!");
 
-    const bool blended = additive || HasDrawFlag(flags, DrawFlags::Blended);
+    const bool blended = (blendModes != 0);
     const int  tme     = HasDrawFlag(flags, DrawFlags::Untextured) ? 0 : 1;
     const int  abe     = blended ? 1 : 0;
 
@@ -243,7 +255,7 @@ void AddBatchGifTags(VifPacket & pkt, const tex::Texture & texture, int ctx,
     pkt.AddQword(MakeTestData(), static_cast<u64>(GS_REG_TEST + ctx));
     pkt.AddQword(MakeTex1Data(texture), static_cast<u64>(GS_REG_TEX1 + ctx));
     pkt.AddQword(MakeTex0Data(texture), static_cast<u64>(GS_REG_TEX0 + ctx));
-    pkt.AddQword(MakeAlphaData(additive), static_cast<u64>(GS_REG_ALPHA + ctx));
+    pkt.AddQword(MakeAlphaData(flags), static_cast<u64>(GS_REG_ALPHA + ctx));
     pkt.AddQword(gs::ZBufData(blended), static_cast<u64>(GS_REG_ZBUF + ctx));
 
     // ...then the drawing tag: gouraud triangle list, STQ mapping, with the

@@ -26,6 +26,7 @@ typedef enum
     MEMTAG_MDL_ALIAS,  // MD2/Alias models.
     MEMTAG_MDL_SPRITE, // Sprite models.
     MEMTAG_MDL_WORLD,  // World geometry.
+    MEMTAG_LIGHTMAP,   // Lightmap atlas buffers (see renderer/lightmap.cpp).
     MEMTAG_COUNT,      // Number of entries in this enum. Internal use only.
 } PS2MemTag;
 

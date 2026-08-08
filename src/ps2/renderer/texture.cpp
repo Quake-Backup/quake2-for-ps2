@@ -32,6 +32,7 @@ int GsPsm(PixelFormat format)
     case PixelFormat::RGBA32   : return GS_PSM_32;
     case PixelFormat::RGB16    : return GS_PSM_16;
     case PixelFormat::Palette8 : return GS_PSM_8;
+    case PixelFormat::Alpha8   : return GS_PSM_8;
     }
     return GS_PSM_32; // Unreachable; keeps GCC's -Wreturn-type happy.
 }
@@ -74,6 +75,7 @@ int BytesPerTexel(PixelFormat format)
     case PixelFormat::RGBA32   : return 4;
     case PixelFormat::RGB16    : return 2;
     case PixelFormat::Palette8 : return 1;
+    case PixelFormat::Alpha8   : return 1;
     }
     return 4; // Unreachable; keeps GCC's -Wreturn-type happy.
 }
@@ -180,27 +182,24 @@ const u16 * MakeCheckerPattern(int variant)
 // The two particle images, generated rather than loaded - Quake 2 never
 // shipped either as a file, ref_gl builds its own in R_InitParticleTexture.
 //
-// Both are RGBA32 with every texel's colour at the GS modulate identity (128),
-// so a particle's colour rides entirely on its vertex colour and the image
-// contributes only its shape through alpha. Alpha is 128 (= 1.0 on the GS) at
-// full opacity, so a fully opaque particle blends at exactly 1x rather than
-// the ~2x an 0xFF alpha would give. Texels at alpha 0 never reach the blender
-// at all - the batch's alpha test drops them.
+// Both are Alpha8: one coverage byte per texel, sampled through the shared
+// alpha-ramp CLUT, which supplies the GS modulate identity (128) as the colour
+// and the byte itself as the alpha. So a particle's colour rides entirely on
+// its vertex colour and the image contributes only its shape. The ramp maps
+// coverage 255 to alpha 128 (= 1.0 on the GS), so a fully opaque particle
+// blends at exactly 1x rather than the ~2x an 0xFF alpha would give; coverage 0
+// maps to alpha 0, and those texels never reach the blender at all - the
+// batch's alpha test drops them.
 //
 // Both dimensions are powers of two, so no ST rescale is needed
 // (unlike the model skins - see StScaleFor).
 constexpr int kParticleDotDim = 8;
 constexpr int kParticleHdDim  = 32;
 
-constexpr u32 ParticleTexel(u32 alpha)
-{
-    return 128u | (128u << 8) | (128u << 16) | (alpha << 24);
-}
-
 // The classic blocky dot, exactly ref_gl's 8x8 pattern. It sits in the
 // top-left corner because the particle draws as a single triangle covering
 // only that half of the image.
-const u32 * MakeParticleDotPattern()
+const u8 * MakeParticleDotPattern()
 {
     constexpr u8 prtDot[kParticleDotDim][kParticleDotDim] = {
         { 0,0,0,0,0,0,0,0 },
@@ -213,27 +212,27 @@ const u32 * MakeParticleDotPattern()
         { 0,0,0,0,0,0,0,0 },
     };
 
-    alignas(16) static u32 s_buffer[kParticleDotDim * kParticleDotDim];
+    alignas(16) static u8 s_buffer[kParticleDotDim * kParticleDotDim];
     for (int y = 0; y < kParticleDotDim; ++y)
     {
         for (int x = 0; x < kParticleDotDim; ++x)
         {
-            s_buffer[x + (y * kParticleDotDim)] = ParticleTexel(prtDot[y][x] ? 128u : 0u);
+            s_buffer[x + (y * kParticleDotDim)] = prtDot[y][x] ? 255 : 0;
         }
     }
     return s_buffer;
 }
 
-// The soft round particle: alpha falling off smoothly from the centre to
+// The soft round particle: coverage falling off smoothly from the centre to
 // nothing at the edge, drawn as a full quad. The falloff is 1 - d^2 over the
 // radius, squared again, which keeps a bright core and a long thin tail
 // instead of the linear ramp's visible disc edge.
-const u32 * MakeParticleHdPattern()
+const u8 * MakeParticleHdPattern()
 {
     constexpr float kCentre = (kParticleHdDim - 1) * 0.5f;
     constexpr float kRadius = kParticleHdDim * 0.5f;
 
-    alignas(16) static u32 s_buffer[kParticleHdDim * kParticleHdDim];
+    alignas(16) static u8 s_buffer[kParticleHdDim * kParticleHdDim];
     for (int y = 0; y < kParticleHdDim; ++y)
     {
         for (int x = 0; x < kParticleHdDim; ++x)
@@ -244,8 +243,8 @@ const u32 * MakeParticleHdPattern()
             float falloff = 1.0f - ((dx * dx) + (dy * dy));
             falloff = (falloff <= 0.0f) ? 0.0f : (falloff * falloff);
 
-            const u32 alpha = static_cast<u32>(falloff * 128.0f);
-            s_buffer[x + (y * kParticleHdDim)] = ParticleTexel((alpha > 128u) ? 128u : alpha);
+            const u32 coverage = static_cast<u32>(falloff * 255.0f);
+            s_buffer[x + (y * kParticleHdDim)] = static_cast<u8>((coverage > 255u) ? 255u : coverage);
         }
     }
     return s_buffer;
@@ -532,12 +531,18 @@ void TextureCache::Init()
                  builtin.format, builtin.components, ImageType::Pic, TexFlags::Builtin);
     }
 
+    // The checkerboards and the particle images below are the built-ins we
+    // generate here at runtime rather than link into the ELF, so - unlike the
+    // rest of the table - their pixels may still be sitting in the EE data
+    // cache. Register() only marks non-built-ins dirty, so mark them by hand or
+    // their first upload DMAs stale memory.
     for (int i = 0; i < kNumDebugTextures; ++i)
     {
         char name[16];
         std::snprintf(name, sizeof(name), "debug%d", i);
         m_debugTextures[i] = Find(name, ImageType::Pic);
         PS2_Assert(m_debugTextures[i] != nullptr);
+        m_debugTextures[i]->MarkPixelsDirty();
     }
 
     // The particle images are registered outside the table above so their
@@ -546,18 +551,20 @@ void TextureCache::Init()
     // smooth falloff that would band badly without bilinear.
     Texture & particleDot = Register("pics/particle.pcx", MakeParticleDotPattern(),
                                      kParticleDotDim, kParticleDotDim,
-                                     PixelFormat::RGBA32, TexComponents::RGBA,
+                                     PixelFormat::Alpha8, TexComponents::RGBA,
                                      ImageType::Pic, TexFlags::Builtin);
     particleDot.magFilter = TexFilter::Nearest;
     particleDot.minFilter = TexFilter::Nearest;
+    particleDot.MarkPixelsDirty();
     m_particleTextures[0] = &particleDot;
 
     Texture & particleHd = Register("pics/particle_hd.pcx", MakeParticleHdPattern(),
                                     kParticleHdDim, kParticleHdDim,
-                                    PixelFormat::RGBA32, TexComponents::RGBA,
+                                    PixelFormat::Alpha8, TexComponents::RGBA,
                                     ImageType::Pic, TexFlags::Builtin);
     particleHd.magFilter = TexFilter::Linear;
     particleHd.minFilter = TexFilter::Linear;
+    particleHd.MarkPixelsDirty();
     m_particleTextures[1] = &particleHd;
 
     Com_Printf("Texture cache initialised: %u built-in images registered.\n", m_texturePool.UsedCount());

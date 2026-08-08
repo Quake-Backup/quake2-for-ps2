@@ -62,18 +62,28 @@ constexpr float kGuardBandNdcLimit = 0.8f;
 //
 // Additive replaces Blended's equation with Cs * As + Cd - the source colour
 // added to the framebuffer instead of interpolated with it - and implies
-// everything else Blended does, including the depth-write mask. The two are
-// mutually exclusive; passing both asserts. Note the alpha still scales the
-// contribution, so a fully opaque (As = 0x80) additive batch is exactly
-// OpenGL's glBlendFunc(GL_ONE, GL_ONE) while a fading one needs no second
-// blend mode. Additive results saturate rather than wrap: gs::Init leaves
-// the GS COLCLAMP register enabled.
+// everything else Blended does, including the depth-write mask. Note the alpha
+// still scales the contribution, so a fully opaque (As = 0x80) additive batch
+// is exactly OpenGL's glBlendFunc(GL_ONE, GL_ONE) while a fading one needs no
+// second blend mode. Additive results saturate rather than wrap: gs::Init
+// leaves the GS COLCLAMP register enabled.
+//
+// Modulate is the third equation, Cd * As: it scales what is already in the
+// framebuffer by the batch's alpha and contributes no colour of its own. This
+// is how the lightmap pass darkens the diffuse pass under it. The GS blend unit
+// multiplies by a scalar alpha and never by a second colour, so this is as close
+// to OpenGL's glBlendFunc(GL_ZERO, GL_SRC_COLOR) as the hardware gets - what it
+// modulates by is the source's *alpha*, not its RGB.
+//
+// The three are mutually exclusive; passing more than one asserts. Each implies
+// the ABE bit and the depth-write mask.
 enum class DrawFlags : u32
 {
     None       = 0,
     Blended    = 1 << 0,
     Untextured = 1 << 1,
     Additive   = 1 << 2,
+    Modulate   = 1 << 3,
 };
 
 constexpr DrawFlags operator|(DrawFlags a, DrawFlags b)
