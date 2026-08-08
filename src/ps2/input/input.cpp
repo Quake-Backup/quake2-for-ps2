@@ -1,15 +1,21 @@
 /* ================================================================================================
  * File: input.cpp
- * Brief: Gamepad input backend, replacing null/in_null.c. Drives a single GamePad
- *        (see pad.h) and maps its state onto the engine: buttons become key events
- *        routed by input focus (menu/console navigation vs. rebindable game action
- *        keys), the left stick rotates the camera and the right stick moves the
- *        player - following the axis handling of the original win32/in_win.c.
+ * Brief: Gamepad + keyboard input backend, replacing null/in_null.c. Drives a single
+ *        GamePad (see pad.h) and maps its state onto the engine: buttons become key
+ *        events routed by input focus (menu/console navigation vs. rebindable game
+ *        action keys), the right stick rotates the camera and the left stick moves
+ *        the player - following the axis handling of the original win32/in_win.c.
+ *
+ *        A USB keyboard (see keyboard.h) is optional and gated by the in_keyboard
+ *        cvar: when present its keys are forwarded verbatim, so the stock default.cfg
+ *        binds work as they do on the PC. The gamepad is unaffected either way, and
+ *        both devices can be used at the same time.
  *
  * This source code is released under the GNU GPL v2 license.
  * ================================================================================================ */
 
 #include "ps2/common.h"
+#include "ps2/input/keyboard.h"
 #include "ps2/input/pad.h"
 
 // The input backend is client code (the engine's own win32/in_win.c is the same):
@@ -90,6 +96,19 @@ static u16 s_oldButtons = 0;
 // even if input focus changed while the button was held.
 static int s_heldKeys[kNumButtons] = {};
 
+// The optional USB keyboard, polled alongside the pad in IN_Frame.
+static ps2::input::Keyboard s_keyboard;
+
+// Mirrors in_keyboard, and whether we have already tried to bring the driver up
+// (a one-shot: the IOP modules must not be loaded twice, and a failed attempt is
+// not worth repeating every frame).
+static bool s_keyboardEnabled = false;
+static bool s_keyboardInitTried = false;
+
+// Quake keys currently held down via the keyboard, so they can be released if the
+// keyboard is switched off mid-press - otherwise a held +attack would stick.
+static bool s_keyboardHeld[256] = {};
+
 // Stick tuning (cvar names and defaults follow the original win32 joystick code;
 // negate a sensitivity to invert that axis).
 static const cvar_t * s_yawSensitivity;
@@ -100,6 +119,9 @@ static const cvar_t * s_yawThreshold;
 static const cvar_t * s_pitchThreshold;
 static const cvar_t * s_forwardThreshold;
 static const cvar_t * s_sideThreshold;
+
+// Gates the keyboard only; the gamepad keeps working either way.
+static const cvar_t * s_inKeyboard;
 
 // ------------------------------------------------------------------------------------------------
 // Helpers
@@ -118,6 +140,48 @@ void InstallDefaultBinds()
         char bind[64];
         std::snprintf(bind, sizeof(bind), "%s", mapping.gameBind);
         Key_SetBinding(mapping.gameKey, bind);
+    }
+}
+
+// Releases every key the keyboard still has down. Called when the keyboard is
+// switched off, since no up event will ever arrive for those presses.
+void ReleaseHeldKeyboardKeys()
+{
+    for (int key = 0; key < ps2::ArrayLength(s_keyboardHeld); ++key)
+    {
+        if (s_keyboardHeld[key])
+        {
+            s_keyboardHeld[key] = false;
+            Key_Event(key, false, sys_frame_time);
+        }
+    }
+}
+
+// Applies the current in_keyboard setting. Switching it on the first time brings
+// the driver up - the IOP modules load on demand, so a user who never wants a
+// keyboard never pays for one - and switching it off drops any held keys.
+void SyncKeyboardEnabled()
+{
+    const bool enabled = (s_inKeyboard->value != 0.0f);
+    if (enabled == s_keyboardEnabled)
+    {
+        return;
+    }
+    s_keyboardEnabled = enabled;
+
+    if (!enabled)
+    {
+        ReleaseHeldKeyboardKeys();
+        return;
+    }
+
+    if (!s_keyboardInitTried)
+    {
+        s_keyboardInitTried = true;
+        if (s_keyboard.Init())
+        {
+            Com_Printf("USB keyboard input initialised.\n");
+        }
     }
 }
 
@@ -140,68 +204,92 @@ void IN_Init()
     s_pitchThreshold     = Cvar_Get("joy_pitchthreshold",     "0.15", 0);
     s_forwardThreshold   = Cvar_Get("joy_forwardthreshold",   "0.15", 0);
     s_sideThreshold      = Cvar_Get("joy_sidethreshold",      "0.15", 0);
+    s_inKeyboard         = Cvar_Get("in_keyboard",            "1",    CVAR_ARCHIVE);
 
     if (s_gamepad.Init())
     {
         InstallDefaultBinds();
         Com_Printf("Gamepad input initialised.\n");
     }
+
+    // Quiet when no keyboard driver comes up: it is optional hardware, and the
+    // pad binds installed above are what the console actually ships with.
+    SyncKeyboardEnabled();
 }
 
 void IN_Shutdown()
 {
     s_gamepad.Shutdown();
+    s_keyboard.Shutdown();
 }
 
 // ------------------------------------------------------------------------------------------------
-// IN_Frame - once per client frame: advance the pad state machine and poll it
+// IN_Frame - once per client frame: advance the device state machines and poll them
 // ------------------------------------------------------------------------------------------------
 
 void IN_Frame()
 {
     s_gamepad.Update();
+
+    SyncKeyboardEnabled();
+    if (s_keyboardEnabled)
+    {
+        s_keyboard.Update();
+    }
 }
 
 // ------------------------------------------------------------------------------------------------
-// IN_Commands - emit key events for button state changes
+// IN_Commands - emit key events for button state changes and keystrokes
 // ------------------------------------------------------------------------------------------------
 
 void IN_Commands()
 {
     const u16 buttons = s_gamepad.Buttons();
     const u16 changed = static_cast<u16>(buttons ^ s_oldButtons);
-    if (changed == 0)
+    if (changed != 0)
     {
-        return;
+        s_oldButtons = buttons;
+
+        const bool uiFocus = (cls.key_dest != key_game);
+
+        for (int i = 0; i < kNumButtons; ++i)
+        {
+            const ButtonMapping & mapping = kButtonMap[i];
+            if ((changed & mapping.padButton) == 0)
+            {
+                continue;
+            }
+
+            if ((buttons & mapping.padButton) != 0)
+            {
+                const int key = uiFocus ? mapping.uiKey : mapping.gameKey;
+                s_heldKeys[i] = key;
+                Key_Event(key, true, sys_frame_time);
+            }
+            else if (s_heldKeys[i] != 0)
+            {
+                Key_Event(s_heldKeys[i], false, sys_frame_time);
+                s_heldKeys[i] = 0;
+            }
+        }
     }
-    s_oldButtons = buttons;
 
-    const bool uiFocus = (cls.key_dest != key_game);
-
-    for (int i = 0; i < kNumButtons; ++i)
+    // Keystrokes go straight through: unlike the pad there is no input focus
+    // routing to do, since the keys the engine binds are the keys we send.
+    if (s_keyboardEnabled)
     {
-        const ButtonMapping & mapping = kButtonMap[i];
-        if ((changed & mapping.padButton) == 0)
+        const int numEvents = s_keyboard.NumEvents();
+        for (int i = 0; i < numEvents; ++i)
         {
-            continue;
-        }
-
-        if ((buttons & mapping.padButton) != 0)
-        {
-            const int key = uiFocus ? mapping.uiKey : mapping.gameKey;
-            s_heldKeys[i] = key;
-            Key_Event(key, true, sys_frame_time);
-        }
-        else if (s_heldKeys[i] != 0)
-        {
-            Key_Event(s_heldKeys[i], false, sys_frame_time);
-            s_heldKeys[i] = 0;
+            const ps2::input::Keyboard::Event & event = s_keyboard.GetEvent(i);
+            s_keyboardHeld[event.key] = event.down;
+            Key_Event(event.key, event.down, sys_frame_time);
         }
     }
 }
 
 // ------------------------------------------------------------------------------------------------
-// IN_Move - sticks: left rotates the camera, right moves the player
+// IN_Move - sticks: right rotates the camera, left moves the player
 // ------------------------------------------------------------------------------------------------
 
 void IN_Move(usercmd_t * cmd)
