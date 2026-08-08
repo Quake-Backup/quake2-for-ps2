@@ -46,6 +46,9 @@ extern unsigned int  size_usbmass_bd_irx;
 namespace ps2::sys {
 namespace {
 
+// Set once the USB branch below has run. See UsbStackStarted().
+static bool s_usbStackStarted = false;
+
 // The file probed for under "<base>/baseq2/" to decide a base path works.
 constexpr const char * kProbeFile = "pak0.pak";
 
@@ -133,6 +136,8 @@ const char * DetectBasePathAndBootIop()
     ExecIopModule("usbd",        usbd_irx,        size_usbd_irx);
     ExecIopModule("usbmass_bd",  usbmass_bd_irx,  size_usbmass_bd_irx);
 
+    s_usbStackStarted = true;
+
     // Route newlib file IO through fileXio -> iomanX: bdmfs registers mass:
     // with iomanX, which the plain kernel fio path cannot reach.
     fileXioInit();
@@ -151,6 +156,11 @@ const char * DetectBasePathAndBootIop()
               "Emulator: enable the host filesystem and put baseq2/ next to the ELF.\n"
               "Console: USB drive with a baseq2/ folder (%s etc).", kProbeFile);
     return nullptr; // unreachable; Sys_Error halts
+}
+
+bool UsbStackStarted()
+{
+    return s_usbStackStarted;
 }
 
 } // namespace ps2::sys

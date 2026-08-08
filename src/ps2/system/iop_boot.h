@@ -23,4 +23,10 @@ namespace ps2::sys {
 // modules later at IN_Init - after the IOP reset, which is the required order.
 const char * DetectBasePathAndBootIop();
 
+// True once the call above has taken the USB route: the IOP was reset, the sbv
+// patches that allow loading a module from an EE buffer are in place and usbd.irx
+// is running. False on the host: fast path, which skips all of it - IOP drivers
+// started later (see input/keyboard.cpp) must then patch and start usbd themselves.
+bool UsbStackStarted();
+
 } // namespace ps2::sys
