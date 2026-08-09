@@ -213,7 +213,7 @@ void LightmapManager::NextAtlas()
 
     const int index = m_atlasCount++;
 
-    m_alpha[index]  = static_cast<u8 *>(PS2_MemAllocAligned(16, kAtlasAlphaBytes, MEMTAG_LIGHTMAP));
+    m_alpha[index]  = static_cast<u8  *>(PS2_MemAllocAligned(16, kAtlasAlphaBytes, MEMTAG_LIGHTMAP));
     m_mirror[index] = static_cast<u16 *>(PS2_MemAllocAligned(16, kAtlasColorBytes, MEMTAG_LIGHTMAP));
 
     // Clear to white so the gaps the packer leaves modulate to 1.0 rather than
@@ -599,8 +599,7 @@ void LightmapManager::ChainSurface(mod::ModelSurface & surf, const refdef_t & vi
         // Fold this frame's lights straight into the surface's own block. The
         // cached style state deliberately still describes the *static* bake, so
         // the restore below knows the block is dirty even if no style moved.
-        BuildLightmap(surf, viewDef.lightstyles, viewDef.dlights, viewDef.num_dlights,
-                      /* addDynamic = */ true);
+        BuildLightmap(surf, viewDef.lightstyles, viewDef.dlights, viewDef.num_dlights, /* addDynamic = */ true);
         StoreLightmap(surf);
 
         surf.lightmapDynamicFrame = frameCount;
