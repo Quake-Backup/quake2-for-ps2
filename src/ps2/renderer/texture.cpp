@@ -7,6 +7,7 @@
 
 #include "ps2/renderer/texture.h"
 #include "ps2/renderer/image_load.h"
+#include "ps2/renderer/scrap_atlas.h" // small Pics share an atlas instead of a GS page each
 #include "ps2/renderer/gs.h" // gs::ReleaseTexture / gs::DefragVramHeap (end-of-level eviction)
 #include "ps2/builtin/builtin.h"
 #include "ps2/small_pool.h"
@@ -352,6 +353,36 @@ const Texture * TextureCache::LoadFromFile(const char * fullname, const ImageTyp
         format     = PixelFormat::Palette8;
         components = HasTransparentTexels(pic8, width * height) ? TexComponents::RGBA : TexComponents::RGB;
         pixels     = pic8;
+
+        // Small HUD/menu images go into a shared scrap rather than each holding
+        // a GS page of their own. Only Pics: world textures and sprites tile or
+        // are large enough that the page waste is negligible, and a tiling
+        // texture could not use an atlas anyway. Built-ins never reach here,
+        // which is what keeps "backtile" out - it is exactly 64x64 but
+        // Draw_TileClear addresses it in screen space and needs WRAP_REPEAT.
+        if (type == ImageType::Pic && scrap::IsPackable(width, height))
+        {
+            const Texture * atlas = nullptr;
+            int atlasX = 0;
+            int atlasY = 0;
+
+            if (scrap::TryPack(pic8, width, height, &atlas, &atlasX, &atlasY))
+            {
+                // The texels live in the atlas now; the decoded copy is dead.
+                // Register still wants a non-null 'pixels', and every assert
+                // that checks it should keep passing, so point it at the atlas -
+                // Unload knows not to free it.
+                PS2_MemFree(pic8, static_cast<size_t>(width * height), MEMTAG_TEXIMAGE);
+
+                Texture & packed = Register(fullname, atlas->pixels, width, height,
+                                            format, components, type, TexFlags::None);
+                packed.atlas       = atlas;
+                packed.atlasX      = static_cast<s16>(atlasX);
+                packed.atlasY      = static_cast<s16>(atlasY);
+                packed.dirtyPixels = false; // the atlas carries the dirty flag, not the view
+                return &packed;
+            }
+        }
     }
     else if (std::strcmp(extension, ".tga") == 0)
     {
@@ -382,8 +413,17 @@ void TextureCache::Unload(u16 slot)
 
     gs::ReleaseTexture(texture); // return its GS VRAM to the heap (no-op when not resident)
 
-    const int pixelBytes = texture.width * texture.height * BytesPerTexel(texture.format);
-    PS2_MemFree(const_cast<void *>(texture.pixels), static_cast<size_t>(pixelBytes), MEMTAG_TEXIMAGE);
+    // A scrapped image owns neither VRAM nor its pixels - 'pixels' points into
+    // the shared atlas, and freeing it here would take the atlas with it (at the
+    // wrong size, no less). Scraps are monotonic and never reclaim a slot, so
+    // there is nothing to give back. Pics are exempt from eviction anyway, which
+    // makes this unreachable today; it is here so it stays correct if that
+    // policy ever changes.
+    if (texture.atlas == nullptr)
+    {
+        const int pixelBytes = texture.width * texture.height * BytesPerTexel(texture.format);
+        PS2_MemFree(const_cast<void *>(texture.pixels), static_cast<size_t>(pixelBytes), MEMTAG_TEXIMAGE);
+    }
 
     m_texturePool.Free(slot); // resets the slot; its type reads Null again
 }
@@ -421,6 +461,8 @@ void TextureCache::EndRegistration()
         Com_DPrintf("Texture cache: freed %d unused textures.\n", freedCount);
         gs::DefragVramHeap();
     }
+
+    scrap::DumpUsage();
 }
 
 const Texture & TextureCache::DebugTexture(int variant) const
@@ -473,6 +515,9 @@ Texture & TextureCache::Register(const char * name, const void * pixels, int wid
     texture.magFilter    = filter;
     texture.minFilter    = filter;
     texture.textureChain = nullptr;
+    texture.atlas        = nullptr; // the caller packs it into a scrap afterwards, if it fits
+    texture.atlasX       = 0;
+    texture.atlasY       = 0;
     texture.vramAddr     = Texture::kNotResident;
     texture.texbuf       = {};
     texture.dirtyPixels  = !builtin; // loader-written pixels may still sit in the dcache;

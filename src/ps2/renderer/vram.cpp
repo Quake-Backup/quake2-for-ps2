@@ -10,6 +10,14 @@
  *  (ps2gl's trick): it only marks the victim non-resident - the victim's pixels
  *  stay in EE RAM and re-upload transparently the next time it is bound.
  *
+ *  Textures bound this frame are pinned, because their draws may still be queued
+ *  or rasterising, and a request that would have to evict one fails rather than
+ *  corrupting them. That failure is a normal condition, not an error: the caller
+ *  (gs::EnsureTextureResident) drains the GS, calls UnpinAll and retries, then
+ *  Defragment and retries, trading pipelining for the space. Since Defragment
+ *  remakes the heap as one free block, the retry can only fail for a texture
+ *  larger than the entire heap, which the caller rejects up front.
+ *
  * This source code is released under the GNU GPL v2 license.
  * ================================================================================================ */
 
@@ -24,12 +32,6 @@ namespace ps2::vram {
 namespace {
 
 constexpr int kVramTotalWords = 1024 * 1024; // 4 MB of GS VRAM, in 32-bit words.
-
-// One entry per contiguous VRAM range. Every block spans at least one GS page
-// (TextureFootprintWords is page-granular), so the ~1.27 MB heap left after
-// the framebuffers/z-buffer (~161 pages) can never fragment into more blocks
-// than this, no matter how many textures the cache holds.
-constexpr int kMaxBlocks = 176;
 
 // Debug knob: nonzero clamps the heap to this many words so eviction can be
 // exercised without loading more textures than VRAM holds. Keep 0 normally.
@@ -50,23 +52,37 @@ struct Block
 // address, so a block's list neighbours are always its VRAM neighbours. That is
 // what makes splitting and coalescing a pointer fixup instead of an array shift,
 // and it keeps Block pointers stable for as long as the block lives.
-static Block   s_blockPool[kMaxBlocks];
-static Block * s_unusedBlocks = nullptr;
-static Block * s_blockList    = nullptr; // null until Init()
-static int     s_blockCount   = 0;       // blocks currently in s_blockList
-static u32     s_frame        = 0;
+//
+// The pool is sized by Init() from the heap it is handed, since how much VRAM
+// is left over depends on the framebuffer format (see gs::Init).
+static Block * s_blockPool         = nullptr;
+static int     s_blockPoolCapacity = 0;
+static Block * s_unusedBlocks      = nullptr;
+static Block * s_blockList         = nullptr; // null until Init()
+static int     s_blockCount        = 0;       // blocks currently in s_blockList
+static u32     s_frame             = 0;
 
 // The heap extent Init() took over (Defragment() remakes the list from it) and
-// the debug-overlay stat for this frame's upload count.
-static int s_heapBaseWords    = 0;
-static int s_heapTotalWords   = 0;
-static int s_uploadsThisFrame = 0;
+// the debug-overlay stats for this frame.
+static int s_heapBaseWords     = 0;
+static int s_heapTotalWords    = 0;
+static int s_uploadsThisFrame  = 0;
+static int s_oomSyncsThisFrame = 0;
 
-// Takes a descriptor from the pool and fills it in as a free block. The caller
-// links it into the heap list (LinkAfter); ResetHeap makes the list head.
+// Takes a descriptor from the pool and fills it in as a free block, or returns
+// null when the pool is empty. The caller links it into the heap list
+// (LinkAfter); ResetHeap makes the list head.
+//
+// Running dry is not an error: the only caller that can hit it is the split in
+// TryAllocate, which just hands out the whole block instead. The pool is sized
+// at one descriptor per GS page (see Init), which is the most the list can ever
+// hold, so this is belt-and-braces rather than an expected path.
 Block * NewBlock(Address addrWords, int sizeWords)
 {
-    PS2_AssertMsg(s_unusedBlocks != nullptr, "Out of VRAM block descriptors!");
+    if (s_unusedBlocks == nullptr)
+    {
+        return nullptr;
+    }
 
     Block * block  = s_unusedBlocks;
     s_unusedBlocks = block->next;
@@ -125,15 +141,16 @@ void LinkAfter(Block * after, Block * block)
 // Callers deal with the owners first - this only rebuilds the bookkeeping.
 void ResetHeap()
 {
-    for (int i = 0; i < kMaxBlocks; ++i)
+    for (int i = 0; i < s_blockPoolCapacity; ++i)
     {
         s_blockPool[i].owner = nullptr; // no stale Texture pointers left in the pool
-        s_blockPool[i].next  = (i + 1 < kMaxBlocks) ? &s_blockPool[i + 1] : nullptr;
+        s_blockPool[i].next  = (i + 1 < s_blockPoolCapacity) ? &s_blockPool[i + 1] : nullptr;
     }
 
     s_unusedBlocks = &s_blockPool[0];
     s_blockCount   = 0;
     s_blockList    = NewBlock(Address(s_heapBaseWords), s_heapTotalWords);
+    PS2_AssertMsg(s_blockList != nullptr, "VRAM block pool is empty!"); // pool was just refilled
 }
 
 // Merges the free block with its free neighbours, keeping the invariant that no
@@ -198,6 +215,12 @@ const char * PixelFormatName(tex::PixelFormat format)
     return "???"; // Unreachable; keeps GCC's -Wreturn-type happy.
 }
 
+} // namespace
+
+// ------------------------------------------------------------------------------------------------
+// Public API
+// ------------------------------------------------------------------------------------------------
+
 // Prints the whole block list plus the current Stats to stdout, so a failed
 // allocation can be diagnosed from the EE emulog: which textures were holding
 // VRAM, how much each took and how recently they were bound. Blocks marked
@@ -253,7 +276,7 @@ void DumpAllBlocks()
                usedBlocks,
                pinnedBlocks,
                s_blockCount - usedBlocks,
-               s_blockCount, kMaxBlocks);
+               s_blockCount, s_blockPoolCapacity);
 
     Com_Printf("Heap     : %d KB total, %d KB used, %d KB free (largest free block %d KB)\n",
                stats.totalWords * 4 / 1024,
@@ -261,16 +284,11 @@ void DumpAllBlocks()
                stats.freeWords * 4 / 1024,
                largestFreeWords * 4 / 1024);
 
-    Com_Printf("Textures : %d resident, %d uploads this frame\n",
+    Com_Printf("Textures : %d resident, %d uploads this frame, %d GS drains this frame\n",
                stats.residentTextures,
-               stats.uploadsThisFrame);
+               stats.uploadsThisFrame,
+               stats.oomSyncsThisFrame);
 }
-
-} // namespace
-
-// ------------------------------------------------------------------------------------------------
-// Public API
-// ------------------------------------------------------------------------------------------------
 
 void Init(int heapBaseWords)
 {
@@ -286,15 +304,28 @@ void Init(int heapBaseWords)
 
     s_heapBaseWords  = heapBaseWords;
     s_heapTotalWords = heapEndWords - heapBaseWords;
+
+    // One descriptor per GS page bounds the list: every block spans at least a
+    // whole page, since the heap base is page-aligned and TextureFootprintWords
+    // is page-granular, so every split remainder is page-aligned too. The spare
+    // few cost nothing and keep the bound from being exactly tight. Allocated
+    // rather than fixed because how much VRAM is left for the heap depends on
+    // the framebuffer format (see gs::Init); Init runs once and the renderer
+    // has no teardown, so the pool lives for the length of the process.
+    s_blockPoolCapacity = (s_heapTotalWords / 2048) + 8;
+    s_blockPool = new Block[static_cast<size_t>(s_blockPoolCapacity)];
+
     ResetHeap();
 
-    Com_Printf("GS texture heap: %d KB of VRAM.\n", s_heapTotalWords * 4 / 1024);
+    Com_Printf("GS texture heap: %d KB of VRAM (%d block descriptors).\n",
+               s_heapTotalWords * 4 / 1024, s_blockPoolCapacity);
 }
 
 void BeginFrame()
 {
     ++s_frame;
-    s_uploadsThisFrame = 0;
+    s_uploadsThisFrame  = 0;
+    s_oomSyncsThisFrame = 0;
 }
 
 void EndFrame()
@@ -337,7 +368,12 @@ int TextureFootprintWords(int width, int height, int psm)
     return pagesX * pagesY * 2048; // one GS page = 8 KB = 2048 words
 }
 
-Address Allocate(const tex::Texture & texture, int sizeWords, bool * outEvicted)
+int HeapTotalWords()
+{
+    return s_heapTotalWords;
+}
+
+Address TryAllocate(const tex::Texture & texture, int sizeWords, bool * outEvicted)
 {
     PS2_AssertMsg(s_blockList != nullptr, "vram::Init not called!");
     PS2_AssertMsg(texture.vramAddr == tex::Texture::kNotResident, "Texture already resident!");
@@ -357,11 +393,17 @@ Address Allocate(const tex::Texture & texture, int sizeWords, bool * outEvicted)
 
             if (block->sizeWords > sizeWords)
             {
-                // Split off the free remainder.
+                // Split off the free remainder. With no descriptor left to
+                // describe it, hand out the oversized block whole rather than
+                // failing - the surplus comes back when the block is freed and
+                // coalesced.
                 Block * remainder = NewBlock(Address(static_cast<int>(block->addrWords) + sizeWords),
                                              block->sizeWords - sizeWords);
-                LinkAfter(block, remainder);
-                block->sizeWords = sizeWords;
+                if (remainder != nullptr)
+                {
+                    LinkAfter(block, remainder);
+                    block->sizeWords = sizeWords;
+                }
             }
 
             block->owner          = &texture;
@@ -387,9 +429,11 @@ Address Allocate(const tex::Texture & texture, int sizeWords, bool * outEvicted)
 
         if (victim == nullptr)
         {
-            DumpAllBlocks();
-            Sys_Error("GS texture heap too small for this frame's working set! Failed request of %d words.", sizeWords);
-            return Address::Invalid; // unreachable; Sys_Error halts.
+            // Everything left is pinned. Not fatal: the caller drains the GS -
+            // which is the only reason the pins exist - and retries. Anything
+            // evicted on the way here stays evicted, which is fine; those
+            // textures re-upload on their next bind.
+            return Address::Invalid;
         }
 
         Com_DPrintf("VRAM: evicting '%s' (%d KB)\n", victim->owner->name, victim->sizeWords * 4 / 1024);
@@ -398,6 +442,27 @@ Address Allocate(const tex::Texture & texture, int sizeWords, bool * outEvicted)
         victim->owner = nullptr;
         *outEvicted = true;
         CoalesceFree(victim);
+    }
+}
+
+void UnpinAll()
+{
+    PS2_AssertMsg(s_blockList != nullptr, "vram::Init not called!");
+
+    // Clamp this frame's stamps back one frame rather than zeroing them: the
+    // blocks stay ordered by how recently they were bound, so a texture the
+    // frame has not touched in a while is still the first to go.
+    if (s_frame == 0)
+    {
+        return; // no frame has started, so nothing can be pinned
+    }
+
+    for (Block * block = s_blockList; block != nullptr; block = block->next)
+    {
+        if (block->owner != nullptr && block->lastBoundFrame == s_frame)
+        {
+            block->lastBoundFrame = s_frame - 1;
+        }
     }
 }
 
@@ -478,11 +543,17 @@ void NoteTextureUpload()
     ++s_uploadsThisFrame;
 }
 
+void NoteOomSync()
+{
+    ++s_oomSyncsThisFrame;
+}
+
 Stats GetStats()
 {
     Stats stats = {};
-    stats.totalWords       = s_heapTotalWords;
-    stats.uploadsThisFrame = s_uploadsThisFrame;
+    stats.totalWords        = s_heapTotalWords;
+    stats.uploadsThisFrame  = s_uploadsThisFrame;
+    stats.oomSyncsThisFrame = s_oomSyncsThisFrame;
 
     for (const Block * block = s_blockList; block != nullptr; block = block->next)
     {

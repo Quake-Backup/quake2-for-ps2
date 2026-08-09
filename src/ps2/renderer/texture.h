@@ -95,6 +95,16 @@ struct Texture final
     // chain as one batch and resets it to null - it never outlives the frame.
     mutable const mod::ModelSurface * textureChain;
 
+    // Set when the image lives inside a shared scrap atlas (see scrap_atlas.h)
+    // rather than owning VRAM: bind 'atlas' and shift the draw's texel
+    // coordinates by atlasX/atlasY, which gs::SetTextureFor2D does. 'width' and
+    // 'height' stay the image's own, so Draw_GetPicSize and every caller's
+    // layout math are unaffected, and 'pixels' points into the atlas buffer -
+    // it is not a standalone allocation and must not be freed (see Unload).
+    const Texture * atlas;
+    s16             atlasX;
+    s16             atlasY;
+
     // Residency is a cache managed by gs/vram: binding a const Texture may
     // upload it (or evict others), so these mutate behind the const API.
     static constexpr auto kNotResident = vram::Address::Invalid;

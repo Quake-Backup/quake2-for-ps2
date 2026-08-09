@@ -47,6 +47,7 @@ PS2_CXX_SRC =                         \
 	ps2/renderer/model.cpp            \
 	ps2/renderer/model_load.cpp       \
 	ps2/renderer/lightmap.cpp         \
+	ps2/renderer/scrap_atlas.cpp      \
 	ps2/renderer/cinematic.cpp        \
 	ps2/renderer/render_view.cpp      \
 	ps2/renderer/render_md2.cpp       \

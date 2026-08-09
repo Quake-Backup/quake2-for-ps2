@@ -27,6 +27,7 @@
 #include "ps2/renderer/lightmap.h"
 #include "ps2/renderer/model.h"
 #include "ps2/renderer/texture.h"
+#include "ps2/renderer/scrap_atlas.h" // SkylinePacker, shared with the 2D scrap atlases
 #include "ps2/renderer/gs.h"
 
 #include <cmath>
@@ -120,8 +121,8 @@ private:
     void NextAtlas();
     int  CurrentAtlas() const { return m_atlasCount - 1; }
 
-    void ResetBlocks() { std::memset(m_allocated, 0, sizeof(m_allocated)); }
-    bool AllocBlock(int w, int h, int * outX, int * outY);
+    void ResetBlocks() { m_packer.Reset(); }
+    bool AllocBlock(int w, int h, int * outX, int * outY) { return m_packer.Alloc(w, h, outX, outY); }
 
     void BuildLightmap(const mod::ModelSurface & surf, const lightstyle_t * lightstyles,
                        const dlight_t * dlights, int numDlights, bool addDynamic);
@@ -149,8 +150,9 @@ private:
     // Per-atlas draw chains, rebuilt every frame by ChainSurface.
     const mod::ModelSurface * m_chains[kMaxLightmapTextures] = {};
 
-    // Skyline packer: the filled height of each column of the atlas being built.
-    int m_allocated[kLightmapTextureWidth] = {};
+    // Packs each surface's luxel block into the atlas being built. Shared with
+    // the 2D scrap atlases, which pack the same way at the same size.
+    SkylinePacker<kLightmapTextureWidth, kLightmapTextureHeight> m_packer = {};
 
     // Where a surface's luxels are accumulated before being clamped and stored.
     // Floating point and unclamped, so styles and dynamic lights can push a
@@ -263,61 +265,6 @@ void LightmapManager::EndBuilding()
     Com_DPrintf("Lightmaps: %d atlas(es) of %dx%d, %d KB of EE RAM.\n",
                 m_atlasCount, kLightmapTextureWidth, kLightmapTextureHeight,
                 (m_atlasCount * (kAtlasAlphaBytes + kAtlasColorBytes)) / 1024);
-}
-
-// ------------------------------------------------------------------------------------------------
-// Skyline packer (ref_gl's LM_AllocBlock)
-// ------------------------------------------------------------------------------------------------
-
-// Finds the lowest shelf 'w' columns wide that leaves room for 'h' rows, and
-// raises those columns over it. Allocation is monotonic - blocks are never
-// individually freed, only wiped wholesale by ResetBlocks.
-bool LightmapManager::AllocBlock(const int w, const int h, int * outX, int * outY)
-{
-    PS2_Assert(w > 0 && h > 0);
-
-    int best = kLightmapTextureHeight;
-    int bestX = 0;
-
-    // <= because a block ending flush with the last column still fits; ref_gl's
-    // '<' here quietly wastes its rightmost columns.
-    for (int i = 0; i <= kLightmapTextureWidth - w; ++i)
-    {
-        int best2 = 0;
-        int j = 0;
-
-        for (; j < w; ++j)
-        {
-            if (m_allocated[i + j] >= best)
-            {
-                break; // Already taller than the best shelf found so far.
-            }
-            if (m_allocated[i + j] > best2)
-            {
-                best2 = m_allocated[i + j];
-            }
-        }
-
-        if (j == w) // Every column cleared: a valid spot, and lower than the last.
-        {
-            bestX = i;
-            best  = best2;
-        }
-    }
-
-    if (best + h > kLightmapTextureHeight)
-    {
-        return false; // Would overflow the bottom of the atlas.
-    }
-
-    for (int i = 0; i < w; ++i)
-    {
-        m_allocated[bestX + i] = best + h;
-    }
-
-    *outX = bestX;
-    *outY = best;
-    return true;
 }
 
 // ------------------------------------------------------------------------------------------------

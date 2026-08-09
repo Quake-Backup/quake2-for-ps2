@@ -193,9 +193,11 @@ void DrawMemUsageOverlay()
     DrawInternalString(textX, textY, line);
 }
 
-// GS VRAM texture-heap overlay in the lower-left corner: free/uncommitted heap
-// space, the number of resident textures and the texture uploads done so far
-// this frame (streaming pressure - high or spiking means the heap is thrashing).
+// GS VRAM texture-heap overlay in the lower-left corner: how much of the heap is
+// committed, the number of resident textures, the texture uploads done so far
+// this frame (streaming pressure - high or spiking means the heap is thrashing)
+// and the GS drains a full heap forced this frame (see gs::EnsureTextureResident;
+// anything but zero means the frame's working set does not fit).
 void DrawVramUsageOverlay()
 {
     if (s_showVramStats->value == 0.0f)
@@ -204,7 +206,7 @@ void DrawVramUsageOverlay()
     }
 
     constexpr int kLineHeight = kGlyphSize + 2; // Matches DrawInternalString spacing.
-    constexpr int kNumLines   = 4;              // Header + three stats.
+    constexpr int kNumLines   = 5;              // Header + four stats.
     constexpr int kPanelWidth = 174;
     constexpr int kPadding    = 4;
 
@@ -226,9 +228,15 @@ void DrawVramUsageOverlay()
     char line[64];
 
     // PS2_FormatMemoryUnit returns a shared static buffer, so it must be consumed
-    // by this one snprintf before anything else reuses it.
-    std::snprintf(line, sizeof(line), "%-10s %s", "Free",
-                  PS2_FormatMemoryUnit(static_cast<size_t>(stats.freeWords) * 4u, true));
+    // by this one snprintf before anything else reuses it - hence the two calls
+    // rather than one line with both figures.
+    std::snprintf(line, sizeof(line), "%-10s %s", "Used",
+                  PS2_FormatMemoryUnit(static_cast<size_t>(stats.totalWords - stats.freeWords) * 4u, true));
+    DrawInternalString(textX, textY, line);
+    textY += kLineHeight;
+
+    std::snprintf(line, sizeof(line), "%-10s %s", "Total",
+                  PS2_FormatMemoryUnit(static_cast<size_t>(stats.totalWords) * 4u, true));
     DrawInternalString(textX, textY, line);
     textY += kLineHeight;
 
@@ -236,7 +244,10 @@ void DrawVramUsageOverlay()
     DrawInternalString(textX, textY, line);
     textY += kLineHeight;
 
-    std::snprintf(line, sizeof(line), "%-10s %d", "Uploads", stats.uploadsThisFrame);
+    // Uploads and heap-full drains share a line to keep the panel compact; the
+    // drain count is the one to watch, since it is zero on a healthy frame.
+    std::snprintf(line, sizeof(line), "%-10s %d (%d sync)", "Uploads",
+                  stats.uploadsThisFrame, stats.oomSyncsThisFrame);
     DrawInternalString(textX, textY, line);
 }
 

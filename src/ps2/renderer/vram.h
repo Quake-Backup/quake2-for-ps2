@@ -32,12 +32,29 @@ void EndFrame();
 // graph_vram_size undercounts here - see the .cpp for why.
 int TextureFootprintWords(int width, int height, int psm);
 
+// Size of the heap handed to Init(), in words. The largest request that can
+// ever be serviced, since Defragment() can always remake the heap as one block.
+int HeapTotalWords();
+
 // Allocates 'sizeWords' for 'texture', evicting least-recently-bound textures as
-// needed (never ones bound this frame; asserts if the frame's working set cannot
-// fit). Evicted textures get vramAddr = kNotResident and self-heal on their next
-// bind. Returns the block's word address; sets *outEvicted when anything was
-// evicted - the caller must sync the GS before writing over reused VRAM.
-Address Allocate(const tex::Texture & texture, int sizeWords, bool * outEvicted);
+// needed - never ones bound this frame, whose draws may still be in flight.
+// Evicted textures get vramAddr = kNotResident and self-heal on their next bind.
+// Returns the block's word address, or Address::Invalid when the request cannot
+// be met without touching a texture bound this frame; sets *outEvicted when
+// anything was evicted - the caller must sync the GS before writing over reused
+// VRAM.
+//
+// Failure is not fatal and not the end of the road: the caller drains the GS
+// (which is what the this-frame protection guards against), calls UnpinAll and
+// retries, then Defragment and retries. See gs::EnsureTextureResident.
+Address TryAllocate(const tex::Texture & texture, int sizeWords, bool * outEvicted);
+
+// Drops the this-frame eviction protection from every resident texture, making
+// the whole heap evictable again. Only legal once the GS is idle - the pins
+// exist because a block bound this frame may still be queued in the frame packet
+// or rasterising, and nothing else re-establishes that guarantee. Relative LRU
+// order is preserved, so the coldest textures stay the preferred victims.
+void UnpinAll();
 
 // Marks the (resident) texture as bound this frame, protecting it from eviction
 // until the next frame.
@@ -71,13 +88,25 @@ bool Defragment();
 // (a first upload or a dirty re-upload); reset each frame by BeginFrame().
 void NoteTextureUpload();
 
+// Records one mid-frame GS drain forced by a failed allocation, for the same
+// per-frame counters. A nonzero count means the frame's working set outgrew the
+// heap and the renderer traded pipelining for it.
+void NoteOomSync();
+
+// Prints the whole block list and the current stats: which textures hold VRAM,
+// how much each takes and how recently each was bound. For diagnosing a failed
+// allocation from the EE log - blocks marked [pinned] were bound this frame, and
+// a large free total next to a small largest-free-block means fragmentation.
+void DumpAllBlocks();
+
 // Live snapshot of the texture heap, for the ref.cpp debug overlay.
 struct Stats
 {
-    int freeWords;        // uncommitted VRAM: total size of the free blocks
-    int totalWords;       // heap size handed to Init()
-    int residentTextures; // textures currently holding a block
-    int uploadsThisFrame; // texture DMA uploads since the last BeginFrame()
+    int freeWords;         // uncommitted VRAM: total size of the free blocks
+    int totalWords;        // heap size handed to Init()
+    int residentTextures;  // textures currently holding a block
+    int uploadsThisFrame;  // texture DMA uploads since the last BeginFrame()
+    int oomSyncsThisFrame; // allocation failures that forced a GS drain
 };
 
 // Computes the current stats (cheap; walks the block list).
