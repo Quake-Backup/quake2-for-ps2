@@ -16,23 +16,22 @@
  *  draw chain. The lightmap pass then walks one chain per atlas (AtlasTexture /
  *  AtlasChain) and clears them with ClearChains.
  *
- *  The atlases are Alpha8: the GS blend unit can only scale the framebuffer by a
- *  scalar alpha, never by a second colour, so what the lightmap pass multiplies in
- *  is luxel *intensity*. The colour of each luxel is kept in EE RAM alongside it
- *  (see lightmap.cpp) for the paths that will want it later.
- *
- *  TODO (coloured lighting): lighting is monochrome for exactly that reason - the
- *  hardware cannot express diffuse x coloured-lightmap per pixel in one blend. The
- *  colour is loaded, built, animated and stored; only the last step of getting it
- *  onto the screen is missing, so this is where an accessor for it belongs. Every
- *  site that has to change is marked with this same tag - here, in lightmap.cpp
- *  (the mirror buffer and StoreLightmap) and in render_view.cpp (ClipVertex,
- *  GatherPolyTriangles, EmitScratchVertex and SurfaceDrawState).
+ *  A luxel reaches the screen split in two, because the GS cannot deliver it whole:
+ *  the blend unit computes (A - B) * C + D where C is a scalar alpha and never a
+ *  second colour, so diffuse x coloured-lightmap is not expressible as one blend.
+ *  So the atlases the hardware samples are Alpha8 and carry only the luxel's
+ *  *intensity*, which the lightmap pass multiplies in per pixel; the chroma left
+ *  over rides in a mirror in EE RAM (AtlasColors) that the diffuse pass samples
+ *  per vertex and folds into the vertex colour the GS modulates the wall texture
+ *  by. Intensity times chroma is the luxel again, so the two together reproduce
+ *  it - at full resolution in the term that varies per pixel, and at vertex
+ *  resolution in the one that barely varies at all.
  *
  * This source code is released under the GNU GPL v2 license.
  * ================================================================================================ */
 
 #include "ps2/common.h"
+#include <tamtypes.h>
 
 namespace ps2::tex { struct Texture; }
 namespace ps2::mod { struct ModelSurface; }
@@ -58,6 +57,43 @@ constexpr int kLuxelSizeUnits = 16;
 // Six atlases is ~384 KB of GS VRAM out of a ~1.27 MB heap, which is the real
 // budget to watch - see the note on vram::Allocate failures in lightmap.cpp.
 constexpr int kMaxLightmapTextures = 12;
+
+// ------------------------------------------------------------------------------------------------
+// Luxel chroma
+//
+// What is left of a luxel once its intensity has been taken out: its rgb rescaled
+// so the brightest channel is full, packed 5:6:5 with red high. Halves what the
+// mirror costs in EE RAM - 128 KB an atlas instead of 256 - for a precision loss
+// that cannot show, since the term is a slowly varying tint sampled at vertices
+// rather than at pixels.
+//
+// Note this is *not* tex::PixelFormat::RGB16, which is the 5551-with-red-low
+// layout the hardware wants; nothing packed here ever reaches the GS.
+// ------------------------------------------------------------------------------------------------
+
+// An unpacked chroma: 0..1 per channel, of which the brightest is always 1.
+struct AtlasColor
+{
+    float r, g, b;
+};
+
+// Rounded rather than truncated, so a channel already at full scale survives the
+// round trip exactly and an untinted luxel stays untinted.
+constexpr u16 PackAtlasColor(int r, int g, int b)
+{
+    return static_cast<u16>((((r * 31 + 127) / 255) << 11) |
+                            (((g * 63 + 127) / 255) <<  5) |
+                             ((b * 31 + 127) / 255));
+}
+
+inline AtlasColor UnpackAtlasColor(u16 packed)
+{
+    constexpr float k5 = 1.0f / 31.0f;
+    constexpr float k6 = 1.0f / 63.0f;
+    return AtlasColor{ static_cast<float>((packed >> 11) & 0x1F) * k5,
+                       static_cast<float>((packed >>  5) & 0x3F) * k6,
+                       static_cast<float>( packed        & 0x1F) * k5 };
+}
 
 // Registers the lightmap cvars. Call once, after tex::Init().
 void Init();
@@ -98,6 +134,13 @@ void ChainSurface(mod::ModelSurface & surf, const refdef_t & viewDef, int frameC
 // are the surfaces' lightmapTextureNum.
 int NumAtlases();
 const tex::Texture & AtlasTexture(int index);
+
+// The atlas's chroma mirror: kLightmapTextureWidth * kLightmapTextureHeight
+// packed AtlasColors, indexed [t * kLightmapTextureWidth + s] - the same
+// addressing as the atlas texture, so the vertices' lightmap UVs scaled by the
+// atlas dimensions address it directly. Never uploaded; this is the half of each
+// luxel the GS cannot blend, left for the diffuse pass to sample itself.
+const u16 * AtlasColors(int index);
 
 // Head of the atlas's draw chain, as built by ChainSurface this frame; null when
 // nothing visible uses it. Walk it through ModelSurface::lightmapChain.

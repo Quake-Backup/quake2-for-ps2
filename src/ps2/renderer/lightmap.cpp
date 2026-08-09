@@ -7,10 +7,12 @@
  *  Storage: ref_gl keeps RGBA8 atlases and modulates them over the diffuse pass with
  *  glBlendFunc(GL_ZERO, GL_SRC_COLOR). The GS blend unit computes (A - B) * C + D
  *  where C is a scalar alpha, never a second colour, so that multiply is not
- *  expressible here. What the GS can do is Cd * As, so the atlas the hardware
- *  samples is Alpha8: one luxel *intensity* byte, read through the alpha-ramp CLUT.
- *  Each luxel's colour is kept beside it in EE RAM (RGB565, never uploaded) for the
- *  paths that will want the hue later.
+ *  expressible here. What the GS can do is Cd * As, so each luxel is split in two:
+ *  its *intensity* goes into an Alpha8 atlas the hardware samples per pixel through
+ *  the alpha-ramp CLUT, and the chroma left over goes into a mirror beside it in EE
+ *  RAM (5:6:5, never uploaded) that the diffuse pass samples per vertex and folds
+ *  into its vertex colour. The two multiply back to the luxel, so the split costs
+ *  resolution only in the chroma - which is the term that barely varies.
  *
  *  Dynamic lights: ref_gl relocates a dlit surface into a shared scratch atlas at a
  *  second (dlight_s, dlight_t) and biases its UVs, flushing whenever the scratch
@@ -69,14 +71,6 @@ constexpr int kAtlasColorBytes = kAtlasLuxels * static_cast<int>(sizeof(u16));
 // is more stack than the model loader should be spending.
 static lightstyle_t s_defaultLightStyles[MAX_LIGHTSTYLES];
 
-// Packs a clamped 0-255 triplet into the EE-side colour mirror's RGB565, red in
-// the high bits. This one never reaches the GS - it is not tex::PixelFormat::RGB16
-// (which is 5551 with red *low*, the layout the hardware wants).
-constexpr u16 PackRgb565(int r, int g, int b)
-{
-    return static_cast<u16>(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
-}
-
 // Luxels a surface spans, from its texture-space extents.
 inline int LuxelsWide(const mod::ModelSurface & surf) { return (surf.extents[0] >> 4) + 1; }
 inline int LuxelsHigh(const mod::ModelSurface & surf) { return (surf.extents[1] >> 4) + 1; }
@@ -108,6 +102,12 @@ public:
         return m_atlases[index];
     }
 
+    const u16 * AtlasColors(int index) const
+    {
+        PS2_Assert(index >= 0 && index < m_atlasCount);
+        return m_mirror[index];
+    }
+
     const mod::ModelSurface * AtlasChain(int index) const
     {
         PS2_Assert(index >= 0 && index < m_atlasCount);
@@ -133,16 +133,10 @@ private:
     int  m_atlasCount = 0;
     bool m_building   = false;
 
-    // The atlases. m_alpha is what the GS samples (and what Texture::pixels
-    // points at); m_mirror is the EE-side luxel colour, allocated in step with
-    // it. Both are heap blocks so a map only pays for the atlases it fills.
-    //
-    // TODO (coloured lighting): m_mirror is written by StoreLightmap and read by
-    // nothing yet - it exists so the colour half of each luxel survives, since
-    // the GS blend unit can only modulate by the scalar alpha in m_alpha (see
-    // vu1::DrawFlags::Modulate). Whatever recovers the colour needs an accessor
-    // here; the leading candidate is sampling it per vertex in the gather path
-    // and folding it into the diffuse pass's vertex colour.
+    // The atlases, one luxel split across the pair: m_alpha holds the intensity
+    // the GS samples (and is what Texture::pixels points at), m_mirror the
+    // chroma the diffuse pass samples off the EE, allocated in step with it.
+    // Both are heap blocks, so a map only pays for the atlases it fills.
     tex::Texture m_atlases[kMaxLightmapTextures] = {};
     u8 *         m_alpha[kMaxLightmapTextures]   = {};
     u16 *        m_mirror[kMaxLightmapTextures]  = {};
@@ -413,8 +407,8 @@ void LightmapManager::AddDynamicLights(const mod::ModelSurface & surf,
 }
 
 // Clamps the accumulated luxels and writes them into the surface's block of its
-// atlas: intensity into the Alpha8 texture the GS samples, colour into the
-// EE-side mirror beside it.
+// atlas, split into the two terms the hardware needs them in: the intensity into
+// the Alpha8 texture the GS samples, the chroma into the EE-side mirror beside it.
 void LightmapManager::StoreLightmap(const mod::ModelSurface & surf)
 {
     const int smax = LuxelsWide(surf);
@@ -465,14 +459,23 @@ void LightmapManager::StoreLightmap(const mod::ModelSurface & surf)
             // darkest, the exact inverse of the shadow we want.
             dstAlpha[s] = static_cast<u8>((max < 1) ? 1 : max);
 
-            // TODO (coloured lighting): this stores the luxel's colour as-is,
-            // which carries its intensity a second time - 'max' is already in
-            // dstAlpha, and the lightmap pass multiplies by it. A consumer that
-            // also multiplies by this RGB would square the brightness. Decide
-            // here whether to keep the raw colour and normalise at sample time,
-            // or to store chroma (rgb / max) so the two terms multiply back to
-            // exactly the luxel.
-            dstColor[s] = PackRgb565(r, g, b);
+            // The chroma is what is left once that intensity is divided back
+            // out - rgb rescaled so its brightest channel is full. Storing the
+            // colour as-is would carry the intensity a second time and the
+            // diffuse pass, which multiplies by this, would square it. A luxel
+            // with no colour at all has no chroma to speak of, so it takes
+            // white and lets the (floored) intensity alone darken it.
+            if (max > 0)
+            {
+                const float toFull = 255.0f / static_cast<float>(max);
+                dstColor[s] = PackAtlasColor(static_cast<int>(static_cast<float>(r) * toFull + 0.5f),
+                                             static_cast<int>(static_cast<float>(g) * toFull + 0.5f),
+                                             static_cast<int>(static_cast<float>(b) * toFull + 0.5f));
+            }
+            else
+            {
+                dstColor[s] = PackAtlasColor(255, 255, 255);
+            }
         }
 
         dstAlpha += kLightmapTextureWidth;
@@ -645,6 +648,11 @@ int NumAtlases()
 const tex::Texture & AtlasTexture(const int index)
 {
     return s_manager.AtlasTexture(index);
+}
+
+const u16 * AtlasColors(const int index)
+{
+    return s_manager.AtlasColors(index);
 }
 
 const mod::ModelSurface * AtlasChain(const int index)

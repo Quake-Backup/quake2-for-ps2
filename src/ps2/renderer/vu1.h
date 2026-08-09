@@ -73,7 +73,9 @@ constexpr float kGuardBandNdcLimit = 0.8f;
 // is how the lightmap pass darkens the diffuse pass under it. The GS blend unit
 // multiplies by a scalar alpha and never by a second colour, so this is as close
 // to OpenGL's glBlendFunc(GL_ZERO, GL_SRC_COLOR) as the hardware gets - what it
-// modulates by is the source's *alpha*, not its RGB.
+// modulates by is the source's *alpha*, not its RGB. The colour half of a luxel
+// therefore cannot come through here at all; it reaches the screen through the
+// diffuse pass's vertex colour instead (see lm::AtlasColors).
 //
 // The three are mutually exclusive; passing more than one asserts. Each implies
 // the ABE bit and the depth-write mask.
