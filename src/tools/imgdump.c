@@ -493,11 +493,9 @@ int main(int argc, const char ** argv)
         DumpColormap(palette);
     }
 
-    DoImage("conchars",  4);
-    DoImage("conback",   2);
-    DoImage("help",      2);
-    DoImage("inventory", 2);
-    DoImage("backtile",  2);
+    DoImage("conchars", 4);
+    DoImage("conback",  2);
+    DoImage("backtile", 2);
 
     printf("Done! (%s)\n", g_palettized ? "8-bit palettized" : "RGB");
 }

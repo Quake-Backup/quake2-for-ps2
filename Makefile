@@ -63,9 +63,7 @@ PS2_C_SRC = \
 	ps2/builtin/palette.c             \
 	ps2/builtin/conchars.c            \
 	ps2/builtin/conback.c             \
-	ps2/builtin/backtile.c            \
-	ps2/builtin/inventory.c           \
-	ps2/builtin/help.c
+	ps2/builtin/backtile.c
 
 # Stock Quake II engine / game / server - untouched C, statically linked.
 # The null/* stubs stand in for sound and CD audio until real PS2 backends land.

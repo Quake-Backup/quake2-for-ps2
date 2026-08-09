@@ -513,8 +513,6 @@ void TextureCache::Init()
         { "pics/conchars.pcx",  conchars_data,         conchars_width,  conchars_height,  PixelFormat::Palette8, TexComponents::RGBA },
         { "pics/conback.pcx",   conback_data,          conback_width,   conback_height,   PixelFormat::Palette8, TexComponents::RGB  },
         { "pics/backtile.pcx",  backtile_data,         backtile_width,  backtile_height,  PixelFormat::Palette8, TexComponents::RGB  },
-        { "pics/inventory.pcx", inventory_data,        inventory_width, inventory_height, PixelFormat::Palette8, TexComponents::RGB  },
-        { "pics/help.pcx",      help_data,             help_width,      help_height,      PixelFormat::Palette8, TexComponents::RGB  },
         { "pics/debug0.pcx",    MakeCheckerPattern(0), kCheckerDim,     kCheckerDim,      PixelFormat::RGB16,    TexComponents::RGB  },
 #if PS2_QUAKE_DEBUG // Extra debug textures for the textured cube test:
         { "pics/debug1.pcx",    MakeCheckerPattern(1), kCheckerDim,     kCheckerDim,      PixelFormat::RGB16,    TexComponents::RGB  },

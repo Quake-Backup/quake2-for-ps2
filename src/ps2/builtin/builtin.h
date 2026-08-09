@@ -35,16 +35,6 @@ extern const int backtile_width;
 extern const int backtile_height;
 extern const unsigned char backtile_data[];
 
-/* inventory.pcx: inventory screen frame. Palette8 RGB. */
-extern const int inventory_width;
-extern const int inventory_height;
-extern const unsigned char inventory_data[];
-
-/* help.pcx: help/computer screen frame. Palette8 RGB. */
-extern const int help_width;
-extern const int help_height;
-extern const unsigned char help_data[];
-
 #ifdef __cplusplus
 } // extern "C"
 #endif // __cplusplus
