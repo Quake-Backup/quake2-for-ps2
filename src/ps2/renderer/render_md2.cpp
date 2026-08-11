@@ -28,6 +28,7 @@
 #include "ps2/renderer/render_view.h"
 #include "ps2/renderer/texture.h"
 #include "ps2/renderer/model.h"
+#include "ps2/renderer/clip.h"
 #include "ps2/renderer/vu1.h"
 #include "ps2/math/vec_mat.h"
 
@@ -139,25 +140,6 @@ inline void FlushScratchVULerp(const math::Mat4 & mvp, const tex::Texture & text
 inline math::Mat4 MakeAliasMatrix(const entity_t & entity)
 {
     return MakeEntityMatrix(entity, /*flipPitchAngle=*/true);
-}
-
-// RF_DEPTHHACK: squeeze the entity's whole depth range into the slice
-// nearest the camera, so the view weapon can never poke through a wall it
-// is visually in front of. ref_gl does it with glDepthRange(0, 0.3); here
-// the equivalent is a post-multiply remapping clip z, which the projection
-// maps to NDC +1 at the near plane and -1 at the far one:
-//     z' = kDepthHackScale * z + (1 - kDepthHackScale) * w
-// i.e. NDC z spanning [1 - 2s, 1]. Only rows' z columns change, and the
-// scale rides on w, so it composes after everything else.
-constexpr float kDepthHackScale = 0.15f;
-
-inline void ApplyDepthHack(math::Mat4 & m)
-{
-    for (int row = 0; row < 4; ++row)
-    {
-        m.m[row][2] = (m.m[row][2] * kDepthHackScale) +
-                      (m.m[row][3] * (1.0f - kDepthHackScale));
-    }
 }
 
 // Conservative frustum cull (ref_gl's R_CullAliasModel): the model-space
@@ -466,6 +448,81 @@ const math::Vec3 * LerpVertsEE(const dtrivertx_t * verts, const dtrivertx_t * ol
 }
 
 // ------------------------------------------------------------------------------------------------
+// EE-side clipping (the view weapon)
+// ------------------------------------------------------------------------------------------------
+
+// Ping-pong buffers for the clipper. File-level rather than stack: draws are
+// synchronous, so every triangle reuses them in turn.
+static clip::Scratch s_clipScratch;
+
+// MD2 shades per vertex, so the colour has to survive a cut: it rides through
+// the clipper as unpacked 0..255 floats in ClipVertex::color, which interpolate
+// linearly like everything else there, and pack back on the way out.
+inline math::Vec4 UnpackClipColor(u32 rgba)
+{
+    return { static_cast<float>( rgba        & 0xFF),
+             static_cast<float>((rgba >>  8) & 0xFF),
+             static_cast<float>((rgba >> 16) & 0xFF),
+             static_cast<float>((rgba >> 24) & 0xFF) };
+}
+
+inline u32 PackClipColor(const math::Vec4 & c)
+{
+    const auto channel = [](float f) -> u32
+    {
+        return (f <= 0.0f) ? 0u : (f >= 255.0f) ? 255u : static_cast<u32>(f + 0.5f);
+    };
+    return channel(c.x) | (channel(c.y) << 8) | (channel(c.z) << 16) | (channel(c.w) << 24);
+}
+
+inline void EmitClippedVertex(const clip::ClipVertex & v)
+{
+    vu1::DrawVertex & dst = s_scratchVerts[s_scratchVertCount++];
+    dst.x    = v.pos.x;
+    dst.y    = v.pos.y;
+    dst.z    = v.pos.z;
+    dst.w    = 1.0f;
+    dst.rgba = PackClipColor(v.color);
+    dst.s    = v.st.x;
+    dst.t    = v.st.y;
+    dst.q    = 1.0f;
+}
+
+// Clips one model triangle against the volume the VU judges and appends the
+// survivors to the scratch buffer, flushing it when full. Returns the number of
+// triangles emitted.
+int GatherClippedTriangle(clip::ClipVertex (&corners)[3], const math::Mat4 & mvp,
+                          const tex::Texture & texture, const vu1::DrawFlags flags)
+{
+    const clip::ClipVertex * verts = nullptr;
+    bool wasClipped = false;
+    const int count = clip::ClipTriangle(corners, mvp, s_clipScratch, &verts, &wasClipped);
+
+    if (count == 0)
+    {
+        ++GetDrawStats().trisCulled;
+        return 0;
+    }
+    if (wasClipped)
+    {
+        ++GetDrawStats().trisClipped;
+    }
+
+    // The survivors fan-triangulate.
+    if (s_scratchVertCount + (count - 2) * 3 > kScratchMaxVerts)
+    {
+        FlushScratch(mvp, texture, flags);
+    }
+    for (int v = 1; v < count - 1; ++v)
+    {
+        EmitClippedVertex(verts[0]);
+        EmitClippedVertex(verts[v]);
+        EmitClippedVertex(verts[v + 1]);
+    }
+    return count - 2;
+}
+
+// ------------------------------------------------------------------------------------------------
 // glcmds expansion
 // ------------------------------------------------------------------------------------------------
 
@@ -643,6 +700,7 @@ static const cvar_t * s_lerpModels = nullptr;
 static const cvar_t * s_vuLerp     = nullptr;
 static const cvar_t * s_cullFace   = nullptr;
 static const cvar_t * s_shadows    = nullptr;
+static const cvar_t * s_clipWeapon = nullptr;
 
 } // namespace
 
@@ -652,10 +710,11 @@ static const cvar_t * s_shadows    = nullptr;
 
 void InitEntityRendering()
 {
-    s_lerpModels = Cvar_Get("ps2_md2_lerp_on",  "1", 0);
-    s_vuLerp     = Cvar_Get("ps2_md2_vu_lerp",  "1", 0);
-    s_cullFace   = Cvar_Get("ps2_md2_cullface", "1", 0);
-    s_shadows    = Cvar_Get("ps2_md2_shadows",  "1", 0);
+    s_lerpModels = Cvar_Get("ps2_md2_lerp_on",     "1", 0);
+    s_vuLerp     = Cvar_Get("ps2_md2_vu_lerp",     "1", 0);
+    s_cullFace   = Cvar_Get("ps2_md2_cullface",    "1", 0);
+    s_shadows    = Cvar_Get("ps2_md2_shadows",     "1", 0);
+    s_clipWeapon = Cvar_Get("ps2_md2_clip_weapon", "1", 0);
 
     for (vu1::LerpDrawAttrib & attrib : s_shadowAttribs)
     {
@@ -724,23 +783,40 @@ void DrawAliasMD2Entity(const refdef_t & viewDef, const entity_t & entity, const
     tex::StScaleFor(skin, &stScaleS, &stScaleT);
 
     math::Mat4 mvp = MakeAliasMatrix(entity) * viewProj;
-    if (entity.flags & RF_DEPTHHACK)
-    {
-        ApplyDepthHack(mvp);
-    }
 
-    const bool vuLerp = (s_vuLerp->value != 0.0f) && !(entity.flags & kShellFlags);
+    // The view weapon is clipped here on the EE instead of being left to the
+    // VU's whole-triangle reject. It is the one model the camera sits inside:
+    // parts of it pass behind the eye - the chaingun's spinning barrels most of
+    // all - and dropping those triangles whole punches visible holes in it. No
+    // other alias model needs this, and clipping every monster would not be
+    // worth the EE time. Clipping needs the pose on the EE, so the weapon takes
+    // the scalar lerp path; the VU's back-face cull goes with it, which costs
+    // only some overdraw, since the gun is opaque and the z-buffer sorts it.
+    const bool clipOnEE = (entity.flags & RF_WEAPONMODEL) && (s_clipWeapon->value != 0.0f);
+    const bool vuLerp   = (s_vuLerp->value != 0.0f) && !(entity.flags & kShellFlags) && !clipOnEE;
     const auto faceCull = static_cast<vu1::FaceCull>(static_cast<u32>(s_cullFace->value) % 3u);
 
     // Translucent entities blend over the finished opaque scene (the entity
     // pass draws them last) with alpha already folded into the colour LUT.
-    const auto blendFlags = (entity.flags & RF_TRANSLUCENT)
-                          ? vu1::DrawFlags::Blended
-                          : vu1::DrawFlags::None;
+    //
+    // RF_DEPTHHACK rides along as a draw flag rather than a change to 'mvp':
+    // it is a depth *range*, and the microprogram applies it where OpenGL
+    // does, to the window coordinate after the clip judgement. Remapping clip
+    // z here instead would defeat that judgement for the one entity that most
+    // needs it - see the DrawFlags::DepthHack notes in vu1.h.
+    auto batchFlags = (entity.flags & RF_TRANSLUCENT)
+                    ? vu1::DrawFlags::Blended
+                    : vu1::DrawFlags::None;
+
+    if (entity.flags & RF_DEPTHHACK)
+    {
+        batchFlags = batchFlags | vu1::DrawFlags::DepthHack;
+    }
 
     // Expand the glcmds over the pose. Note MD2 triangles are not near-plane
-    // clipped like the world's: the VU rejects straddlers whole (guard band),
-    // which would only show when the camera is inside a model.
+    // clipped like the world's: the VU rejects straddlers whole (guard band).
+    // The view weapon draws against a much closer near plane than the rest of
+    // the scene (see kZNearWeapon) so it has almost nothing left to straddle.
     int emittedVerts = 0;
     if (vuLerp)
     {
@@ -757,7 +833,7 @@ void DrawAliasMD2Entity(const refdef_t & viewDef, const entity_t & entity, const
         {
             if (s_scratchVertCount == kScratchMaxVerts)
             {
-                FlushScratchVULerp(mvp, skin, lc.frontv, lc.backv, faceCull, blendFlags);
+                FlushScratchVULerp(mvp, skin, lc.frontv, lc.backv, faceCull, batchFlags);
             }
 
             const int i = s_scratchVertCount++;
@@ -771,39 +847,67 @@ void DrawAliasMD2Entity(const refdef_t & viewDef, const entity_t & entity, const
             };
             ++emittedVerts;
         });
-        FlushScratchVULerp(mvp, skin, lc.frontv, lc.backv, faceCull, blendFlags);
+        FlushScratchVULerp(mvp, skin, lc.frontv, lc.backv, faceCull, batchFlags);
     }
     else
     {
         // Shells draw as a flat-coloured inflated silhouette: no skin, and
         // always blended, whether or not the client tagged them translucent.
+        // OR-ed onto the batch flags rather than replacing them so an entity's
+        // depth range survives (Blended is idempotent if it was already set).
         const bool powersuit = (entity.flags & kShellFlags) != 0;
         const auto flags = powersuit
-                         ? (vu1::DrawFlags::Blended | vu1::DrawFlags::Untextured)
-                         : blendFlags;
+                         ? (batchFlags | vu1::DrawFlags::Blended | vu1::DrawFlags::Untextured)
+                         : batchFlags;
 
         const math::Vec3 * const lerpedPositions =
             LerpVertsEE(frame->verts, oldFrame->verts, hdr->num_xyz, lc, powersuit);
 
-        ExpandGLCmds(hdr, [&](float s, float t, s32 index)
+        if (clipOnEE)
         {
-            if (s_scratchVertCount == kScratchMaxVerts)
-            {
-                FlushScratch(mvp, skin, flags); // Capacity is a triangle multiple,
-            }                                   // so this only fires between them.
+            // The expansion hands over one corner at a time; clip and emit
+            // whole triangles as they complete.
+            clip::ClipVertex corners[3];
+            int cornerCount = 0;
 
-            vu1::DrawVertex  & dst = s_scratchVerts[s_scratchVertCount++];
-            const math::Vec3 & pos = lerpedPositions[index];
-            dst.x    = pos.x;
-            dst.y    = pos.y;
-            dst.z    = pos.z;
-            dst.w    = 1.0f;
-            dst.rgba = colorLUT[frame->verts[index].lightnormalindex];
-            dst.s    = powersuit ? 0.0f : (s * stScaleS);
-            dst.t    = powersuit ? 0.0f : (t * stScaleT);
-            dst.q    = 1.0f;
-            ++emittedVerts;
-        });
+            ExpandGLCmds(hdr, [&](float s, float t, s32 index)
+            {
+                clip::ClipVertex & c = corners[cornerCount++];
+                const math::Vec3 & pos = lerpedPositions[index];
+                c.pos   = { pos.x, pos.y, pos.z, 1.0f };
+                c.st    = { powersuit ? 0.0f : (s * stScaleS),
+                            powersuit ? 0.0f : (t * stScaleT), 0.0f, 0.0f };
+                c.color = UnpackClipColor(colorLUT[frame->verts[index].lightnormalindex]);
+
+                if (cornerCount == 3)
+                {
+                    cornerCount = 0;
+                    emittedVerts += GatherClippedTriangle(corners, mvp, skin, flags) * 3;
+                }
+            });
+        }
+        else
+        {
+            ExpandGLCmds(hdr, [&](float s, float t, s32 index)
+            {
+                if (s_scratchVertCount == kScratchMaxVerts)
+                {
+                    FlushScratch(mvp, skin, flags); // Capacity is a triangle multiple,
+                }                                   // so this only fires between them.
+
+                vu1::DrawVertex  & dst = s_scratchVerts[s_scratchVertCount++];
+                const math::Vec3 & pos = lerpedPositions[index];
+                dst.x    = pos.x;
+                dst.y    = pos.y;
+                dst.z    = pos.z;
+                dst.w    = 1.0f;
+                dst.rgba = colorLUT[frame->verts[index].lightnormalindex];
+                dst.s    = powersuit ? 0.0f : (s * stScaleS);
+                dst.t    = powersuit ? 0.0f : (t * stScaleT);
+                dst.q    = 1.0f;
+                ++emittedVerts;
+            });
+        }
         FlushScratch(mvp, skin, flags);
     }
 

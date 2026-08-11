@@ -79,6 +79,17 @@ constexpr float kGuardBandNdcLimit = 0.8f;
 //
 // The three are mutually exclusive; passing more than one asserts. Each implies
 // the ABE bit and the depth-write mask.
+//
+// DepthHack is orthogonal to all of the above and touches no GS register: it
+// compresses the batch's depth into the slice of the z-buffer nearest the
+// camera, so the view weapon can never poke through a wall it is visually in
+// front of (Quake 2's RF_DEPTHHACK, ref_gl's glDepthRange(0, 0.3)). It applies
+// where OpenGL's depth range does - to the window coordinate, *after* the clip
+// judgement - by scaling the microprogram's NDC-to-GS z conversion. Folding an
+// equivalent remap into the caller's projection instead would run it before the
+// judgement, which is not the same thing: clipw tests |z| against |w|, so a
+// remapped z stops being rejected once w goes negative and the geometry behind
+// the camera reaches the GS mirrored through the origin.
 enum class DrawFlags : u32
 {
     None       = 0,
@@ -86,6 +97,7 @@ enum class DrawFlags : u32
     Untextured = 1 << 1,
     Additive   = 1 << 2,
     Modulate   = 1 << 3,
+    DepthHack  = 1 << 4,
 };
 
 constexpr DrawFlags operator|(DrawFlags a, DrawFlags b)

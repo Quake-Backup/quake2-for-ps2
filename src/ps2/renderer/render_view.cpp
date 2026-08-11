@@ -25,6 +25,7 @@
 #include "ps2/renderer/texture.h"
 #include "ps2/renderer/model.h"
 #include "ps2/renderer/lightmap.h"
+#include "ps2/renderer/clip.h"
 #include "ps2/renderer/vu1.h"
 #include "ps2/renderer/gs.h"
 #include "ps2/math/vec_mat.h"
@@ -43,6 +44,16 @@ namespace {
 // Depth range for the world projection (ref_gl's values).
 constexpr float kZNear = 4.0f;
 constexpr float kZFar  = 4096.0f;
+
+// The view weapon gets its own, much closer near plane. Its models sit at the
+// view origin with the stock and hands reaching back past it, so at kZNear a
+// good part of the gun straddles the near plane - and the VU rejects straddling
+// triangles whole rather than cutting them, which would punch holes in it. The
+// weapon's depth is remapped into a fixed slice of the z-buffer regardless of
+// the projection (vu1::DrawFlags::DepthHack), so a near plane this close costs
+// it no precision it can use: the gun still spans thousands of z values inside
+// its slice.
+constexpr float kZNearWeapon = 0.25f;
 
 // Vertex colour for the not-yet-lit world: GS modulate 128 = texels unchanged.
 constexpr u32 kFullBright = vu1::PackColorRGBA(128, 128, 128, 0x80);
@@ -97,6 +108,9 @@ static vec3_t s_upVec      = {};
 
 // World-to-clip transform for the frame (world geometry draws in world space).
 static math::Mat4 s_viewProjMatrix = {};
+
+// The same transform with the view weapon's closer near plane (kZNearWeapon).
+static math::Mat4 s_weaponViewProjMatrix = {};
 
 // View frustum side planes (left, right, bottom, top) for bounding-box culling.
 static cplane_t s_frustum[4] = {};
@@ -268,14 +282,19 @@ void SetupFrame(const refdef_t & viewDef)
     const math::Vec3 target = { eye.x + s_forwardVec[0], eye.y + s_forwardVec[1], eye.z + s_forwardVec[2] };
     const math::Vec3 up     = { s_upVec[0], s_upVec[1], s_upVec[2] };
 
-    const math::Mat4 view = math::LookAt(eye, target, up);
-    const math::Mat4 proj = math::PerspectiveProjection(
-        math::DegToRad(viewDef.fov_y),
-        static_cast<float>(viewDef.width) / static_cast<float>(viewDef.height),
-        static_cast<float>(gs::Width()), static_cast<float>(gs::Height()),
-        kZNear, kZFar);
+    const float fovY    = math::DegToRad(viewDef.fov_y);
+    const float aspect  = static_cast<float>(viewDef.width) / static_cast<float>(viewDef.height);
+    const float screenW = static_cast<float>(gs::Width());
+    const float screenH = static_cast<float>(gs::Height());
 
+    const math::Mat4 view = math::LookAt(eye, target, up);
+    const math::Mat4 proj = math::PerspectiveProjection(fovY, aspect, screenW, screenH, kZNear, kZFar);
     s_viewProjMatrix = view * proj;
+
+    // The view weapon's variant differs only in the near plane, so it shares
+    // the camera and every screen mapping; nothing else may use it.
+    const math::Mat4 weaponProj = math::PerspectiveProjection(fovY, aspect, screenW, screenH, kZNearWeapon, kZFar);
+    s_weaponViewProjMatrix = view * weaponProj;
 
     SetUpFrustum(viewDef);
 }
@@ -649,84 +668,21 @@ inline void FlushScratch(const tex::Texture & texture, const SurfaceDrawState & 
 }
 
 // ------------------------------------------------------------------------------------------------
-// Triangle clipping against the VU clip volume
+// Triangle gathering through the clipper
 //
-// The VU microprogram does not clip: a triangle with any vertex outside its
-// clip volume is rejected whole (ADC bit), so world triangles must be
-// pre-clipped here on the EE against all six planes the VU judges - near and
-// far (z is judged exactly), and the four guard-band side planes. The sides
-// matter just as much as near: a floor polygon clipped at the near plane
-// right under the camera lands at tiny w and enormous |x/w|, far outside any
-// band the GS 12.4 coordinates could hold. Clipping runs in clip space - a
-// vertex is inside while w-z >= 0 (near; also excludes everything behind the
-// camera), w+z >= 0 (far), and G*w +/- x/y >= 0 (sides, G = the VU guard-band
-// limit). Everything a vertex carries - world position, UVs, and the six
-// distances themselves - is linear under a plane cut, so a split interpolates
-// the whole ClipVertex as five quadword lerps on VU0, no scalar float math.
-// Whole-triangle-inside is the common case and skips all of it.
+// The VU rejects a straddling triangle whole rather than cutting it, so world
+// geometry is pre-clipped on the EE against the six planes it judges. The
+// clipper itself lives in clip.h, shared with the alias model path; what
+// follows is this file's use of it. ClipVertex::st carries the vertex alpha in
+// .z under SurfaceDrawState::vertexAlpha, and ClipVertex::color the luxel
+// chroma as a 0..1 tint under SurfaceDrawState::lightmapColors.
 // ------------------------------------------------------------------------------------------------
 
-constexpr int kNumClipPlanes = 6;
+using clip::ClipVertex;
 
-// Clip a hair early so the VU's judgement never flags a vertex this clipper
-// just placed on the boundary (clip-space units, i.e. ~world units here).
-constexpr float kClipEpsilon = 0.01f;
-
-// Signed distances to the clip planes; >= 0 is inside. Held as two whole quadwords
-// (six planes, two spare lanes) so the whole set interpolates with two vector lerps
-// while the per-plane tests still read it as a plain float array.
-union ClipDists
-{
-    math::Vec4 q[2];
-    float f[8];
-};
-
-// Everything a clipped vertex carries, laid out as five quadwords so a plane cut
-// interpolates it with five aligned vector lerps and no scalar float math at all.
-struct alignas(16) ClipVertex
-{
-    math::Vec4 pos; // world position, w = 1
-    math::Vec4 st;  // diffuse texture coords in xy; .z is the vertex alpha under
-                    // SurfaceDrawState::vertexAlpha (ignored otherwise), .w unused
-
-    // Per-vertex tint the batch colour is scaled by under
-    // SurfaceDrawState::lightmapColors - the luxel chroma, 0..1 per channel,
-    // .w unused. White (untinted) unless the gather fills it in, so the paths
-    // that never sample a lightmap can leave it alone; it costs them one
-    // quadword store and rides through the lerps below either way.
-    math::Vec4 color = { 1.0f, 1.0f, 1.0f, 1.0f };
-
-    ClipDists  d;
-};
-static_assert(sizeof(ClipVertex) == 80, "ClipVertex must be exactly five quadwords");
-
-// Sutherland-Hodgman pass of a convex polygon against one plane. 'out' must
-// hold inCount + 1 vertexes. Returns the clipped vertex count.
-int ClipAgainstPlane(const ClipVertex * in, const int inCount, ClipVertex * out, const int plane)
-{
-    int outCount = 0;
-    for (int i = 0; i < inCount; ++i)
-    {
-        const ClipVertex & a = in[i];
-        const ClipVertex & b = in[(i + 1 == inCount) ? 0 : i + 1];
-
-        if (a.d.f[plane] >= 0.0f)
-        {
-            out[outCount++] = a;
-        }
-        if ((a.d.f[plane] >= 0.0f) != (b.d.f[plane] >= 0.0f)) // Edge crosses the plane.
-        {
-            const float t = a.d.f[plane] / (a.d.f[plane] - b.d.f[plane]);
-            ClipVertex & o = out[outCount++];
-            math::LerpTo(o.pos,    a.pos,    b.pos,    t);
-            math::LerpTo(o.st,     a.st,     b.st,     t);
-            math::LerpTo(o.color,  a.color,  b.color,  t);
-            math::LerpTo(o.d.q[0], a.d.q[0], b.d.q[0], t);
-            math::LerpTo(o.d.q[1], a.d.q[1], b.d.q[1], t);
-        }
-    }
-    return outCount;
-}
+// Ping-pong buffers for the clipper. File-level rather than stack: draws are
+// synchronous, so every triangle reuses them in turn.
+static clip::Scratch s_clipScratch;
 
 // Swaps the batch colour's alpha for this vertex's own, clamped onto the GS's
 // 0..0x80 = 0..1.0 alpha scale.
@@ -775,26 +731,9 @@ inline void EmitScratchVertex(const ClipVertex & v, const SurfaceDrawState & sta
     dst.q    = 1.0f;
 }
 
-// Fills in a corner's six clip-plane distances from its position. The vertex
-// draws untransformed and the VU applies 'mvp', so the judgement has to happen
-// in that same clip space.
-inline void SetClipDists(ClipVertex & c, const math::Mat4 & mvp)
-{
-    const math::Vec4 clip = math::Transform(c.pos, mvp);
-    const float gw = vu1::kGuardBandNdcLimit * clip.w;
-    c.d.f[0] = (clip.w - clip.z) - kClipEpsilon; // near (and behind-camera)
-    c.d.f[1] = (clip.w + clip.z) - kClipEpsilon; // far
-    c.d.f[2] = (gw - clip.x) - kClipEpsilon;     // guard band sides
-    c.d.f[3] = (gw + clip.x) - kClipEpsilon;
-    c.d.f[4] = (gw - clip.y) - kClipEpsilon;
-    c.d.f[5] = (gw + clip.y) - kClipEpsilon;
-    c.d.f[6] = 0.0f; // Spare lanes: never read as planes, but they ride
-    c.d.f[7] = 0.0f; // along through the lerps, so keep them finite.
-}
-
 // Clips one triangle against the VU clip volume and appends the survivors to
 // the scratch buffer, flushing it when full. The corners arrive with their
-// position and UVs set; their clip distances are computed here.
+// position and UVs set; their clip distances are computed by the clipper.
 void GatherTriangle(ClipVertex (&corners)[3],
                     const tex::Texture & texture,
                     const SurfaceDrawState & state)
@@ -809,80 +748,31 @@ void GatherTriangle(ClipVertex (&corners)[3],
         return;
     }
 
-    int insidePerPlane[kNumClipPlanes] = {};
-    for (ClipVertex & c : corners)
-    {
-        SetClipDists(c, *state.mvp);
-        for (int p = 0; p < kNumClipPlanes; ++p)
-        {
-            insidePerPlane[p] += (c.d.f[p] >= 0.0f);
-        }
-    }
+    const ClipVertex * verts = nullptr;
+    bool wasClipped = false;
+    const int count = clip::ClipTriangle(corners, *state.mvp, s_clipScratch, &verts, &wasClipped);
 
-    int insideTotal = 0;
-    bool outsideAny = false;
-    for (int p = 0; p < kNumClipPlanes; ++p)
-    {
-        insideTotal += insidePerPlane[p];
-        outsideAny  |= (insidePerPlane[p] == 0);
-    }
-
-    if (outsideAny)
+    if (count == 0)
     {
         ++s_drawStats.trisCulled;
-        return; // All three corners outside one plane: entirely out.
-    }
-
-    if (insideTotal == 3 * kNumClipPlanes)
-    {
-        // Whole triangle inside: the common case, no clipping.
-        ++s_drawStats.trisDrawn;
-        if (s_scratchVertCount + 3 > kScratchMaxVerts)
-        {
-            FlushScratch(texture, state);
-        }
-        for (const ClipVertex & c : corners)
-        {
-            EmitScratchVertex(c, state);
-        }
         return;
     }
 
-    // Straddling triangle: clip against every plane in turn. Each pass
-    // can add one vertex (3 -> at most 9); the survivors fan-triangulate.
-    ++s_drawStats.trisClipped;
-    ClipVertex bufferA[3 + kNumClipPlanes];
-    ClipVertex bufferB[3 + kNumClipPlanes];
-
-    const ClipVertex * in = corners;
-    ClipVertex * out = bufferA;
-    int count = 3;
-    for (int p = 0; p < kNumClipPlanes && count >= 3; ++p)
+    if (wasClipped)
     {
-        if (insidePerPlane[p] == 3)
-        {
-            continue; // All corners inside this plane: every clipped
-                      // vertex is a convex mix of them, so none can
-                      // cross it either.
-        }
-        count = ClipAgainstPlane(in, count, out, p);
-        in  = out;
-        out = (out == bufferA) ? bufferB : bufferA;
-    }
-    if (count < 3)
-    {
-        return;
+        ++s_drawStats.trisClipped;
     }
 
+    // The survivors fan-triangulate.
     if (s_scratchVertCount + (count - 2) * 3 > kScratchMaxVerts)
     {
         FlushScratch(texture, state);
     }
     for (int v = 1; v < count - 1; ++v)
     {
-        EmitScratchVertex(in[0],     state);
-        EmitScratchVertex(in[v],     state);
-        EmitScratchVertex(in[v + 1], state);
+        EmitScratchVertex(verts[0],     state);
+        EmitScratchVertex(verts[v],     state);
+        EmitScratchVertex(verts[v + 1], state);
     }
     s_drawStats.trisDrawn += count - 2;
 }
@@ -2278,7 +2168,9 @@ void RenderEntities(const refdef_t & viewDef)
         switch (model->type)
         {
         case mod::ModelType::AliasMD2:
-            DrawAliasMD2Entity(viewDef, entity, s_viewProjMatrix);
+            DrawAliasMD2Entity(viewDef, entity, (entity.flags & RF_WEAPONMODEL)
+                                              ? s_weaponViewProjMatrix
+                                              : s_viewProjMatrix);
             break;
 
         case mod::ModelType::Brush:

@@ -117,6 +117,27 @@ constexpr int kChainTailQwords  = 4;
 // 0xFFFF/32 maps z/w [-1 (far), +1 (near)] onto [0, 0xFFFF] in the 16-bit z-buffer.
 constexpr float kGsDepthScale = static_cast<float>(0xFFFF) / 32.0f;
 
+// DrawFlags::DepthHack: the fraction of the z-buffer a hacked batch keeps, up
+// against the near end. ref_gl's glDepthRange(0, 0.3) over the same inverted
+// range this projection produces.
+constexpr float kDepthHackScale = 0.15f;
+
+// The GS z conversion for a batch, as the (offset, scale) pair the microprogram
+// applies to NDC z. The unhacked pair is the mapping described on kGsDepthScale
+// above; a hacked one squeezes NDC z into [1 - 2s, 1] before it, i.e.
+//
+//     Z = 16 * kGsDepthScale * (1 + (s * ndcZ + (1 - s)))
+//       = 16 * (kGsDepthScale * (2 - s) + ndcZ * kGsDepthScale * s)
+//
+// leaving the nearest s of the z-buffer to the batch and costing the
+// microprogram nothing - it multiplies and adds these either way.
+inline void DepthRangeFor(DrawFlags flags, float * outScale, float * outOffset)
+{
+    const float s = HasDrawFlag(flags, DrawFlags::DepthHack) ? kDepthHackScale : 1.0f;
+    *outScale  = kGsDepthScale * s;
+    *outOffset = kGsDepthScale * (2.0f - s);
+}
+
 // Per-vertex GIF registers the microprogram outputs. RGBAQ goes through an
 // A+D qword because the native RGBAQ layout is the vertex's packed color u32
 // with Q in the word above - the VU raw-copies the color instead of spreading
@@ -357,13 +378,18 @@ void SendChainAndWait(VifPacket & pkt)
 
 // Rebuilds s_constants for a draw and opens the chain with its unpack to the
 // fixed low VU addresses (shared by both draw paths).
-void BeginDrawChain(VifPacket & pkt, const math::Mat4 & mvp)
+void BeginDrawChain(VifPacket & pkt, const math::Mat4 & mvp, DrawFlags flags)
 {
+    // Every chunk of a draw shares one flags value, so the batch's depth range
+    // is a property of the whole chain and rides with the other constants.
+    float depthScale, depthOffset;
+    DepthRangeFor(flags, &depthScale, &depthOffset);
+
     s_constants.mvp       = mvp;
-    s_constants.gsScale   = { 2048.0f, 2048.0f, kGsDepthScale, 0.0f };
+    s_constants.gsScale   = { 2048.0f, 2048.0f, depthScale, 0.0f };
     s_constants.gsOffset  = { 2048.0f + static_cast<float>(gs::Width())  * 0.5f,
                               2048.0f + static_cast<float>(gs::Height()) * 0.5f,
-                              kGsDepthScale, 0.0f };
+                              depthOffset, 0.0f };
     s_constants.clipScale = { kGuardBandScale, kGuardBandScale, 1.0f, 0.0f };
 
     pkt.Reset();
@@ -426,7 +452,7 @@ void DrawTriangles(const math::Mat4 & mvp, const tex::Texture & texture,
     const int ctx = gs::CurrentContext();
 
     VifPacket & pkt = s_drawPacket;
-    BeginDrawChain(pkt, mvp);
+    BeginDrawChain(pkt, mvp, flags);
 
     // One chunk per VU run; the double buffer overlaps each chunk's unpack
     // with the previous chunk's transform.
@@ -438,7 +464,7 @@ void DrawTriangles(const math::Mat4 & mvp, const tex::Texture & texture,
         if (pkt.QwordCount() + kChunkChainQwords + kChainTailQwords > kDrawPacketQwords)
         {
             SendChainAndWait(pkt);
-            BeginDrawChain(pkt, mvp);
+            BeginDrawChain(pkt, mvp, flags);
         }
 
         const int remaining  = vertCount - firstVert;
@@ -467,7 +493,7 @@ void DrawLerpedTriangles(const math::Mat4 & mvp, const tex::Texture & texture,
     const int ctx = gs::CurrentContext();
 
     VifPacket & pkt = s_drawPacket;
-    BeginDrawChain(pkt, mvp);
+    BeginDrawChain(pkt, mvp, flags);
 
     // Chunking as in DrawTriangles. Full chunks are even, so every chunk's
     // slice of the 8-byte position stream starts 16-byte aligned; only a
@@ -477,7 +503,7 @@ void DrawLerpedTriangles(const math::Mat4 & mvp, const tex::Texture & texture,
         if (pkt.QwordCount() + kLerpChunkChainQwords + kChainTailQwords > kDrawPacketQwords)
         {
             SendChainAndWait(pkt);
-            BeginDrawChain(pkt, mvp);
+            BeginDrawChain(pkt, mvp, flags);
         }
 
         const int remaining  = vertCount - firstVert;
