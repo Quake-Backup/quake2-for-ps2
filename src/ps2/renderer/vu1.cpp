@@ -180,6 +180,17 @@ static u32 s_texturedTrisProgAddr = 0;
 // Helper functions
 // ------------------------------------------------------------------------------------------------
 
+// PRIM Register Bits:
+//   PRI  - Primitive type
+//   IIP  - Shading method (0=flat, 1=gouraud)
+//   TME  - Texture mapping (0=off, 1=on)
+//   FGE  - Fog (0=off, 1=on)
+//   ABE  - Alpha Blending (0=off, 1=on)
+//   AA1  - Anti-aliasing (0=off,1=on)
+//   FST  - Texture coordinate specification (0=use ST/RGBAQ register, 1=use UV register) (UV means no perspective correction, good for 2D)
+//   CTXT - Drawing context (0=1, 1=2)
+//   FIX  - ?? Fragment value control (use 0)
+
 // TEX0/TEX1 register qwords for the batch's texture bind, sent A+D over PATH1.
 // Built here rather than with the packet2_utils helpers because those hardcode
 // GS context 0 and this renderer alternates contexts per frame.
