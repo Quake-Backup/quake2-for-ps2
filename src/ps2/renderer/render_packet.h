@@ -34,6 +34,7 @@ public:
     // the heap must already be up.
     void Init(int maxQwords)
     {
+        // TODO: Can we also use packet2 lib (-lpacket2) here and get rid of old packet lib (-lpacket) dependency?
         PS2_AssertMsg(m_packet == nullptr, "RenderPacket::Init called twice!");
         m_packet = packet_init(maxQwords, PACKET_NORMAL);
         PS2_AssertMsg(m_packet != nullptr, "packet_init failed!");
