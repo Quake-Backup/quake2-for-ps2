@@ -212,7 +212,7 @@ void Init()
     // Latched: the framebuffer format fixes the whole VRAM layout, so it is read
     // once here and a change only takes effect on the next run.
     s_fb16Bit       = Cvar_Get("ps2_fb_16bit",  "1", CVAR_ARCHIVE);
-    s_enableDither  = Cvar_Get("ps2_fb_dither", "1", CVAR_ARCHIVE);
+    s_enableDither  = Cvar_Get("ps2_fb_dither", "0", CVAR_ARCHIVE); // Skybox looks significantly worse with dithering on.
     const bool fb16 = (s_fb16Bit->value != 0.0f);
 
     // Two framebuffers. 16-bit halves them - 1120 KB each down to 560 KB - which

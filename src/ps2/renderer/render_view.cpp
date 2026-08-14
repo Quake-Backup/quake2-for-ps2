@@ -9,7 +9,8 @@
  *  gathers each chain's triangles into a scratch buffer and submits them through
  *  vu1::DrawTriangles - one synchronous batch per texture. Translucent surfaces
  *  are routed aside and drawn back-to-front at the end of the frame by
- *  RenderAlphaSurfaces; sky still awaits the skybox milestone.
+ *  RenderAlphaSurfaces, and sky surfaces aside to render_sky.cpp, which draws
+ *  the skybox behind them once the opaque world is down.
  *
  *  Camera mapping: Quake is Z-up with AngleVectors giving forward/right/up; those
  *  feed math::LookAt directly (its right = cross(up, -forward) lands on Quake's
@@ -22,6 +23,7 @@
 #include "ps2/common.h"
 #include "ps2/renderer/render_view.h"
 #include "ps2/renderer/render_md2.h"
+#include "ps2/renderer/render_sky.h"
 #include "ps2/renderer/texture.h"
 #include "ps2/renderer/model.h"
 #include "ps2/renderer/lightmap.h"
@@ -73,6 +75,7 @@ static const cvar_t * s_dynamicLightmaps  = nullptr;
 static const cvar_t * s_lightmaps         = nullptr;
 static const cvar_t * s_lightmapOnly      = nullptr;
 static const cvar_t * s_lightmapColor     = nullptr;
+static const cvar_t * s_polyblend         = nullptr;
 
 // Not ours to read: SetLightLevel writes the sampled light level back into it
 // every frame for the game code (hence non-const). Registered by the client
@@ -579,7 +582,9 @@ void RecursiveWorldNode(const refdef_t & viewDef, const mod::ModelInstance & wor
         const int texFlags = surf->texInfo->flags;
         if (texFlags & SURF_SKY)
         {
-            // TODO: Sky surfaces feed the skybox bounds (skybox milestone).
+            // Never drawn: a sky surface is a hole, and all it contributes is
+            // which part of the skybox the player can see through it.
+            sky::AddSurface(*surf, viewDef.vieworg);
             continue;
         }
 
@@ -1108,6 +1113,52 @@ void SetLightLevel(const refdef_t & viewDef)
 }
 
 // ------------------------------------------------------------------------------------------------
+// Full screen colour blend (ref_gl's R_Flash / R_PolyBlend)
+// ------------------------------------------------------------------------------------------------
+
+// Scales a 0..1 blend channel onto 0..255, clamped: refdef_t::blend comes
+// straight off the wire (cl_ents.c) or out of cl_testblend, and nothing
+// upstream promises the range a cast would need.
+inline u8 BlendChannelToByte(const float channel)
+{
+    const float scaled = channel * 255.0f;
+    return (scaled >= 255.0f) ? 255u
+         : (scaled <= 0.0f)   ? 0u
+                              : static_cast<u8>(scaled);
+}
+
+// The damage/powerup/underwater tint the game code accumulates in
+// refdef_t::blend (SV_CalcBlend in p_view.c), as one blended rectangle over
+// the finished 3D scene.
+//
+// Fills the whole framebuffer rather than the refdef's view rectangle, which
+// is where ref_gl's viewport put it: the 3D path here sets no scissor, so at
+// scr_viewsize < 100 the scene has already been drawn over the border that
+// SCR_TileClear laid down, and tinting only the rectangle would leave that
+// overdrawn border untinted.
+//
+// This opens the deferred 2D batch, which is what puts it under the HUD: every
+// 2D primitive the client draws after re.RenderFrame returns appends to the
+// same batch, and nothing flushes it until gs::EndFrame.
+void RenderBlendedOverlay(const refdef_t & viewDef)
+{
+    if (s_polyblend->value == 0.0f)
+    {
+        return;
+    }
+    if (viewDef.blend[3] <= 0.0f)
+    {
+        return; // Fully transparent: nothing to tint.
+    }
+
+    gs::FillRect(0, 0, gs::Width(), gs::Height(),
+                 BlendChannelToByte(viewDef.blend[0]),
+                 BlendChannelToByte(viewDef.blend[1]),
+                 BlendChannelToByte(viewDef.blend[2]),
+                 BlendChannelToByte(viewDef.blend[3]));
+}
+
+// ------------------------------------------------------------------------------------------------
 // Translucent surface pass
 // ------------------------------------------------------------------------------------------------
 
@@ -1408,6 +1459,8 @@ void RenderWorldModel(const refdef_t & viewDef)
     const mod::ModelInstance * const world = mod::GetWorldModel();
     PS2_AssertMsg(world != nullptr, "RenderFrame without a world model!");
 
+    sky::ClearBounds();
+
     PushDLights(viewDef, *world);
     SetUpViewClusters(viewDef, *world);
     MarkLeaves(*world);
@@ -1419,6 +1472,11 @@ void RenderWorldModel(const refdef_t & viewDef)
     const SurfaceDrawState state = WorldSurfaceDrawState();
     DrawTextureChains(state);
     DrawLightmapChains(state);
+
+    // Last of the world, where ref_gl's R_DrawWorld puts it: the opaque pass
+    // above has filled the depth buffer, so the sky only costs fill where it
+    // is actually visible through it.
+    sky::DrawSkyBox(viewDef, s_viewProjMatrix);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -2190,7 +2248,7 @@ void RenderEntities(const refdef_t & viewDef)
 // Public API
 // ------------------------------------------------------------------------------------------------
 
-void InitViewRendering()
+void Init()
 {
     s_backFaceCull      = Cvar_Get("ps2_backface_cull",       "0", 0); // NOTE: Off by default. BSP already culls backfacing surfaces.
     s_skipWorld         = Cvar_Get("ps2_skip_world",          "0", 0);
@@ -2206,6 +2264,7 @@ void InitViewRendering()
     s_lightmaps         = Cvar_Get("ps2_lightmaps",           "1", 0); // Debug: 0 drops the lightmap pass, leaving the world fullbright.
     s_lightmapOnly      = Cvar_Get("ps2_lightmap_only",       "0", 0); // Debug: 1 drops the diffuse textures, showing the lighting alone.
     s_lightmapColor     = Cvar_Get("ps2_lightmap_color",      "1", 0); // Debug: 0 drops the per-vertex luxel chroma, leaving lighting monochrome.
+    s_polyblend         = Cvar_Get("ps2_polyblend",           "1", 0); // ref_gl's gl_polyblend: the full screen damage/powerup/underwater tint.
 
     // Already registered by the client; this just resolves the same object.
     s_lightLevel = Cvar_Get("r_lightlevel", "0", 0);
@@ -2216,6 +2275,9 @@ void InitViewRendering()
     {
         s_turbSin[i] = kTurbSinAmplitude * math::Sinf(static_cast<float>(i) * kRadiansPerStep);
     }
+
+    sky::InitSkyRendering();
+    view::InitEntityRendering();
 }
 
 void BeginRegistration()
@@ -2326,6 +2388,7 @@ void RenderFrame(const refdef_t & viewDef)
 
     SetupFrame(viewDef);
 
+    // Opaque world surfaces and skybox, followed by opaque and translucent entities.
     RenderWorldModel(viewDef);
     RenderEntities</*isTranslucentPass=*/false>(viewDef);
     RenderEntities</*isTranslucentPass=*/true>(viewDef);
@@ -2347,6 +2410,10 @@ void RenderFrame(const refdef_t & viewDef)
     // Nothing to draw: hands the light at the camera back to the game code.
     // Where ref_gl's R_RenderFrame calls R_SetLightLevel.
     SetLightLevel(viewDef);
+
+    // Last, over the finished scene: ref_gl's R_Flash/R_PolyBlend.
+    // (powerups/damange fullscreen blended polygon).
+    RenderBlendedOverlay(viewDef);
 }
 
 } // namespace ps2::view

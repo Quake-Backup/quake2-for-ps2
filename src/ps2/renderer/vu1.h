@@ -90,14 +90,23 @@ constexpr float kGuardBandNdcLimit = 0.8f;
 // judgement, which is not the same thing: clipw tests |z| against |w|, so a
 // remapped z stops being rejected once w goes negative and the geometry behind
 // the camera reaches the GS mirrored through the origin.
+//
+// NoDepthWrite is likewise orthogonal: it masks the batch's depth writes on
+// their own, without the blend equation and ABE bit the three modes above drag
+// along with theirs. The z-test still reads, so the batch sorts against what is
+// already in the buffer but leaves nothing behind for later ones to sort
+// against - what an opaque primitive standing in for infinity wants. The
+// skybox is the caller: it draws at a finite 2300 units so the world can
+// occlude it, and must not occlude anything drawn after it out there in return.
 enum class DrawFlags : u32
 {
-    None       = 0,
-    Blended    = 1 << 0,
-    Untextured = 1 << 1,
-    Additive   = 1 << 2,
-    Modulate   = 1 << 3,
-    DepthHack  = 1 << 4,
+    None         = 0,
+    Blended      = 1 << 0,
+    Untextured   = 1 << 1,
+    Additive     = 1 << 2,
+    Modulate     = 1 << 3,
+    DepthHack    = 1 << 4,
+    NoDepthWrite = 1 << 5,
 };
 
 constexpr DrawFlags operator|(DrawFlags a, DrawFlags b)

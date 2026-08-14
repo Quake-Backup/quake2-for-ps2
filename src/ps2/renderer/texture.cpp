@@ -133,6 +133,54 @@ bool HasTransparentTexels(const u8 * pic8, int texelCount)
     return false;
 }
 
+// Set by tex::SetSkyDownsample(); consumed by LoadFromFile for Sky images.
+static bool s_skyDownsample = false;
+
+// Halves an 8-bit indexed image in both dimensions by point sampling, into a
+// fresh allocation - a quarter of the VRAM for a sky face.
+//
+// Point sampling, not averaging: these are palette indices, and the mean of
+// two indices is an unrelated colour. Averaging would have to go through the
+// palette and back, and coming back needs an inverse-palette lookup this
+// renderer has no table for. ref_gl's gl_skymip took the same shortcut by
+// leaning on GL_MipMap, which averages the *unpalettized* image; here the
+// image never leaves index space, so dropping every other row and column is
+// what is left. On a sky - low frequency by nature - it is hard to tell apart.
+//
+// Frees 'pic8' and returns the replacement, or leaves it alone and returns it
+// unchanged when the image is too small to halve.
+u8 * DownsampleIndexed2x(u8 * pic8, int * width, int * height)
+{
+    const int srcW = *width;
+    const int srcH = *height;
+    if (srcW < 2 || srcH < 2)
+    {
+        return pic8;
+    }
+
+    const int dstW = srcW / 2;
+    const int dstH = srcH / 2;
+
+    u8 * const scaled = static_cast<u8 *>(
+        PS2_MemAllocAligned(16, static_cast<size_t>(dstW * dstH), MEMTAG_TEXIMAGE));
+
+    for (int y = 0; y < dstH; ++y)
+    {
+        const u8 * const srcRow = pic8   + (y * 2 * srcW);
+        u8 * const       dstRow = scaled + (y * dstW);
+        for (int x = 0; x < dstW; ++x)
+        {
+            dstRow[x] = srcRow[x * 2];
+        }
+    }
+
+    PS2_MemFree(pic8, static_cast<size_t>(srcW * srcH), MEMTAG_TEXIMAGE);
+
+    *width  = dstW;
+    *height = dstH;
+    return scaled;
+}
+
 // Checkerboards for the DebugTexture() variants, RGB16. Variant 0 (pink) is
 // the classic missing-image stand-in; the others give test scenes several
 // distinct textures to exercise VRAM streaming.
@@ -350,9 +398,24 @@ const Texture * TextureCache::LoadFromFile(const char * fullname, const ImageTyp
             return nullptr;
         }
 
-        format     = PixelFormat::Palette8;
-        components = HasTransparentTexels(pic8, width * height) ? TexComponents::RGBA : TexComponents::RGB;
-        pixels     = pic8;
+        if (type == ImageType::Sky && s_skyDownsample)
+        {
+            pic8 = DownsampleIndexed2x(pic8, &width, &height);
+        }
+
+        format = PixelFormat::Palette8;
+        pixels = pic8;
+
+        // Sky faces always sample as RGB, whatever they contain. The 3D path's
+        // alpha test cuts texels whose alpha is zero (vu1.cpp's MakeTestData),
+        // and palette entry 255 is exactly that - so a sky face that happened
+        // to use index 255 would be punched through to the clear colour
+        // instead of drawing. No stock env/ face does, but ref_gl's sky upload
+        // path skips its transparency handling for the same reason, and the
+        // sky is the one texture with nothing behind it to show through to.
+        components = (type != ImageType::Sky && HasTransparentTexels(pic8, width * height))
+                   ? TexComponents::RGBA
+                   : TexComponents::RGB;
 
         // Small HUD/menu images go into a shared scrap rather than each holding
         // a GS page of their own. Only Pics: world textures and sprites tile or
@@ -639,6 +702,11 @@ void EndRegistration()
 const Texture * Find(const char * name, const ImageType type)
 {
     return s_cache.Find(name, type);
+}
+
+void SetSkyDownsample(const bool enable)
+{
+    s_skyDownsample = enable;
 }
 
 void TouchTexture(const Texture & texture)

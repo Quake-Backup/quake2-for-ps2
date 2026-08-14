@@ -20,6 +20,7 @@
 #include "ps2/renderer/cinematic.h"
 #include "ps2/renderer/render_view.h"
 #include "ps2/renderer/render_md2.h"
+#include "ps2/renderer/render_sky.h"
 #include "ps2/renderer/tests/draw_cube.h"
 #include "ps2/renderer/tests/cinematics.h"
 #include "ps2/builtin/builtin.h"
@@ -267,6 +268,7 @@ void DrawDrawStatsOverlay()
         { "Nodes",   stats.nodesWalked   },
         { "Surfs",   stats.surfaces      },
         { "Alpha",   stats.surfacesAlpha },
+        { "Sky",     stats.skyFaces      },
         { "Tris",    stats.trisDrawn     },
         { "Ents",    stats.entities      },
         { "Prts",    stats.particles     },
@@ -328,6 +330,7 @@ qboolean PS2_RefInit(void * hinstance, void * wndproc)
     ps2::vu1::Init();
     ps2::lm::Init();
     ps2::mod::Init();
+    ps2::view::Init();
 
     s_showFpsCount  = Cvar_Get("ps2_show_fps",       "1", 0);
     s_showMemStats  = Cvar_Get("ps2_show_memstats",  "1", 0);
@@ -344,9 +347,6 @@ qboolean PS2_RefInit(void * hinstance, void * wndproc)
 
     viddef.width  = ps2::gs::Width();
     viddef.height = ps2::gs::Height();
-
-    ps2::view::InitViewRendering();
-    ps2::view::InitEntityRendering();
 
     Com_Printf("PS2 refresh initialised: %dx%d\n", viddef.width, viddef.height);
     return true;
@@ -366,6 +366,7 @@ void PS2_BeginRegistration(const char * mapName)
     ps2::tex::BeginRegistration();
     ps2::mod::BeginRegistration(mapName);
     ps2::view::BeginRegistration();
+    ps2::sky::BeginRegistration();
 }
 
 void PS2_EndRegistration()
@@ -376,8 +377,7 @@ void PS2_EndRegistration()
 
 void PS2_SetSky(const char * name, float rotate, vec3_t axis)
 {
-    (void)name; (void)rotate; (void)axis;
-    // TODO
+    ps2::sky::SetSky(name, rotate, axis);
 }
 
 struct model_s * PS2_RegisterModel(const char * name)

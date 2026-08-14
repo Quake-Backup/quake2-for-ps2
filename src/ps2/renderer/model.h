@@ -21,23 +21,14 @@ namespace ps2::mod {
 
 using Vec3 = math::Vec3;
 
-enum class PlaneSides : u32
-{
-    Front,
-    Back,
-    On,
-};
-
 enum class SurfaceFlags : u32
 {
     // Misc surface flags (same values used by ref_gl). These are the renderer's
     // own per-surface flags, distinct from the SURF_* texinfo flags on disk.
-    None           = 0,
-    PlaneBack      = 2,
-    DrawSky        = 4,
-    DrawTurb       = 16,
-    DrawBackground = 64,
-    Underwater     = 128,
+    None      = 0,
+    PlaneBack = 2,
+    DrawSky   = 4,
+    DrawTurb  = 16,
 };
 
 constexpr SurfaceFlags operator|(SurfaceFlags lhs, SurfaceFlags rhs)

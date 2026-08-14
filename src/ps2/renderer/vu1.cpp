@@ -253,8 +253,9 @@ inline u64 MakeAlphaData(DrawFlags flags)
 
 // Emits the batch's 7 GIF tag qwords into an open inline unpack: the A+D
 // state block and the drawing tag for 'vertCount' vertices. Blended batches
-// turn the prim's ABE bit on and mask depth writes; untextured ones clear
-// the TME bit (the texture registers are still written, just not sampled).
+// turn the prim's ABE bit on and mask depth writes; NoDepthWrite masks them
+// without the ABE bit; untextured ones clear the TME bit (the texture
+// registers are still written, just not sampled).
 void AddBatchGifTags(VifPacket & pkt, const tex::Texture & texture, int ctx,
                      int vertCount, DrawFlags flags)
 {
@@ -274,10 +275,11 @@ void AddBatchGifTags(VifPacket & pkt, const tex::Texture & texture, int ctx,
     // function and the depth-write mask for this context...
     pkt.AddQword(GIF_SET_TAG(5, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
     pkt.AddQword(MakeTestData(), static_cast<u64>(GS_REG_TEST + ctx));
-    pkt.AddQword(MakeTex1Data(texture), static_cast<u64>(GS_REG_TEX1 + ctx));
-    pkt.AddQword(MakeTex0Data(texture), static_cast<u64>(GS_REG_TEX0 + ctx));
-    pkt.AddQword(MakeAlphaData(flags), static_cast<u64>(GS_REG_ALPHA + ctx));
-    pkt.AddQword(gs::ZBufData(blended), static_cast<u64>(GS_REG_ZBUF + ctx));
+    pkt.AddQword(MakeTex1Data(texture), static_cast<u64>(GS_REG_TEX1  + ctx));
+    pkt.AddQword(MakeTex0Data(texture), static_cast<u64>(GS_REG_TEX0  + ctx));
+    pkt.AddQword(MakeAlphaData(flags),  static_cast<u64>(GS_REG_ALPHA + ctx));
+    pkt.AddQword(gs::ZBufData(blended || HasDrawFlag(flags, DrawFlags::NoDepthWrite)),
+                 static_cast<u64>(GS_REG_ZBUF + ctx));
 
     // ...then the drawing tag: gouraud triangle list, STQ mapping, with the
     // per-vertex registers of kVertexRegList.

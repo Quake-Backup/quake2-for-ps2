@@ -164,6 +164,19 @@ void EndRegistration();
 // Returns nullptr when the file is missing or fails to decode.
 const Texture * Find(const char * name, ImageType type);
 
+// Halve every ImageType::Sky image loaded from now on, both dimensions, and
+// keep doing it until switched back off. ref_gl's gl_skymip in the shape the
+// PS2 needs it: a sky face is the largest single texture the renderer binds
+// (256x256 = 64 KB of VRAM), and a rotating sky forces all six of them
+// resident at once, so a quarter of that is worth having on hand.
+//
+// A mode flag rather than a Find() parameter because it belongs to the sky
+// module's load loop, exactly as ref_gl bracketed its six GL_FindImage calls
+// with gl_picmip++/gl_picmip--. Note the cache keys on name and type only, so
+// a sky already resident from an earlier map keeps whichever size it loaded
+// at; render_sky.cpp reads the face's real width back rather than assuming.
+void SetSkyDownsample(bool enable);
+
 // Re-stamps an already-resolved texture as used in the current registration
 // cycle, so EndRegistration() won't evict it. The model cache calls this when
 // a model is found in-cache: its texture pointers are reused directly, without
