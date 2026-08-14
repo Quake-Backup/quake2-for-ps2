@@ -71,7 +71,7 @@ extern "C" {
 
 qboolean SNDDMA_Init()
 {
-    s_disableSound = Cvar_Get("ps2_disable_sound", "0", 0);
+    s_disableSound = Cvar_Get("ps2_disable_sound", "0", CVAR_ARCHIVE);
     if (s_disableSound->value != 0.0f)
     {
         Com_Printf("Sound system disabled by ps2_disable_sound - running silent.\n");
