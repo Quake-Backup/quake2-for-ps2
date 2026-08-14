@@ -40,6 +40,9 @@ PS2_CXX_SRC =                         \
 	ps2/input/input.cpp               \
 	ps2/input/keyboard.cpp            \
 	ps2/input/pad.cpp                 \
+	ps2/audio/snd.cpp                 \
+	ps2/audio/audsrv_device.cpp       \
+	ps2/audio/mix_ring.cpp            \
 	ps2/renderer/gs.cpp               \
 	ps2/renderer/vram.cpp             \
 	ps2/renderer/texture.cpp          \
@@ -51,6 +54,7 @@ PS2_CXX_SRC =                         \
 	ps2/renderer/cinematic.cpp        \
 	ps2/renderer/render_view.cpp      \
 	ps2/renderer/render_md2.cpp       \
+	ps2/renderer/render_sky.cpp       \
 	ps2/renderer/vid.cpp              \
 	ps2/renderer/ref.cpp              \
 	ps2/renderer/vu1.cpp              \
@@ -67,7 +71,9 @@ PS2_C_SRC = \
 	ps2/builtin/backtile.c
 
 # Stock Quake II engine / game / server - untouched C, statically linked.
-# The null/* stubs stand in for sound and CD audio until real PS2 backends land.
+# The null/* stub stands in for CD audio: Quake II streams its music off CDDA tracks
+# and this port has no CDVD path at all - game data comes from host: or mass:.
+# Sound output itself is implemented, see ps2/audio/.
 ENGINE_C_SRC = \
 	client/cl_cin.c    client/cl_ents.c   client/cl_fx.c     client/cl_input.c \
 	client/cl_inv.c    client/cl_main.c   client/cl_newfx.c  client/cl_parse.c \
@@ -81,7 +87,7 @@ ENGINE_C_SRC = \
 	game/g_func.c      game/g_items.c     game/g_main.c      game/g_misc.c     \
 	game/g_monster.c   game/g_phys.c      game/g_save.c      game/g_spawn.c    \
 	game/g_svcmds.c    game/g_target.c    game/g_trigger.c   game/g_turret.c   \
-	game/g_utils.c     game/g_weapon.c                                         \
+	game/g_utils.c     game/g_weapon.c    game/q_shared.c    game/p_weapon.c   \
 	game/m_actor.c     game/m_berserk.c   game/m_boss2.c     game/m_boss3.c    \
 	game/m_boss31.c    game/m_boss32.c    game/m_brain.c     game/m_chick.c    \
 	game/m_flash.c     game/m_flipper.c   game/m_float.c     game/m_flyer.c    \
@@ -89,8 +95,7 @@ ENGINE_C_SRC = \
 	game/m_insane.c    game/m_medic.c     game/m_move.c      game/m_mutant.c   \
 	game/m_parasite.c  game/m_soldier.c   game/m_supertank.c game/m_tank.c     \
 	game/p_client.c    game/p_hud.c       game/p_trail.c     game/p_view.c     \
-	game/p_weapon.c    game/q_shared.c                                         \
-	null/cd_null.c     null/snddma_null.c                                      \
+	null/cd_null.c                                                             \
 	server/sv_ccmds.c  server/sv_ents.c   server/sv_game.c   server/sv_init.c  \
 	server/sv_main.c   server/sv_send.c   server/sv_user.c   server/sv_world.c
 
@@ -116,9 +121,13 @@ HOST_CFLAGS ?= -O2 -Wall
 
 # IOP/IRX modules embedded into the ELF: the BDM USB mass-storage stack, booted
 # by ps2/system/iop_boot.cpp when the game data isn't on host: (real hardware),
-# plus the USB keyboard driver started on demand by ps2/input/keyboard.cpp.
+# the USB keyboard driver started on demand by ps2/input/keyboard.cpp, and the
+# sound driver pair (libsd under audsrv) started by ps2/audio/audsrv_device.cpp.
 IRX_PATH  = $(PS2SDK)/iop/irx
-IRX_FILES = iomanX.irx fileXio.irx bdm.irx bdmfs_fatfs.irx usbd.irx usbmass_bd.irx ps2kbd.irx
+IRX_FILES = iomanX.irx fileXio.irx \
+            bdm.irx bdmfs_fatfs.irx usbd.irx usbmass_bd.irx \
+            ps2kbd.irx libsd.irx audsrv.irx
+
 IRX_OBJS  = $(addprefix $(OUTPUT_DIR)/irx/, $(IRX_FILES:.irx=.o))
 
 EE_OBJS = $(C_OBJS) $(CXX_OBJS) $(VU_OBJS) $(IRX_OBJS)
@@ -174,7 +183,7 @@ EE_CXXFLAGS += -std=gnu++20 -fno-exceptions -fno-rtti -fno-threadsafe-statics \
 	$(EE_CXX_WARNFLAGS) $(EE_CXX_SYSINCS) \
 	-MMD -MP
 
-EE_LIBS += -ldraw -lgraph -lpacket -lpacket2 -ldma -lpad -lkbd -lpatches -lfileXio -lkernel
+EE_LIBS += -ldraw -lgraph -lpacket -lpacket2 -ldma -lpad -lkbd -laudsrv -lpatches -lfileXio -lkernel
 
 # ----------------------------------------------------------------------------
 #  Rules

@@ -49,6 +49,10 @@ namespace {
 // Set once the USB branch below has run. See UsbStackStarted().
 static bool s_usbStackStarted = false;
 
+// Set once SIF RPC is up and modules can be loaded out of an EE buffer.
+// See StartIopModuleFromBuffer().
+static bool s_moduleLoaderReady = false;
+
 // The file probed for under "<base>/baseq2/" to decide a base path works.
 constexpr const char * kProbeFile = "pak0.pak";
 
@@ -87,6 +91,28 @@ void BusyWaitMsec(int msec)
 {
     const int until = Sys_Milliseconds() + msec;
     while (Sys_Milliseconds() < until) {}
+}
+
+// Prerequisites for SifExecModuleBuffer, for drivers started after boot.
+bool EnsureModuleLoaderReady()
+{
+    if (s_moduleLoaderReady)
+    {
+        return true;
+    }
+
+    SifInitRpc(0);
+
+    // The USB branch of DetectBasePathAndBootIop() reset the IOP and patched it
+    // already; the host: fast path skipped the whole bring-up, so do it here.
+    if (!s_usbStackStarted && sbv_patch_enable_lmb() != 0)
+    {
+        Com_Printf("WARNING: sbv_patch_enable_lmb failed - no IOP module can be loaded!\n");
+        return false;
+    }
+
+    s_moduleLoaderReady = true;
+    return true;
 }
 
 } // namespace
@@ -161,6 +187,28 @@ const char * DetectBasePathAndBootIop()
 bool UsbStackStarted()
 {
     return s_usbStackStarted;
+}
+
+bool StartIopModuleFromBuffer(const char * name, void * image, u32 sizeBytes)
+{
+    if (!EnsureModuleLoaderReady())
+    {
+        return false;
+    }
+
+    int moduleResult = 0;
+    const int id = SifExecModuleBuffer(image, sizeBytes, 0, nullptr, &moduleResult);
+
+    // Negative id = the load itself failed; result 1 = the module's _start bailed
+    // out (NO_RESIDENT_END) - either way the driver is not running.
+    if (id < 0 || moduleResult == 1)
+    {
+        Com_Printf("WARNING: IOP module '%s' failed (id %d, result %d).\n", name, id, moduleResult);
+        return false;
+    }
+
+    Com_Printf("IOP module '%s' started (id %d).\n", name, id);
+    return true;
 }
 
 } // namespace ps2::sys

@@ -69,6 +69,10 @@ void NET_SendLoopPacket(netsrc_t sock, int length, const void * data)
 
 } // namespace
 
+// ------------------------------------------------------------------------------------------------
+// Public API
+// ------------------------------------------------------------------------------------------------
+
 extern "C" {
 
 void NET_Init() { std::memset(s_loopbacks, 0, sizeof(s_loopbacks)); }

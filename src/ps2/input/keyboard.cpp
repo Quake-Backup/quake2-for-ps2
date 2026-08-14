@@ -20,9 +20,6 @@
 #include <cstdlib>
 
 #include <libkbd.h>
-#include <sifrpc.h>
-#include <loadfile.h>
-#include <sbv_patches.h>
 
 extern "C" {
 // Parses a key name the way the engine's own "bind" does, so in_keyboardmap below
@@ -192,24 +189,6 @@ void KeyboardMapCmd()
                static_cast<unsigned long>(usage), Cmd_Argv(2), key);
 }
 
-// Starts an embedded IRX image. Unlike the boot-time loader in iop_boot.cpp this is
-// best-effort: a keyboard that won't come up is not a reason to kill the game.
-bool StartIopModule(const char * name, void * image, u32 sizeBytes)
-{
-    int moduleResult = 0;
-    const int id = SifExecModuleBuffer(image, sizeBytes, 0, nullptr, &moduleResult);
-
-    // Negative id = the load itself failed; result 1 = the module's _start bailed
-    // out (NO_RESIDENT_END) - either way the driver is not running.
-    if (id < 0 || moduleResult == 1)
-    {
-        Com_Printf("WARNING: IOP module '%s' failed (id %d, result %d) - keyboard disabled!\n",
-                   name, id, moduleResult);
-        return false;
-    }
-    return true;
-}
-
 } // namespace
 
 // ------------------------------------------------------------------------------------------------
@@ -224,26 +203,21 @@ bool Keyboard::Init()
     Cmd_AddCommand("in_keyboardmap", KeyboardMapCmd);
 
     // The keyboard driver lives on the IOP and speaks USB, so it needs usbd under
-    // it. The USB boot path already started usbd (and applied the sbv patch that
-    // makes SifExecModuleBuffer work); the host: fast path skipped the whole IOP
-    // bring-up, so do the missing half here.
-    SifInitRpc(0);
-
+    // it. The USB boot path already started usbd; the host: fast path skipped the
+    // whole IOP bring-up, so start it here. Either way a driver that won't come up
+    // only costs us the keyboard, so none of this is fatal.
     if (!ps2::sys::UsbStackStarted())
     {
-        if (sbv_patch_enable_lmb() != 0)
+        if (!ps2::sys::StartIopModuleFromBuffer("usbd", usbd_irx, size_usbd_irx))
         {
-            Com_Printf("WARNING: sbv_patch_enable_lmb failed - keyboard disabled!\n");
-            return false;
-        }
-        if (!StartIopModule("usbd", usbd_irx, size_usbd_irx))
-        {
+            Com_Printf("WARNING: keyboard disabled!\n");
             return false;
         }
     }
 
-    if (!StartIopModule("ps2kbd", ps2kbd_irx, size_ps2kbd_irx))
+    if (!ps2::sys::StartIopModuleFromBuffer("ps2kbd", ps2kbd_irx, size_ps2kbd_irx))
     {
+        Com_Printf("WARNING: keyboard disabled!\n");
         return false;
     }
 

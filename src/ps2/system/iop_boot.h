@@ -9,6 +9,8 @@
  * This source code is released under the GNU GPL v2 license.
  * ================================================================================================ */
 
+#include <tamtypes.h>
+
 namespace ps2::sys {
 
 // Probes host: for the game data first (PCSX2 exposes the ELF's directory as
@@ -28,5 +30,15 @@ const char * DetectBasePathAndBootIop();
 // is running. False on the host: fast path, which skips all of it - IOP drivers
 // started later (see input/keyboard.cpp) must then patch and start usbd themselves.
 bool UsbStackStarted();
+
+// Starts an IRX image embedded in the ELF by the Makefile's bin2c rule. Unlike the
+// boot-time module chain above this is best-effort: it returns false instead of
+// halting, leaving the caller to run without that driver (see input/keyboard.cpp
+// and audio/audsrv_device.cpp).
+//
+// Takes care of the prerequisites the "host:" fast path skipped - SIF RPC is brought
+// up, and the sbv patch that permits loading a module out of an EE buffer is applied
+// when the IOP was never reset. Both happen once, however many drivers call in.
+bool StartIopModuleFromBuffer(const char * name, void * image, u32 sizeBytes);
 
 } // namespace ps2::sys

@@ -374,8 +374,14 @@ void S_PaintChannelFrom8(channel_t * ch, sfxcache_t * sc, int count, int offset)
     if (ch->rightvol > 255)
         ch->rightvol = 255;
 
-    lscale = snd_scaletable[ch->leftvol >> 11];
-    rscale = snd_scaletable[ch->rightvol >> 11];
+    // LAMPERT NOTE: id's C reference path had ">> 11" here, which is always zero for a
+    // volume clamped to 0-255 just above - row zero of the table is all zeros, so
+    // every 8-bit sample mixed to silence. The x86 asm path below indexes the table
+    // correctly (and eax,0F8h / shl eax,7 == row vol>>3), which is why the bug never
+    // showed up on the PC builds. s_loadas8bit defaults to 1, so this is the path
+    // every sound effect takes on the PS2.
+    lscale = snd_scaletable[ch->leftvol >> 3];
+    rscale = snd_scaletable[ch->rightvol >> 3];
     sfx = (signed char *)sc->data + ch->pos;
 
     samp = &paintbuffer[offset];
