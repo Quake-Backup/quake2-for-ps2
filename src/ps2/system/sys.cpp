@@ -9,6 +9,7 @@
 
 #include "ps2/common.h"
 #include "ps2/debug/scr_print.h"
+#include "ps2/system/iop_boot.h"
 
 #include <cstdio>
 #include <cstdarg>
@@ -60,6 +61,10 @@ void Sys_Init()
     // FS_InitFilesystem runs before Sys_Init and already needs file IO - and
     // the pad driver loads its rom0: modules later, at IN_Init.
     Com_Printf("------- Sys_Init (PS2) -------\n");
+
+    Cmd_AddCommand("ps2_dump_iop_mods", []() {
+        ps2::sys::PrintLoadedIopModules(40, &Com_Printf);
+    });
 }
 
 void Sys_Quit()

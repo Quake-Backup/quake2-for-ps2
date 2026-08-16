@@ -41,4 +41,7 @@ bool UsbStackStarted();
 // when the IOP was never reset. Both happen once, however many drivers call in.
 bool StartIopModuleFromBuffer(const char * name, void * image, u32 sizeBytes);
 
+// Debug helper - lists all currently loaded IOP modules.
+void PrintLoadedIopModules(int maxModules, void (*printer)(const char *, ...));
+
 } // namespace ps2::sys

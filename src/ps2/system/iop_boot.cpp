@@ -16,6 +16,8 @@
 
 #include <cstdio>
 
+#include <kernel.h>
+#include <smod.h>
 #include <sifrpc.h>
 #include <iopcontrol.h>
 #include <loadfile.h>
@@ -209,6 +211,78 @@ bool StartIopModuleFromBuffer(const char * name, void * image, u32 sizeBytes)
 
     Com_Printf("IOP module '%s' started (id %d).\n", name, id);
     return true;
+}
+
+void PrintLoadedIopModules(const int maxModules, void (*printer)(const char *, ...))
+{
+    // Module names live in IOP RAM and arrive here by SIF DMA, so this buffer must be
+    // cache-line aligned, not merely "a char array": the DMAC ignores the low bits of
+    // an unaligned destination, dropping the transfer short of the buffer, and a
+    // neighbour sharing the first or last line can later write its dirty line back
+    // over the transferred bytes. 64 is the EE cache line size; ps2sdk aligns its own
+    // smod scratch buffer the same way. A plain char[] only gets 8-byte alignment.
+    // 128 bytes so the buffer owns both cache lines outright and the guard NUL
+    // at [64] can't share a line with anything else.
+    constexpr int kNameXferSize = 64; // Bytes fetched per module, one cache line.
+    alignas(64) static char s_moduleNameBuff[kNameXferSize * 2];
+
+    smod_mod_info_t moduleInfo = {};
+    SifRpcReceiveData_t rpcRecvData = {};
+
+    if (smod_get_next_mod(nullptr, &moduleInfo) == 0)
+    {
+        printer("Error: Couldn't get module list!");
+        return;
+    }
+
+    int evenOdd = 0;
+    int printedCount = 0;
+
+    // Table header:
+    // (Print two tables side-by side, since our console has very few lines).
+    printer("|    IOP module name    | id |    IOP module name    | id |\n");
+    s_moduleNameBuff[kNameXferSize] = '\0'; // Terminator for an unterminated 64-byte name.
+    do
+    {
+        // Write back and invalidate before the transfer: the DMA lands in RAM behind
+        // the EE's back, so any stale/dirty line for this buffer must be gone first.
+        SyncDCache(s_moduleNameBuff, s_moduleNameBuff + kNameXferSize);
+
+        if (SifRpcGetOtherData(&rpcRecvData, moduleInfo.name, s_moduleNameBuff, kNameXferSize, 0) >= 0)
+        {
+            if (s_moduleNameBuff[0] == '\0')
+            {
+                // Unnamed module.
+                strcpy(s_moduleNameBuff, "???");
+            }
+            else
+            {
+                // Truncate to 21 chars, the size of the name column.
+                s_moduleNameBuff[21] = '\0';
+            }
+
+            // Print a table row (we print two tables side-by-side to save lines).
+            if (!(evenOdd++ & 1))
+            {
+                printer("| %-21s | %-2u |", s_moduleNameBuff, static_cast<u32>(moduleInfo.id));
+            }
+            else
+            {
+                printer(" %-21s | %-2u |\n", s_moduleNameBuff, static_cast<u32>(moduleInfo.id));
+            }
+
+            if (++printedCount == maxModules)
+            {
+                break;
+            }
+        }
+    } while (smod_get_next_mod(&moduleInfo, &moduleInfo) != 0);
+
+    if (evenOdd & 1)
+    {
+        printer("\n");
+    }
+    printer(">> Listed %d modules\n", printedCount);
 }
 
 } // namespace ps2::sys
