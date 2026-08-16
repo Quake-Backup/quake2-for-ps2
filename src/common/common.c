@@ -1511,10 +1511,10 @@ void Qcommon_Init(int argc, char ** argv)
         SCR_EndLoadingPlaque();
     }
 
-    // NOTE (LAMPERT): Comment the block above and uncomment these
-    // two lines to force loading straight into a test map without any monsters (deathmatch 1).
+    // NOTE (LAMPERT): Uncomment these two lines to force loading straight
+    // into a level without any monsters (deathmatch 1), e.g.: map base1.
     //
-    //Cbuf_AddText("killserver ; maxclients 1 ; deathmatch 1 ; map base1\n");
+    //Cbuf_AddText("killserver ; maxclients 1 ; deathmatch 1 ; cheats 1 ; map base1\n");
     //Cbuf_Execute();
 
     Com_Printf("---- Quake II Initialized! ----\n");
