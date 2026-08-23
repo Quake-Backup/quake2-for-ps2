@@ -29,6 +29,7 @@
 #include "ps2/renderer/texture.h"
 #include "ps2/renderer/model.h"
 #include "ps2/renderer/clip.h"
+#include "ps2/renderer/batch.h"
 #include "ps2/renderer/vu1.h"
 #include "ps2/math/vec_mat.h"
 
@@ -94,42 +95,13 @@ inline const s32 * GetAliasGLCmds(const dmdl_t * hdr)
 // ------------------------------------------------------------------------------------------------
 
 // Triangle gather buffers, flushed when full (referenced in place by DMA).
-// The VU lerp path fills the byte-position and attribute streams; the EE
-// lerp path fills the plain DrawVertex buffer. One count serves whichever
-// path is active. The +1 on the positions is the DrawLerpedTriangles pad
-// element for odd flush counts (transferred, never read).
-constexpr int kScratchMaxVerts = 3 * 512;
-alignas(16) static vu1::DrawVertex      s_scratchVerts[kScratchMaxVerts];
-alignas(16) static vu1::LerpVertexBytes s_scratchPosBytes[kScratchMaxVerts + 1];
-alignas(16) static vu1::LerpDrawAttrib  s_scratchAttribs[kScratchMaxVerts];
-static int s_scratchVertCount = 0;
-
-// Sends the gathered scratch triangles as one batch and empties the buffer.
-inline void FlushScratch(const math::Mat4 & mvp, const tex::Texture & texture,
-                         const vu1::DrawFlags flags = vu1::DrawFlags::None)
-{
-    if (s_scratchVertCount > 0)
-    {
-        ++GetDrawStats().drawBatches;
-        vu1::DrawTriangles(mvp, texture, s_scratchVerts, s_scratchVertCount, flags);
-        s_scratchVertCount = 0;
-    }
-}
-
-// The VU-lerp equivalent of FlushScratch, submitting the two SoA streams.
-inline void FlushScratchVULerp(const math::Mat4 & mvp, const tex::Texture & texture,
-                               const math::Vec3 & frontv, const math::Vec3 & backv,
-                               const vu1::FaceCull faceCull, const vu1::DrawFlags flags = vu1::DrawFlags::None)
-{
-    if (s_scratchVertCount > 0)
-    {
-        ++GetDrawStats().drawBatches;
-        vu1::DrawLerpedTriangles(mvp, texture, frontv, backv,
-                                 s_scratchPosBytes, s_scratchAttribs, s_scratchVertCount,
-                                 faceCull, flags);
-        s_scratchVertCount = 0;
-    }
-}
+// The two paths gather into their own: the EE lerp path into the shared
+// DrawVertex batch (batch.h, which also carries the clipper), the VU lerp path
+// into the byte-position and attribute streams of s_lerpBatch. Only one of them
+// is ever active for a given model at a time.
+constexpr int kBatchMaxVerts = 3 * 512;
+static batch::TriangleBatch<kBatchMaxVerts> s_batch;
+static batch::VULerpTriangleBatch<kBatchMaxVerts> s_lerpBatch;
 
 // ------------------------------------------------------------------------------------------------
 // Entity transform and frustum cull
@@ -451,10 +423,6 @@ const math::Vec3 * LerpVertsEE(const dtrivertx_t * verts, const dtrivertx_t * ol
 // EE-side clipping (the view weapon)
 // ------------------------------------------------------------------------------------------------
 
-// Ping-pong buffers for the clipper. File-level rather than stack: draws are
-// synchronous, so every triangle reuses them in turn.
-static clip::Scratch s_clipScratch;
-
 // MD2 shades per vertex, so the colour has to survive a cut: it rides through
 // the clipper as unpacked 0..255 floats in ClipVertex::color, which interpolate
 // linearly like everything else there, and pack back on the way out.
@@ -475,51 +443,14 @@ inline u32 PackClipColor(const math::Vec4 & c)
     return channel(c.x) | (channel(c.y) << 8) | (channel(c.z) << 16) | (channel(c.w) << 24);
 }
 
-inline void EmitClippedVertex(const clip::ClipVertex & v)
-{
-    vu1::DrawVertex & dst = s_scratchVerts[s_scratchVertCount++];
-    dst.x    = v.pos.x;
-    dst.y    = v.pos.y;
-    dst.z    = v.pos.z;
-    dst.w    = 1.0f;
-    dst.rgba = PackClipColor(v.color);
-    dst.s    = v.st.x;
-    dst.t    = v.st.y;
-    dst.q    = 1.0f;
-}
-
 // Clips one model triangle against the volume the VU judges and appends the
-// survivors to the scratch buffer, flushing it when full. Returns the number of
-// triangles emitted.
-int GatherClippedTriangle(clip::ClipVertex (&corners)[3], const math::Mat4 & mvp,
-                          const tex::Texture & texture, const vu1::DrawFlags flags)
+// survivors to the gather buffer, flushing it when full. The vertex colour is
+// the shade the clipper interpolated, packed back down on the way out.
+inline void GatherClippedTriangle(clip::ClipVertex (&corners)[3], const math::Mat4 & mvp,
+                                  const tex::Texture & texture, const vu1::DrawFlags flags)
 {
-    const clip::ClipVertex * verts = nullptr;
-    bool wasClipped = false;
-    const int count = clip::ClipTriangle(corners, mvp, s_clipScratch, &verts, &wasClipped);
-
-    if (count == 0)
-    {
-        ++GetDrawStats().trisCulled;
-        return 0;
-    }
-    if (wasClipped)
-    {
-        ++GetDrawStats().trisClipped;
-    }
-
-    // The survivors fan-triangulate.
-    if (s_scratchVertCount + (count - 2) * 3 > kScratchMaxVerts)
-    {
-        FlushScratch(mvp, texture, flags);
-    }
-    for (int v = 1; v < count - 1; ++v)
-    {
-        EmitClippedVertex(verts[0]);
-        EmitClippedVertex(verts[v]);
-        EmitClippedVertex(verts[v + 1]);
-    }
-    return count - 2;
+    s_batch.GatherTriangle(corners, mvp, texture, flags,
+                           [](const clip::ClipVertex & v) { return PackClipColor(v.color); });
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -600,7 +531,7 @@ void ExpandGLCmds(const dmdl_t * hdr, EmitFn && emit)
 // The shadow's attribute stream: flat black at half alpha, identical for
 // every vertex of every shadow - filled once, referenced forever. Alpha
 // 0x40 = 0.5.
-alignas(16) static vu1::LerpDrawAttrib s_shadowAttribs[kScratchMaxVerts];
+alignas(16) static vu1::LerpDrawAttrib s_shadowAttribs[kBatchMaxVerts];
 
 // Draws the entity's planar projected shadow: the same keyframe byte streams
 // the model just drew, run through the same VU1 lerp, with the flattening
@@ -639,29 +570,26 @@ void DrawAliasMD2Shadow(const entity_t & entity, const dmdl_t * hdr,
     mvp.m[3][2] = row3.z;
     mvp.m[3][3] = row3.w;
 
-    const auto flush = [&]()
+    auto flushShadowVerts = [&]()
     {
-        if (s_scratchVertCount > 0)
-        {
-            ++GetDrawStats().drawBatches;
-            vu1::DrawLerpedTriangles(mvp, skin, lc.frontv, lc.backv,
-                                     s_scratchPosBytes, s_shadowAttribs, s_scratchVertCount,
-                                     faceCull, vu1::DrawFlags::Blended | vu1::DrawFlags::Untextured);
-            s_scratchVertCount = 0;
-        }
+        s_lerpBatch.Flush(mvp, skin, lc.frontv, lc.backv, faceCull,
+                          vu1::DrawFlags::Blended | vu1::DrawFlags::Untextured,
+                          s_shadowAttribs); // Use shadow attribs override.
     };
 
     ExpandGLCmds(hdr, [&](float, float, s32 index)
     {
-        if (s_scratchVertCount == kScratchMaxVerts)
+        if (s_lerpBatch.IsFull())
         {
-            flush();
+            flushShadowVerts();
         }
-        const int i = s_scratchVertCount++;
-        s_scratchPosBytes[i].cur = bits_to_u32(frame->verts[index]);
-        s_scratchPosBytes[i].old = bits_to_u32(oldFrame->verts[index]);
+
+        auto dst = s_lerpBatch.PushVertex();
+        dst.pos.cur = bits_to_u32(frame->verts[index]);
+        dst.pos.old = bits_to_u32(oldFrame->verts[index]);
+        // NOTE: dst.attrib is unset, s_shadowAttribs overrides it.
     });
-    flush();
+    flushShadowVerts();
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -817,6 +745,11 @@ void DrawAliasMD2Entity(const refdef_t & viewDef, const entity_t & entity, const
     // clipped like the world's: the VU rejects straddlers whole (guard band).
     // The view weapon draws against a much closer near plane than the rest of
     // the scene (see kZNearWeapon) so it has almost nothing left to straddle.
+    //
+    // 'emittedVerts' tallies what was submitted, for the frame's triangle count
+    // below. Only the two paths that gather verbatim count here; the EE clipping
+    // path's triangles are counted by the gather buffer itself, since the
+    // clipper is what decides how many of them there are.
     int emittedVerts = 0;
     if (vuLerp)
     {
@@ -831,15 +764,15 @@ void DrawAliasMD2Entity(const refdef_t & viewDef, const entity_t & entity, const
 
         ExpandGLCmds(hdr, [&](float s, float t, s32 index)
         {
-            if (s_scratchVertCount == kScratchMaxVerts)
+            if (s_lerpBatch.IsFull())
             {
-                FlushScratchVULerp(mvp, skin, lc.frontv, lc.backv, faceCull, batchFlags);
+                s_lerpBatch.Flush(mvp, skin, lc.frontv, lc.backv, faceCull, batchFlags);
             }
 
-            const int i = s_scratchVertCount++;
-            s_scratchPosBytes[i].cur = bits_to_u32(frame->verts[index]);
-            s_scratchPosBytes[i].old = bits_to_u32(oldFrame->verts[index]);
-            s_scratchAttribs[i] = {
+            auto dst = s_lerpBatch.PushVertex();
+            dst.pos.cur = bits_to_u32(frame->verts[index]);
+            dst.pos.old = bits_to_u32(oldFrame->verts[index]);
+            dst.attrib  = {
                 .rgba = colorLUT[frame->verts[index].lightnormalindex],
                 .s = s * stScaleS,
                 .t = t * stScaleT,
@@ -847,7 +780,7 @@ void DrawAliasMD2Entity(const refdef_t & viewDef, const entity_t & entity, const
             };
             ++emittedVerts;
         });
-        FlushScratchVULerp(mvp, skin, lc.frontv, lc.backv, faceCull, batchFlags);
+        s_lerpBatch.Flush(mvp, skin, lc.frontv, lc.backv, faceCull, batchFlags);
     }
     else
     {
@@ -882,7 +815,7 @@ void DrawAliasMD2Entity(const refdef_t & viewDef, const entity_t & entity, const
                 if (cornerCount == 3)
                 {
                     cornerCount = 0;
-                    emittedVerts += GatherClippedTriangle(corners, mvp, skin, flags) * 3;
+                    GatherClippedTriangle(corners, mvp, skin, flags);
                 }
             });
         }
@@ -890,12 +823,12 @@ void DrawAliasMD2Entity(const refdef_t & viewDef, const entity_t & entity, const
         {
             ExpandGLCmds(hdr, [&](float s, float t, s32 index)
             {
-                if (s_scratchVertCount == kScratchMaxVerts)
+                if (s_batch.IsFull())
                 {
-                    FlushScratch(mvp, skin, flags); // Capacity is a triangle multiple,
-                }                                   // so this only fires between them.
+                    s_batch.Flush(mvp, skin, flags); // Capacity is a triangle multiple,
+                }                                    // so this only fires between them.
 
-                vu1::DrawVertex  & dst = s_scratchVerts[s_scratchVertCount++];
+                vu1::DrawVertex  & dst = s_batch.PushVertex();
                 const math::Vec3 & pos = lerpedPositions[index];
                 dst.x    = pos.x;
                 dst.y    = pos.y;
@@ -908,7 +841,7 @@ void DrawAliasMD2Entity(const refdef_t & viewDef, const entity_t & entity, const
                 ++emittedVerts;
             });
         }
-        FlushScratch(mvp, skin, flags);
+        s_batch.Flush(mvp, skin, flags);
     }
 
     GetDrawStats().trisDrawn += emittedVerts / 3;

@@ -32,6 +32,7 @@
 #include "ps2/renderer/texture.h"
 #include "ps2/renderer/model.h"
 #include "ps2/renderer/clip.h"
+#include "ps2/renderer/batch.h"
 #include "ps2/renderer/vu1.h"
 #include "ps2/math/vec_mat.h"
 
@@ -146,13 +147,12 @@ static vec3_t s_skyClipVerts[kSkyClipStages][2][kMaxSkyClipVerts];
 // Triangle gather buffer, flushed per face (referenced in place by DMA). Six
 // faces of two triangles, each of which can leave the clipper as a 9-gon, so
 // 7 triangles: 42 verts per face is the true ceiling.
-constexpr int kScratchMaxVerts = 3 * 64;
-alignas(16) static vu1::DrawVertex s_scratchVerts[kScratchMaxVerts];
-static int s_scratchVertCount = 0;
+constexpr int kBatchMaxVerts = 3 * 64;
+static batch::TriangleBatch<kBatchMaxVerts> s_batch;
 
-// Ping-pong buffers for the clipper. File-level rather than stack: draws are
-// synchronous, so every triangle reuses them in turn.
-static clip::Scratch s_clipScratch;
+// The sky draws at a finite distance so the world can occlude it, and must not
+// occlude anything drawn after it in return - hence the masked depth writes.
+constexpr vu1::DrawFlags kSkyDrawFlags = vu1::DrawFlags::NoDepthWrite;
 
 // ------------------------------------------------------------------------------------------------
 // Bounds accumulation (ref_gl's DrawSkyPolygon / ClipSkyPolygon)
@@ -327,63 +327,18 @@ void ClipSkyPolygon(const int nump, vec3_t * vecs, const int stage)
 // Drawing
 // ------------------------------------------------------------------------------------------------
 
-// Sends the gathered scratch triangles as one batch and empties the buffer.
-inline void FlushScratch(const math::Mat4 & viewProj, const tex::Texture & texture)
-{
-    if (s_scratchVertCount > 0)
-    {
-        ++view::GetDrawStats().drawBatches;
-        vu1::DrawTriangles(viewProj, texture, s_scratchVerts, s_scratchVertCount, vu1::DrawFlags::NoDepthWrite);
-        s_scratchVertCount = 0;
-    }
-}
-
-inline void EmitScratchVertex(const clip::ClipVertex & v)
-{
-    vu1::DrawVertex & dst = s_scratchVerts[s_scratchVertCount++];
-    dst.x    = v.pos.x;
-    dst.y    = v.pos.y;
-    dst.z    = v.pos.z;
-    dst.w    = 1.0f;
-    dst.rgba = kSkyColor;
-    dst.s    = v.st.x;
-    dst.t    = v.st.y;
-    dst.q    = 1.0f;
-}
-
 // Clips one sky triangle against the volume the VU judges and appends the
-// survivors to the scratch buffer. A cube face is a single quad spanning 90
+// survivors to the gather buffer. A cube face is a single quad spanning 90
 // degrees, so unlike most geometry here this is expected to clip, not
 // exceptional: at the world projection's scale the guard band runs out around
 // 79 degrees off-axis.
-void GatherSkyTriangle(clip::ClipVertex (&corners)[3], const math::Mat4 & viewProj, const tex::Texture & texture)
+//
+// The sky is flat-shaded: every vertex takes the same colour, whatever the
+// clipper left behind.
+inline void GatherSkyTriangle(clip::ClipVertex (&corners)[3], const math::Mat4 & viewProj, const tex::Texture & texture)
 {
-    const clip::ClipVertex * verts = nullptr;
-    bool wasClipped = false;
-    const int count = clip::ClipTriangle(corners, viewProj, s_clipScratch, &verts, &wasClipped);
-
-    if (count == 0)
-    {
-        ++view::GetDrawStats().trisCulled;
-        return;
-    }
-    if (wasClipped)
-    {
-        ++view::GetDrawStats().trisClipped;
-    }
-
-    // The survivors fan-triangulate.
-    if (s_scratchVertCount + (count - 2) * 3 > kScratchMaxVerts)
-    {
-        FlushScratch(viewProj, texture);
-    }
-    for (int v = 1; v < count - 1; ++v)
-    {
-        EmitScratchVertex(verts[0]);
-        EmitScratchVertex(verts[v]);
-        EmitScratchVertex(verts[v + 1]);
-    }
-    view::GetDrawStats().trisDrawn += count - 2;
+    s_batch.GatherTriangle(corners, viewProj, texture, kSkyDrawFlags,
+                           [](const clip::ClipVertex &) { return kSkyColor; });
 }
 
 // One corner of a cube face: face-local ST in [-1, 1] to a world-space vertex
@@ -611,7 +566,7 @@ void DrawSkyBox(const refdef_t & viewDef, const math::Mat4 & viewProj)
 
         // One batch per face: each binds its own texture, so they could never
         // have shared one anyway.
-        FlushScratch(viewProj, face);
+        s_batch.Flush(viewProj, face, kSkyDrawFlags);
         ++view::GetDrawStats().skyFaces;
     }
 }

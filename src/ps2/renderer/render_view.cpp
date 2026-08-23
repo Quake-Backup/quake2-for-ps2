@@ -28,6 +28,7 @@
 #include "ps2/renderer/model.h"
 #include "ps2/renderer/lightmap.h"
 #include "ps2/renderer/clip.h"
+#include "ps2/renderer/batch.h"
 #include "ps2/renderer/vu1.h"
 #include "ps2/renderer/gs.h"
 #include "ps2/math/vec_mat.h"
@@ -159,11 +160,9 @@ alignas(16) static math::Mat4 s_alphaEntityMatrices[MAX_ENTITIES];
 static int s_alphaEntityMatrixCount = 0;
 
 // Triangle gather buffer: texture chains append here and flush through
-// vu1::DrawTriangles when full. DrawTriangles is synchronous, so one buffer
-// serves every batch in turn, referenced in place by the DMA chain.
-constexpr int kScratchMaxVerts = 3072; // whole triangles (3 * 1024); 96 KB
-alignas(16) static vu1::DrawVertex s_scratchVerts[kScratchMaxVerts];
-static int s_scratchVertCount = 0;
+// vu1::DrawTriangles when full (see batch.h).
+constexpr int kBatchMaxVerts = 3072; // whole triangles (3 * 1024); 96 KB
+static batch::TriangleBatch<kBatchMaxVerts> s_batch;
 
 // Performance counters for the frame, reset by RenderFrame and read through
 // GetDrawStats() by the ps2_show_drawstats overlay.
@@ -661,33 +660,19 @@ struct SurfaceDrawState
     const u16 *        lightmapColors = nullptr;
 };
 
-// Sends the gathered scratch triangles as one batch and empties the buffer.
-inline void FlushScratch(const tex::Texture & texture, const SurfaceDrawState & state)
-{
-    if (s_scratchVertCount > 0)
-    {
-        ++s_drawStats.drawBatches;
-        vu1::DrawTriangles(*state.mvp, texture, s_scratchVerts, s_scratchVertCount, state.flags);
-        s_scratchVertCount = 0;
-    }
-}
-
 // ------------------------------------------------------------------------------------------------
 // Triangle gathering through the clipper
 //
 // The VU rejects a straddling triangle whole rather than cutting it, so world
 // geometry is pre-clipped on the EE against the six planes it judges. The
-// clipper itself lives in clip.h, shared with the alias model path; what
-// follows is this file's use of it. ClipVertex::st carries the vertex alpha in
-// .z under SurfaceDrawState::vertexAlpha, and ClipVertex::color the luxel
-// chroma as a 0..1 tint under SurfaceDrawState::lightmapColors.
+// clipper (clip.h) and the gather buffer it feeds (batch.h) are shared with the
+// sky and alias model paths; what follows is this file's use of them, which is
+// the per-vertex colour and nothing else. ClipVertex::st carries the vertex
+// alpha in .z under SurfaceDrawState::vertexAlpha, and ClipVertex::color the
+// luxel chroma as a 0..1 tint under SurfaceDrawState::lightmapColors.
 // ------------------------------------------------------------------------------------------------
 
 using clip::ClipVertex;
-
-// Ping-pong buffers for the clipper. File-level rather than stack: draws are
-// synchronous, so every triangle reuses them in turn.
-static clip::Scratch s_clipScratch;
 
 // Swaps the batch colour's alpha for this vertex's own, clamped onto the GS's
 // 0..0x80 = 0..1.0 alpha scale.
@@ -721,31 +706,23 @@ inline u32 WithVertexColor(u32 rgba, const math::Vec4 & tint)
         | (rgba & 0xFF000000u);
 }
 
-inline void EmitScratchVertex(const ClipVertex & v, const SurfaceDrawState & state)
+// The colour one gathered vertex draws with: the batch colour, tinted by the
+// luxel chroma or wearing this vertex's own alpha, per the draw state.
+inline u32 VertexColor(const ClipVertex & v, const SurfaceDrawState & state)
 {
-    vu1::DrawVertex & dst = s_scratchVerts[s_scratchVertCount++];
-    dst.x    = v.pos.x;
-    dst.y    = v.pos.y;
-    dst.z    = v.pos.z;
-    dst.w    = 1.0f;
-    dst.rgba = (state.lightmapColors != nullptr) ? WithVertexColor(state.rgba, v.color)
-             : state.vertexAlpha                 ? WithVertexAlpha(state.rgba, v.st.z)
-                                                 : state.rgba;
-    dst.s    = v.st.x;
-    dst.t    = v.st.y;
-    dst.q    = 1.0f;
+    return (state.lightmapColors != nullptr) ? WithVertexColor(state.rgba, v.color)
+          : state.vertexAlpha                ? WithVertexAlpha(state.rgba, v.st.z)
+                                             : state.rgba;
 }
 
 // Clips one triangle against the VU clip volume and appends the survivors to
-// the scratch buffer, flushing it when full. The corners arrive with their
+// the gather buffer, flushing it when full. The corners arrive with their
 // position and UVs set; their clip distances are computed by the clipper.
-void GatherTriangle(ClipVertex (&corners)[3],
-                    const tex::Texture & texture,
-                    const SurfaceDrawState & state)
+inline void GatherTriangle(ClipVertex (&corners)[3], const tex::Texture & texture, const SurfaceDrawState & state)
 {
     // Reject a triangle facing away from the camera before any clipping work.
-    // The test is cheaper than the six plane distances below, and a rejected
-    // triangle costs the clipper, the scratch buffer and the VU nothing.
+    // The test is cheaper than the six plane distances the clipper takes, and a
+    // rejected triangle costs the clipper, the gather buffer and the VU nothing.
     if (state.cullBackFaces &&
         math::CullBackFacingTriangle(state.eye, corners[0].pos, corners[1].pos, corners[2].pos))
     {
@@ -753,33 +730,14 @@ void GatherTriangle(ClipVertex (&corners)[3],
         return;
     }
 
-    const ClipVertex * verts = nullptr;
-    bool wasClipped = false;
-    const int count = clip::ClipTriangle(corners, *state.mvp, s_clipScratch, &verts, &wasClipped);
+    s_batch.GatherTriangle(corners, *state.mvp, texture, state.flags,
+                           [&state](const ClipVertex & v) { return VertexColor(v, state); });
+}
 
-    if (count == 0)
-    {
-        ++s_drawStats.trisCulled;
-        return;
-    }
-
-    if (wasClipped)
-    {
-        ++s_drawStats.trisClipped;
-    }
-
-    // The survivors fan-triangulate.
-    if (s_scratchVertCount + (count - 2) * 3 > kScratchMaxVerts)
-    {
-        FlushScratch(texture, state);
-    }
-    for (int v = 1; v < count - 1; ++v)
-    {
-        EmitScratchVertex(verts[0],     state);
-        EmitScratchVertex(verts[v],     state);
-        EmitScratchVertex(verts[v + 1], state);
-    }
-    s_drawStats.trisDrawn += count - 2;
+// Sends the gathered triangles as one batch and empties the buffer.
+inline void FlushScratch(const tex::Texture & texture, const SurfaceDrawState & state)
+{
+    s_batch.Flush(*state.mvp, texture, state.flags);
 }
 
 // Point-samples the luxel chroma a vertex's lightmap UVs land on - the half of
