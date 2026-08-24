@@ -38,9 +38,6 @@ at a small number of well defined seams — `refexport_t`, `SNDDMA_*`, `IN_*`, `
 - Runs on both the **PCSX2 emulator** (game data over `host:`) and **real hardware**
   (game data from USB mass storage).
 
-Multiplayer, CD/background music and save games are not there yet — see
-[Pending work](#pending-work).
-
 ---
 
 ## Getting started
@@ -75,7 +72,7 @@ Multiplayer, CD/background music and save games are not there yet — see
    override `PCSX2=` for other platforms/locations.
 
 3. **The Quake II game data.** Not included here and not redistributable — copy it from
-   your own retail install or the demo. Place it in a `baseq2/` directory at the root of
+   your own retail install. Place it in a `baseq2/` directory at the root of
    the repository (it is `.gitignore`d):
 
    ```
@@ -98,7 +95,7 @@ make run        # build, then launch it in PCSX2
 ```
 
 Header dependencies are tracked automatically (`-MMD`), so editing a header rebuilds only
-the affected objects — no `make clean` needed after header edits.
+the affected objects.
 
 #### Makefile targets
 
@@ -203,34 +200,14 @@ itself, and `PS2DEV` is the single literal path in the whole file — point it a
 ```jsonc
 {
   "configurations": [
-    {
-      "name": "PS2 (EE)",
-      "includePath": [
-        "${workspaceFolder}/src",
-        "${workspaceFolder}/**",
-        "${PS2DEV}/ee/mips64r5900el-ps2-elf/include",
-        "${PS2DEV}/ee/lib/gcc/mips64r5900el-ps2-elf/15.2.0/include",
-        "${PS2SDK}/ee/include",
-        "${PS2SDK}/common/include"
-      ],
-      "defines": ["_EE", "GAME_HARD_LINKED", "PS2_QUAKE"],
-      "compilerPath": "${PS2DEV}/ee/bin/mips64r5900el-ps2-elf-gcc",
-      "cStandard": "gnu89",
-      "cppStandard": "gnu++20",
-      "intelliSenseMode": "gcc-x64",
-      "compileCommands": "${workspaceFolder}/compile_commands.json"
-    }
+    // ...
   ],
   "env": {
-    "PS2DEV": "/Users/you/ps2dev",     // <-- change this
-    "PS2SDK": "${PS2DEV}/ps2sdk"       //     (derived, leave alone)
-  },
-  "version": 4
+    "PS2DEV": "/Users/you/ps2dev", // <-- change this
+    "PS2SDK": "${PS2DEV}/ps2sdk"
+  }
 }
 ```
-
-Adjust the GCC version in the fifth include path if your toolchain differs
-(`ls $PS2DEV/ee/lib/gcc/mips64r5900el-ps2-elf/`).
 
 `compile_commands.json` is per-machine and `.gitignore`d; generate it with `make compiledb`.
 It carries the exact per-file flags (language standard, `-isystem` paths, warning set), so
@@ -461,9 +438,6 @@ playback test).
 killserver ; deathmatch 1 ; cheats 1 ; map base1
 ```
 
-[src/common/common.c](src/common/common.c) has a commented-out `Cbuf_AddText` at the end of
-`Qcommon_Init` that does exactly this, for booting straight into a level.
-
 ---
 
 ## Pending work
@@ -499,10 +473,7 @@ killserver ; deathmatch 1 ; cheats 1 ; map base1
   (`PS2_QUAKE_ASSERTS`), drop the debug overlays and strip the ELF
   ([Makefile:140](Makefile#L140)).
 - Package a ready-to-run **`.iso`/ELF release** so it can be tried without a toolchain.
-- The screenshots in [misc/screens/](misc/screens/) are from the untextured bring-up stage
-  and no longer represent what the port looks like — they need retaking.
-- Real-hardware testing is far less frequent than emulator testing; hardware-only issues
-  (timing, IOP module quirks, USB enumeration) are the most likely place for surprises.
+- Real-hardware testing; hardware-only issues (timing, IOP module quirks, USB enumeration) are the most likely place for surprises.
 
 Contributions are welcome. The one style rule worth stating up front: the backend is held to
 `-Werror` with a strict warning set (`-Wconversion`, `-Wsign-conversion`, `-Wshadow`,
