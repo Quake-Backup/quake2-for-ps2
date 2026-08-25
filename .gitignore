@@ -8,11 +8,11 @@
 *.pp.vcl
 *.vsm
 
-# Host tool binaries (built with the project, not checked in).
-build/tools
-
-# bin2c-generated IRX embedding intermediates:
-build/irx
+# Everything under build/ is generated - the per-config object trees and ELFs,
+# the host tool binaries, the bin2c IRX intermediates. dummy.txt is only there
+# to keep the directory in the repo.
+build/*
+!build/dummy.txt
 
 # Quake2 game asset files, not part of this repository.
 baseq2

@@ -332,10 +332,10 @@ qboolean PS2_RefInit(void * hinstance, void * wndproc)
     ps2::mod::Init();
     ps2::view::Init();
 
-    s_showFpsCount  = Cvar_Get("ps2_show_fps",       "1", 0);
-    s_showMemStats  = Cvar_Get("ps2_show_memstats",  "1", 0);
-    s_showVramStats = Cvar_Get("ps2_show_vramstats", "1", 0);
-    s_showDrawStats = Cvar_Get("ps2_show_drawstats", "1", 0);
+    s_showFpsCount  = Cvar_Get("ps2_show_fps",       PS2_QUAKE_DEBUG ? "1" : "0", 0);
+    s_showMemStats  = Cvar_Get("ps2_show_memstats",  PS2_QUAKE_DEBUG ? "1" : "0", 0);
+    s_showVramStats = Cvar_Get("ps2_show_vramstats", PS2_QUAKE_DEBUG ? "1" : "0", 0);
+    s_showDrawStats = Cvar_Get("ps2_show_drawstats", PS2_QUAKE_DEBUG ? "1" : "0", 0);
 
     s_texConchars = ps2::tex::Find("conchars", ps2::tex::ImageType::Pic);
     s_texBacktile = ps2::tex::Find("backtile", ps2::tex::ImageType::Pic);
@@ -348,7 +348,16 @@ qboolean PS2_RefInit(void * hinstance, void * wndproc)
     viddef.width  = ps2::gs::Width();
     viddef.height = ps2::gs::Height();
 
-    Com_Printf("PS2 refresh initialised: %dx%d\n", viddef.width, viddef.height);
+#if !PS2_QUAKE_DEBUG
+    // Default clear color to black in release builds.
+    ps2::gs::SetClearColor(0, 0, 0);
+#endif // PS2_QUAKE_DEBUG
+
+    Com_DPrintf("PS2 refresh initialised: %dx%d\n", viddef.width, viddef.height);
+    Com_DPrintf("Debug: %s, Asserts: %s\n",
+                PS2_QUAKE_DEBUG   ? "yes" : "no",
+                PS2_QUAKE_ASSERTS ? "yes" : "no");
+
     return true;
 }
 

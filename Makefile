@@ -1,14 +1,16 @@
 # ============================================================================
 #  Quake II PS2 - build system
 # ----------------------------------------------------------------------------
-#  Produces build/quake2.elf for the PS2 EE, using the modern ps2dev toolchain
-#  (mips64r5900el-ps2-elf-*). Built on top of the PS2SDK sample makefiles.
+#  Produces build/<config>/quake2.elf for the PS2 EE, using the modern ps2dev
+#  toolchain (mips64r5900el-ps2-elf-*). Built on the PS2SDK sample makefiles.
 #
-#    make            -> build build/quake2.elf   (VSCode: Shift+Cmd+B)
-#    make run        -> build + launch in PCSX2  (VSCode: F5)
-#    make tools      -> build host tools (imgdump, unpak) into build/tools/
-#    make clean      -> remove build artifacts
-#    make clean_vu   -> remove only assembled VU microprograms
+#    make             -> debug build -> build/debug/quake2.elf   (VSCode: Shift+Cmd+B)
+#    make release     -> optimized   -> build/release/quake2.elf
+#    make run         -> build + launch in PCSX2  (VSCode: F5)
+#    make release run -> the same, with the release build
+#    make tools       -> build host tools (imgdump, unpak) into build/tools/
+#    make clean       -> remove build artifacts (both configs)
+#    make clean_vu    -> remove only assembled VU microprograms
 #
 #  Header dependencies are tracked automatically (-MMD), so editing a header
 #  rebuilds just the affected objects; no more `make clean` after header edits.
@@ -19,10 +21,45 @@ PS2DEV ?= /Users/guilherme/ps2dev
 PS2SDK ?= $(PS2DEV)/ps2sdk
 PCSX2  ?= /Applications/PCSX2.app/Contents/MacOS/PCSX2
 
-SRC_DIR    = src
-OUTPUT_DIR = build
+# ----------------------------------------------------------------------------
+#  Build configuration
+# ----------------------------------------------------------------------------
+#
+#  Picked by the `release` goal, or by BUILD= on the command line:
+#
+#      make          -> debug   -O2, DWARF info, asserts and debug-only code IN
+#      make release  -> release -O3, no DWARF, asserts and debug-only code OUT
+#
+#  Each config owns its object tree under build/<config>/, so alternating
+#  between the two neither mixes objects built with different flags nor forces
+#  a full rebuild.
 
-EE_BIN = $(OUTPUT_DIR)/quake2.elf
+ifneq ($(filter release,$(MAKECMDGOALS)),)
+    BUILD := release
+else
+    BUILD ?= debug
+endif
+
+ifeq ($(filter $(BUILD),debug release),)
+    $(error BUILD must be 'debug' or 'release', got '$(BUILD)')
+endif
+
+# Strip the linked ELF - in BOTH configs, since the debug build is what gets
+# iterated on and DWARF dominates its size (7.7 MB -> 1.7 MB). Costs nothing at
+# runtime: the PS2 loader only reads program headers, which strip leaves alone.
+# The symbols are not lost, they stay in quake2_unstripped.elf beside it (feed
+# that one to addr2line to resolve a crash address). STRIP_ELF=0 turns this off
+# and ships the unstripped ELF as quake2.elf instead.
+STRIP_ELF ?= 1
+
+SRC_DIR    = src
+BUILD_DIR  = build
+OUTPUT_DIR = $(BUILD_DIR)/$(BUILD)
+
+# The SDK link rule (Makefile.eeglobal_cpp) produces $(EE_BIN) with full symbols;
+# $(GAME_ELF) is the binary that actually runs, stripped out of it below.
+EE_BIN   = $(OUTPUT_DIR)/quake2_unstripped.elf
+GAME_ELF = $(OUTPUT_DIR)/quake2.elf
 
 # ----------------------------------------------------------------------------
 #  Source files
@@ -108,14 +145,17 @@ CXX_OBJS = $(addprefix $(OUTPUT_DIR)/$(SRC_DIR)/, $(CXX_SRC:.cpp=.o))
 # VU microprograms: vclpp -> openvcl -> dvp-as
 # Each .vcl assembles into .vudata with <name>_CodeStart/_CodeEnd link symbols
 # (see PS2_DECLARE_VU_MICROPROGRAM in ps2/renderer/vu1.h).
+# None of the EE compiler flags reach this toolchain, so the output is identical
+# in both configs: build it once into build/vu/ and share it.
 VCL_PATH  = $(SRC_DIR)/ps2/renderer/vu1progs
 VCL_FILES = textured_triangles.vcl lerped_triangles.vcl
-VU_OBJS   = $(addprefix $(OUTPUT_DIR)/vu/, $(VCL_FILES:.vcl=.o))
+VU_OBJS   = $(addprefix $(BUILD_DIR)/vu/, $(VCL_FILES:.vcl=.o))
 
 # Standalone command line tools under src/tools, built with the HOST compiler
-# (not the EE toolchain) since they run on the development machine.
+# (not the EE toolchain) since they run on the development machine. Being host
+# binaries they are config-independent, so they live outside build/<config>/.
 TOOLS_PATH   = $(SRC_DIR)/tools
-TOOLS_BINS   = $(addprefix $(OUTPUT_DIR)/tools/, imgdump unpak)
+TOOLS_BINS   = $(addprefix $(BUILD_DIR)/tools/, imgdump unpak)
 HOST_CC     ?= cc
 HOST_CFLAGS ?= -O2 -Wall
 
@@ -137,9 +177,22 @@ DEPS    = $(C_OBJS:.o=.d) $(CXX_OBJS:.o=.d)
 #  Compiler / linker flags (appended to the SDK defaults from Makefile.eeglobal)
 # ----------------------------------------------------------------------------
 
-# TODO: Define a debug and a release (optimized) target. Release should disable asserts and strip the elf.
+# Per-config flags. EE_OPTFLAGS and EE_DBGINFOFLAGS are the SDK's own knobs:
+# Makefile.eeglobal_cpp defaults them with ?= (to -O2 and -gdwarf-2 -gz), so
+# whatever is set here wins - including setting the debug info to empty.
+#
+# PS2_QUAKE_DEBUG and PS2_QUAKE_ASSERTS are always defined to 0 or 1, never undefined.
+ifeq ($(BUILD),release)
+    EE_OPTFLAGS     = -O3
+    EE_DBGINFOFLAGS =
+    CONFIG_DEFS     = -DPS2_QUAKE_DEBUG=0 -DPS2_QUAKE_ASSERTS=0 -DNDEBUG
+else
+    EE_OPTFLAGS     = -O2
+    EE_DBGINFOFLAGS = -gdwarf-2 -gz
+    CONFIG_DEFS     = -DPS2_QUAKE_DEBUG=1 -DPS2_QUAKE_ASSERTS=1
+endif
 
-COMMON_DEFS = -DGAME_HARD_LINKED -DPS2_QUAKE -DPS2_QUAKE_DEBUG=1 -DPS2_QUAKE_ASSERTS=1
+COMMON_DEFS = -DGAME_HARD_LINKED -DPS2_QUAKE $(CONFIG_DEFS)
 
 EE_INCS += -I$(SRC_DIR)
 
@@ -189,13 +242,37 @@ EE_LIBS += -ldraw -lgraph -lpacket -lpacket2 -ldma -lpad -lkbd -laudsrv -lpatche
 #  Rules
 # ----------------------------------------------------------------------------
 
-.PHONY: all run tools clean clean_vu compiledb
+.PHONY: all release run tools clean clean_vu compiledb
 
-all: $(EE_BIN) tools
+all: $(GAME_ELF) tools
+
+# `release` only selects the config (see BUILD above); the build itself is `all`.
+release: all
+
+# Records which STRIP_ELF setting the current $(GAME_ELF) was made with. make
+# compares timestamps, not recipes, so without this a `make STRIP_ELF=0` over an
+# already-built tree would leave the stripped ELF in place and report nothing to
+# do. Flipping the flag switches to a marker that does not exist yet, which
+# re-makes the ELF below.
+STRIP_MARKER = $(OUTPUT_DIR)/.strip_elf-$(STRIP_ELF)
+
+$(STRIP_MARKER):
+	@mkdir -p $(dir $@)
+	@rm -f $(OUTPUT_DIR)/.strip_elf-*
+	@touch $@
+
+# The runnable ELF, made from the symbol-carrying one the SDK link rule builds.
+ifeq ($(STRIP_ELF),0)
+$(GAME_ELF): $(EE_BIN) $(STRIP_MARKER)
+	cp -f $< $@
+else
+$(GAME_ELF): $(EE_BIN) $(STRIP_MARKER)
+	$(EE_STRIP) --strip-all -o $@ $<
+endif
 
 # Out-of-tree object rules. These static-pattern rules take precedence over the
-# generic %.o rules from Makefile.eeglobal so objects land under build/ mirroring
-# the src/ tree. ($(EE_BIN) link rule is provided by Makefile.eeglobal_cpp.)
+# generic %.o rules from Makefile.eeglobal so objects land under build/<config>/
+# mirroring the src/ tree. ($(EE_BIN) link rule comes from Makefile.eeglobal_cpp.)
 $(C_OBJS): $(OUTPUT_DIR)/$(SRC_DIR)/%.o: $(SRC_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(EE_CC) $(EE_CFLAGS) $(EE_INCS) -c $< -o $@
@@ -205,7 +282,7 @@ $(CXX_OBJS): $(OUTPUT_DIR)/$(SRC_DIR)/%.o: $(SRC_DIR)/%.cpp
 	$(EE_CXX) $(EE_CXXFLAGS) $(EE_INCS) -c $< -o $@
 
 # VU1 microprograms.
-$(OUTPUT_DIR)/vu/%.o: $(VCL_PATH)/%.vcl
+$(BUILD_DIR)/vu/%.o: $(VCL_PATH)/%.vcl
 	@mkdir -p $(dir $@)
 	vclpp $< $(basename $@).pp.vcl -j
 	openvcl -o $(basename $@).vsm $(basename $@).pp.vcl
@@ -220,33 +297,36 @@ $(OUTPUT_DIR)/irx/%.o: $(IRX_PATH)/%.irx
 # Host tools: each is a single self-contained .c compiled straight to a binary.
 tools: $(TOOLS_BINS)
 
-$(TOOLS_BINS): $(OUTPUT_DIR)/tools/%: $(TOOLS_PATH)/%.c
+$(TOOLS_BINS): $(BUILD_DIR)/tools/%: $(TOOLS_PATH)/%.c
 	@mkdir -p $(dir $@)
 	$(HOST_CC) $(HOST_CFLAGS) $< -o $@
 
-# PCSX2 exposes the ELF's directory as host:, so the game data must be
-# reachable as build/baseq2. A symlink back to the repo's baseq2/ does it.
+# PCSX2 exposes the ELF's directory as host:, so the game data must be reachable
+# as build/<config>/baseq2. A symlink back to the repo's baseq2/ does it.
 $(OUTPUT_DIR)/baseq2:
+	@mkdir -p $(dir $@)
 	ln -sfn $(abspath baseq2) $@
 
 run: all $(OUTPUT_DIR)/baseq2
-	$(PCSX2) -batch -elf $(abspath $(EE_BIN))
+	$(PCSX2) -batch -elf $(abspath $(GAME_ELF))
 
 # Regenerate compile_commands.json so the editor's IntelliSense uses the exact
 # per-file compile flags. Run after adding/removing source files.
 compiledb:
 	@$(MAKE) -Bnk | python3 scripts/gen_compile_commands.py
 
+# Both configs, not just the selected one.
 clean:
-	rm -rf $(OUTPUT_DIR)/src $(OUTPUT_DIR)/vu $(OUTPUT_DIR)/irx $(OUTPUT_DIR)/tools $(EE_BIN)
+	rm -rf $(BUILD_DIR)/debug $(BUILD_DIR)/release $(BUILD_DIR)/vu $(BUILD_DIR)/tools
 
 clean_vu:
-	rm -rf $(OUTPUT_DIR)/vu
+	rm -rf $(BUILD_DIR)/vu
 
 -include $(DEPS)
 
 # Pull in the PS2SDK toolchain definitions and the C++ link rule. These provide
-# EE_CC/EE_CXX/EE_STRIP, the -D_EE/-G0/-O2 defaults, EE_LDFLAGS (linkfile,
-# max-page-size) and the `$(EE_BIN): $(EE_OBJS)` link recipe (links with g++).
+# EE_CC/EE_CXX/EE_STRIP, the -D_EE/-G0 defaults (the optimization and debug-info
+# ones are set per-config above), EE_LDFLAGS (linkfile, max-page-size) and the
+# `$(EE_BIN): $(EE_OBJS)` link recipe (links with g++).
 include $(PS2SDK)/samples/Makefile.pref
 include $(PS2SDK)/samples/Makefile.eeglobal_cpp

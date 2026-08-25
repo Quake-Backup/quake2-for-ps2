@@ -1435,8 +1435,8 @@ void Qcommon_Init(int argc, char ** argv)
     Con_Init(); // LAMPERT: Early console init so we can debug initialization problems.
 
     // LAMPERT 2015-10-26:
-	// Developer mode by default, unless specified otherwise.
-    developer = Cvar_Get("developer", "1", 0);
+	// Developer mode by default in debug builds, unless specified otherwise.
+    developer = Cvar_Get("developer", PS2_QUAKE_DEBUG ? "1" : "0", 0);
 
     // we need to add the early commands twice, because
     // a basedir or cddir needs to be set before execing

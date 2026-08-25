@@ -90,27 +90,52 @@ at a small number of well defined seams — `refexport_t`, `SNDDMA_*`, `IN_*`, `
 ### Building
 
 ```sh
-make            # build build/quake2.elf (+ host tools)
+make            # debug build -> build/debug/quake2.elf (+ host tools)
+make release    # optimized   -> build/release/quake2.elf
 make run        # build, then launch it in PCSX2
 ```
 
 Header dependencies are tracked automatically (`-MMD`), so editing a header rebuilds only
 the affected objects.
 
+#### Debug and release
+
+| | `make` (debug) | `make release` |
+| --- | --- | --- |
+| Optimization | `-O2` | `-O3` |
+| Debug info | `-gdwarf-2 -gz` | none |
+| `PS2_Assert` / `PS2_AssertMsg` | on | compiled out |
+| `PS2_QUAKE_DEBUG` code (test cube, cinematic test, extra debug textures) | in | compiled out |
+
+Each config keeps its own object tree under `build/<config>/`, so switching back and forth
+neither mixes objects built with different flags nor forces a full rebuild. `release` is
+just a config selector, so it composes: `make release run` builds and launches the release
+ELF. `BUILD=debug` / `BUILD=release` does the same thing from the command line.
+
+Both configs **strip** the linked ELF, which is mostly about the debug build — DWARF
+dominates its size, and stripping takes it from ~7.7 MB to ~1.7 MB. Nothing is lost: the
+PS2 loader only reads program headers, and the full symbols stay next to it in
+`quake2_unstripped.elf` (feed that one to `addr2line` to resolve a crash address). Build
+with `STRIP_ELF=0` to ship the unstripped ELF as `quake2.elf` instead.
+
 #### Makefile targets
 
 | Target | What it does |
 | --- | --- |
-| `make` / `make all` | Builds `build/quake2.elf` and the host tools. |
-| `make run` | Builds, symlinks `build/baseq2` → `baseq2/`, and launches PCSX2 with the ELF. |
+| `make` / `make all` | Builds `build/debug/quake2.elf` and the host tools. |
+| `make release` | The same, optimized, into `build/release/quake2.elf`. |
+| `make run` | Builds, symlinks `build/<config>/baseq2` → `baseq2/`, and launches PCSX2 with the ELF. |
 | `make tools` | Builds the host-side command line tools into `build/tools/` (see below). |
 | `make compiledb` | Regenerates `compile_commands.json` from the Makefile, for IntelliSense/clangd. Run after adding or removing source files. |
-| `make clean` | Removes all build artifacts. |
+| `make clean` | Removes all build artifacts, both configs. |
 | `make clean_vu` | Removes only the assembled VU microprograms (`build/vu/`). |
 
-Useful variable overrides: `PS2DEV=`, `PS2SDK=`, `PCSX2=`, `HOST_CC=`, and
-`-DPS2_FS_BASE_PATH=\"host:.\"` in `COMMON_DEFS` to pin the game data path and skip
-autodetection.
+The host tools and the assembled VU microprograms are config-independent (no EE compiler
+flag reaches either), so they are built once and shared, outside `build/<config>/`.
+
+Useful variable overrides: `BUILD=`, `STRIP_ELF=`, `PS2DEV=`, `PS2SDK=`, `PCSX2=`,
+`HOST_CC=`, and `-DPS2_FS_BASE_PATH=\"host:.\"` in `COMMON_DEFS` to pin the game data path
+and skip autodetection.
 
 #### Host tools
 
@@ -125,8 +150,8 @@ Built with the *host* compiler, not the EE toolchain:
 
 ### Running in PCSX2
 
-`make run` handles the launch (`PCSX2 -batch -elf build/quake2.elf`), but PCSX2 itself needs
-a couple of settings that are **off by default**. Edit
+`make run` handles the launch (`PCSX2 -batch -elf build/debug/quake2.elf`), but PCSX2 itself
+needs a couple of settings that are **off by default**. Edit
 `PCSX2.ini` **while PCSX2 is closed** — it rewrites the file on exit and will clobber your
 changes. On macOS it lives at `~/Library/Application Support/PCSX2/inis/PCSX2.ini`.
 
@@ -137,8 +162,9 @@ changes. On macOS it lives at `~/Library/Application Support/PCSX2/inis/PCSX2.in
 HostFs = true
 ```
 
-PCSX2 maps `host:` to the directory the ELF was loaded from — that is `build/`, and the
-`run` target symlinks `build/baseq2` back to the repo's `baseq2/`. Without `HostFs`, the boot
+PCSX2 maps `host:` to the directory the ELF was loaded from — that is `build/debug/` (or
+`build/release/`), and the `run` target symlinks a `baseq2` there back to the repo's
+`baseq2/`. Without `HostFs`, the boot
 probe finds nothing and the game halts with *"No game data found"*. The equivalent UI toggle
 (Settings → Advanced → Enable Host Filesystem) is hidden unless advanced settings are shown.
 
@@ -469,9 +495,6 @@ killserver ; deathmatch 1 ; cheats 1 ; map base1
 
 **Build and project**
 
-- Separate **debug and release targets**: release should disable asserts
-  (`PS2_QUAKE_ASSERTS`), drop the debug overlays and strip the ELF
-  ([Makefile:140](Makefile#L140)).
 - Package a ready-to-run **`.iso`/ELF release** so it can be tried without a toolchain.
 - Real-hardware testing; hardware-only issues (timing, IOP module quirks, USB enumeration) are the most likely place for surprises.
 
