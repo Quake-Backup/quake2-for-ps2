@@ -42,10 +42,16 @@ u64 ZBufData(bool maskDepthWrites);
 // GS VRAM word address of the 256-entry CLUT a texture of this pixel format
 // samples through: the global palette (Quake's shared 8-bit palette) for
 // Palette8, and the alpha ramp (index = alpha, colour pinned at the modulate
-// identity) for Alpha8. Both are uploaded once by Init() to fixed spots outside
-// the texture heap. Returns vram::Address::Invalid for the direct-colour
-// formats, which sample no CLUT.
-vram::Address ClutAddressFor(tex::PixelFormat format);
+// identity) for Alpha8, and for Palette8 either the plain global palette or the
+// intensity-brightened copy of it, depending on what the image is for (see
+// tex::TakesIntensity). All three live at fixed spots outside the texture heap.
+// Returns vram::Address::Invalid for the direct-colour formats, which sample no CLUT.
+vram::Address ClutAddressFor(const tex::Texture & texture);
+
+// The ps2_intensity value the lit palette CLUT currently holds, floored at 1.
+// Formats that cannot sample through that CLUT have to scale their own texels
+// by this instead (see tex::TakesIntensity).
+float IntensityScale();
 
 // Background colour used by BeginFrame()'s screen clear.
 void SetClearColor(u8 r, u8 g, u8 b);

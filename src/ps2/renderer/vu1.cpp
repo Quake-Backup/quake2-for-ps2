@@ -200,7 +200,7 @@ inline u64 MakeTex0Data(const tex::Texture & texture)
     // palette or the alpha ramp, by format); reloading the on-chip CLUT cache
     // on every bind is cheap (1 KB). Everything else leaves the CLUT fields
     // zero (as gs::SetTextureFor2D).
-    const vram::Address clutAddr = gs::ClutAddressFor(texture.format);
+    const vram::Address clutAddr = gs::ClutAddressFor(texture);
     const bool palettized = (clutAddr != vram::Address::Invalid);
 
     return GS_SET_TEX0(texture.texbuf.address >> 6,

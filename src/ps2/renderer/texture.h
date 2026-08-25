@@ -34,6 +34,17 @@ enum class ImageType : u8
     Sky     // Skybox face.
 };
 
+// Which images are pre-brightened by ps2_intensity before anything multiplies
+// them back down again: a wall under its lightmap, a skin or a sprite under an
+// entity's shade colour. Images drawn at face value - the HUD, the menus, the
+// sky - are left alone, or the compensation would just wash them out.
+constexpr bool TakesIntensity(ImageType type)
+{
+    return (type == ImageType::Wall) ||
+           (type == ImageType::Skin) ||
+           (type == ImageType::Sprite);
+}
+
 // Bit-flag texture properties, orthogonal to the ImageType.
 enum class TexFlags : u8
 {

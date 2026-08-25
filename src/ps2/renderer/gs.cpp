@@ -120,15 +120,28 @@ static const tex::Texture * s_currentTex = nullptr;
 static int s_texOriginU = 0;
 static int s_texOriginV = 0;
 
-// The two CLUTs, both built and uploaded once at Init to fixed VRAM spots
-// outside the texture heap (see clut.h for their layout).
+// The three CLUTs, all living at fixed VRAM spots outside the texture heap
+// (see clut.h for their layout).
 //
-// The global palette is Quake's shared 8-bit palette, which every Palette8
-// texture's TEX0 points at. The alpha ramp backs PixelFormat::Alpha8: the
-// lightmap atlases (luxel intensity) and the generated particle images (their
-// shape) both carry only an alpha signal and take their colour from the primitive.
+// The global palette is Quake's shared 8-bit palette. The lit palette is that
+// same palette pre-brightened by 'intensity', and is what a Palette8 image
+// samples through when something is going to multiply it back down - a wall
+// under its lightmap, a skin under its shade colour. Everything drawn at face
+// value (the HUD, the menus, the sky) keeps the unscaled one, which is the same
+// split ref_gl makes when it skips intensity for it_pic and it_sky.
+//
+// The alpha ramp backs PixelFormat::Alpha8: the lightmap atlases (luxel
+// intensity) and the generated particle images (their shape) both carry only an
+// alpha signal and take their colour from the primitive.
 static tex::Clut s_globalPaletteClut;
+static tex::Clut s_litPaletteClut;
 static tex::Clut s_alphaRampClut;
+
+// ref_gl's 'intensity': how much every lit image is brightened before anything
+// multiplies it back down. Read each frame so it can be dialled in on hardware;
+// changing it rebuilds and re-uploads s_litPaletteClut (see RefreshLitPalette).
+static const cvar_t * s_intensity = nullptr;
+static float s_litPaletteScale = 0.0f; // what s_litPaletteClut currently holds
 
 // Packs the matrix into the DIMX register: sixteen 3-bit signed fields at a
 // 4-bit stride.
@@ -204,6 +217,52 @@ void SetClearColor(u8 r, u8 g, u8 b)
     s_clearColor[2] = b;
 }
 
+// Sends one or two CLUTs to their fixed VRAM addresses and waits for the
+// transfer. Only ever called between frames, so it can take the shared upload
+// packet without fighting the streamed texture uploads for it.
+static void UploadCluts(const tex::Clut * first, const tex::Clut * second)
+{
+    RenderPacket & upload = s_texUploadPacket;
+    upload.Reset();
+
+    const tex::Clut * const cluts[] = { first, second };
+    for (const tex::Clut * clut : cluts)
+    {
+        if (clut != nullptr)
+        {
+            upload.TextureTransfer(clut->entries, tex::Clut::kImageWidth, tex::Clut::kImageHeight,
+                                   GS_PSM_32, clut->vramAddr, tex::Clut::kTransferWidth);
+        }
+    }
+    upload.TextureFlush();
+
+    upload.SendChain();
+    upload.Wait();
+}
+
+// Rebuilds the lit palette when ps2_intensity has changed, so the value can be
+// dialled in on hardware without a restart. A no-op on every frame that did not
+// change it, which is all but a handful.
+//
+// Note this reaches Palette8 images only, which is every image the retail game
+// ships. A PixelFormat::RGBA32 texture (a .tga replacement) carries the scale in
+// its own texels instead and picks up a new value when it is next loaded - the
+// same restart ref_gl needs for all of them.
+static void RefreshLitPalette()
+{
+    // Below 1 would darken rather than brighten, which is not what the knob is
+    // for and is what ref_gl's own floor at 1 says too.
+    const float scale = (s_intensity->value < 1.0f) ? 1.0f : s_intensity->value;
+    if (scale == s_litPaletteScale)
+    {
+        return;
+    }
+
+    s_litPaletteScale = scale;
+    s_litPaletteClut.BuildFromPaletteScaled(global_palette, scale);
+    UploadCluts(&s_litPaletteClut, nullptr);
+}
+
 void Init()
 {
     dma_channel_initialize(DMA_CHANNEL_GIF, nullptr, 0);
@@ -244,19 +303,22 @@ void Init()
     s_zbuffer.zsm     = static_cast<unsigned int>(zPsm);
     s_zbuffer.address = static_cast<unsigned int>(graph_vram_allocate(kRenderWidth, kRenderHeight, zPsm, GRAPH_ALIGN_PAGE));
 
-    // Both CLUTs live with the fixed allocations; the streamed texture heap
+    // All three CLUTs live with the fixed allocations; the streamed texture heap
     // takes everything after them, rounded up to a page so its footprint math
-    // stays page-aligned (the rest of the second CLUT's page is unused).
+    // stays page-aligned (the rest of the last CLUT's page is unused).
     // graph_vram_allocate hands out increasing addresses, so the heap starts
-    // past the later of the two.
+    // past the last of the three.
     const int clutVramAddr      = graph_vram_allocate(tex::Clut::kImageWidth, tex::Clut::kImageHeight,
+                                                      GS_PSM_32, GRAPH_ALIGN_BLOCK);
+    const int litClutVramAddr   = graph_vram_allocate(tex::Clut::kImageWidth, tex::Clut::kImageHeight,
                                                       GS_PSM_32, GRAPH_ALIGN_BLOCK);
     const int alphaRampClutAddr = graph_vram_allocate(tex::Clut::kImageWidth, tex::Clut::kImageHeight,
                                                       GS_PSM_32, GRAPH_ALIGN_BLOCK);
-    PS2_Assert(alphaRampClutAddr > clutVramAddr);
+    PS2_Assert(alphaRampClutAddr > litClutVramAddr && litClutVramAddr > clutVramAddr);
 
     vram::Init((alphaRampClutAddr + tex::Clut::kNumEntries + 2047) & ~2047);
     s_globalPaletteClut.vramAddr = vram::Address(clutVramAddr);
+    s_litPaletteClut.vramAddr    = vram::Address(litClutVramAddr);
     s_alphaRampClut.vramAddr     = vram::Address(alphaRampClutAddr);
 
     // Display framebuffer 0 first; auto-detects NTSC/PAL.
@@ -291,34 +353,36 @@ void Init()
     pkt.Wait();
     pkt.WaitFinish();
 
-    // Build and upload both CLUTs (resident; neither ever changes).
+    // Build and upload the CLUTs. The two below never change again; the lit
+    // palette is built by RefreshLitPalette, which also uploads it and runs
+    // once here before anything can sample it.
     s_globalPaletteClut.BuildFromPalette(global_palette);
     s_alphaRampClut.BuildAlphaRamp();
 
-    RenderPacket & upload = s_texUploadPacket;
-    upload.Reset();
-    const tex::Clut * const cluts[] = { &s_globalPaletteClut, &s_alphaRampClut };
-    for (const tex::Clut * clut : cluts)
-    {
-        upload.TextureTransfer(clut->entries, tex::Clut::kImageWidth, tex::Clut::kImageHeight,
-                               GS_PSM_32, clut->vramAddr, tex::Clut::kTransferWidth);
-    }
-    upload.TextureFlush();
+    UploadCluts(&s_globalPaletteClut, &s_alphaRampClut);
 
-    upload.SendChain();
-    upload.Wait();
+    s_intensity = Cvar_Get("ps2_intensity", "2", CVAR_ARCHIVE);
+    RefreshLitPalette();
 
     s_drawCtx   = 1;
     s_packetIdx = 0;
 }
 
-vram::Address ClutAddressFor(tex::PixelFormat format)
+float IntensityScale()
 {
-    switch (format)
+    return s_litPaletteScale;
+}
+
+vram::Address ClutAddressFor(const tex::Texture & texture)
+{
+    switch (texture.format)
     {
-    case tex::PixelFormat::Palette8 : return s_globalPaletteClut.vramAddr;
-    case tex::PixelFormat::Alpha8   : return s_alphaRampClut.vramAddr;
-    default                         : return vram::Address::Invalid;
+    case tex::PixelFormat::Palette8 :
+        return tex::TakesIntensity(texture.type) ? s_litPaletteClut.vramAddr : s_globalPaletteClut.vramAddr;
+    case tex::PixelFormat::Alpha8 :
+        return s_alphaRampClut.vramAddr;
+    default :
+        return vram::Address::Invalid;
     }
 }
 
@@ -326,6 +390,9 @@ void BeginFrame()
 {
     PS2_AssertMsg(!s_frameStarted, "BeginFrame: frame already started!");
     s_frameStarted = true;
+
+    // Between frames is the only safe moment to rewrite a CLUT the GS samples.
+    RefreshLitPalette();
 
     s_packetIdx ^= 1;
 
@@ -716,7 +783,7 @@ void SetTextureFor2D(const tex::Texture & texture)
     lod.k             = 0.0f;
 
     clutbuffer_t clut;
-    const vram::Address clutAddr = ClutAddressFor(bindTex.format);
+    const vram::Address clutAddr = ClutAddressFor(bindTex);
     if (clutAddr != vram::Address::Invalid)
     {
         // Reload the on-chip CLUT cache on every bind: cheap (1 KB) at the 2D

@@ -133,6 +133,33 @@ bool HasTransparentTexels(const u8 * pic8, int texelCount)
     return false;
 }
 
+// Multiplies an RGBA32 image's colour channels in place, clamping each at full
+// rather than wrapping. The alpha is left alone - it is coverage, not light.
+// This is ref_gl's intensitytable applied directly to the texels, for the images
+// that cannot reach it through a CLUT.
+void ScaleTexelsForIntensity(u8 * rgba, int texelCount, float scale)
+{
+    if (scale <= 1.0f)
+    {
+        return;
+    }
+
+    // TODO: Precompute and cache ramp values.
+    u8 ramp[256];
+    for (int i = 0; i < ArrayLength(ramp); ++i)
+    {
+        const float scaled = static_cast<float>(i) * scale;
+        ramp[i] = static_cast<u8>((scaled >= 255.0f) ? 255.0f : scaled);
+    }
+
+    for (int i = 0; i < texelCount; ++i, rgba += 4)
+    {
+        rgba[0] = ramp[rgba[0]];
+        rgba[1] = ramp[rgba[1]];
+        rgba[2] = ramp[rgba[2]];
+    }
+}
+
 // Set by tex::SetSkyDownsample(); consumed by LoadFromFile for Sky images.
 static bool s_skyDownsample = false;
 
@@ -459,6 +486,16 @@ const Texture * TextureCache::LoadFromFile(const char * fullname, const ImageTyp
         format     = PixelFormat::RGBA32;
         components = hasAlpha ? TexComponents::RGBA : TexComponents::RGB;
         pixels     = pic32;
+
+        // True-colour images have no CLUT to carry ps2_intensity for them, so
+        // a lit one takes the scale in its own texels here. That bakes in
+        // whatever the value is at load time, unlike the palettized images the
+        // retail game is made of, which follow the cvar live - a .tga picks up
+        // a new value the next time it is loaded.
+        if (TakesIntensity(type))
+        {
+            ScaleTexelsForIntensity(pic32, width * height, gs::IntensityScale());
+        }
     }
     else
     {

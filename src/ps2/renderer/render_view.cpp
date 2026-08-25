@@ -76,6 +76,7 @@ static const cvar_t * s_dynamicLightmaps  = nullptr;
 static const cvar_t * s_lightmaps         = nullptr;
 static const cvar_t * s_lightmapOnly      = nullptr;
 static const cvar_t * s_lightmapColor     = nullptr;
+static const cvar_t * s_lightmapModulate  = nullptr;
 static const cvar_t * s_polyblend         = nullptr;
 
 // Not ours to read: SetLightLevel writes the sampled light level back into it
@@ -1529,13 +1530,20 @@ LightSampleResult RecursiveLightPoint(const mod::ModelInstance & world, const mo
         const u8 * lightmap = surf->samples;
         lightmap += 3 * (dt * ((surf->extents[0] >> 4) + 1) + ds);
 
+        // Scaled by ps2_lightmap_modulate for the same reason the atlases are
+        // (ref_gl applies gl_modulate in both places): an entity standing on a
+        // surface should take the brightness that surface is drawn at, or
+        // turning the knob up would light the world and leave everything in it
+        // behind.
+        const float modulate = s_lightmapModulate->value * (1.0f / 255.0f);
+
         for (int map = 0; map < mod::kMaxLightmaps && surf->styles[map] != 255; ++map)
         {
             const float * styleRGB = lightstyles[surf->styles[map]].rgb;
 
-            outColor[0] += lightmap[0] * styleRGB[0] * (1.0f / 255.0f);
-            outColor[1] += lightmap[1] * styleRGB[1] * (1.0f / 255.0f);
-            outColor[2] += lightmap[2] * styleRGB[2] * (1.0f / 255.0f);
+            outColor[0] += lightmap[0] * styleRGB[0] * modulate;
+            outColor[1] += lightmap[1] * styleRGB[1] * modulate;
+            outColor[2] += lightmap[2] * styleRGB[2] * modulate;
 
             lightmap += 3 * ((surf->extents[0] >> 4) + 1) * ((surf->extents[1] >> 4) + 1);
         }
@@ -2223,6 +2231,10 @@ void Init()
     s_lightmapOnly      = Cvar_Get("ps2_lightmap_only",       "0", 0); // Debug: 1 drops the diffuse textures, showing the lighting alone.
     s_lightmapColor     = Cvar_Get("ps2_lightmap_color",      "1", 0); // Debug: 0 drops the per-vertex luxel chroma, leaving lighting monochrome.
     s_polyblend         = Cvar_Get("ps2_polyblend",           "1", 0); // ref_gl's gl_polyblend: the full screen damage/powerup/underwater tint.
+
+    // Registered by the lightmap manager, which owns it; this resolves the same
+    // object so the entity lighting can scale by it too.
+    s_lightmapModulate = Cvar_Get("ps2_lightmap_modulate", "1", CVAR_ARCHIVE);
 
     // Already registered by the client; this just resolves the same object.
     s_lightLevel = Cvar_Get("r_lightlevel", "0", 0);
