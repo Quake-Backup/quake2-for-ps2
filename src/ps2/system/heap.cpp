@@ -139,7 +139,7 @@ void PS2_MemFree(void * ptr, size_t sizeBytes, PS2MemTag tag)
 
 void PS2_TagsAddMem(PS2MemTag tag, size_t sizeBytes)
 {
-    s_memTagCounts[MemTagToIndex(tag)].totalBytes += sizeBytes;
+    AccountAlloc(tag, sizeBytes);
 }
 
 size_t PS2_GetTotalMemBytes()
@@ -179,7 +179,13 @@ void PS2_TagsAddSystemMem()
     // the kernel carved out above the heap ceiling.
     if (totalBytes > availBytes)
     {
-        PS2_TagsAddMem(MEMTAG_MISC, totalBytes - availBytes);
+        const size_t totalUsedBytes = totalBytes - availBytes;
+
+        Sys_ConsoleOutput(va("RAM available: %.2f MB, used by ELF + system: %.2f MB\n",
+                             static_cast<double>(availBytes) / 1024.0 / 1024.0,
+                             static_cast<double>(totalUsedBytes) / 1024.0 / 1024.0));
+
+        PS2_TagsAddMem(MEMTAG_MISC, totalUsedBytes);
     }
 }
 
