@@ -21,8 +21,9 @@
 #include "ps2/renderer/render_view.h"
 #include "ps2/renderer/render_md2.h"
 #include "ps2/renderer/render_sky.h"
-#include "ps2/renderer/tests/draw_cube.h"
-#include "ps2/renderer/tests/cinematics.h"
+#include "ps2/tests/draw_cube.h"
+#include "ps2/tests/cinematics.h"
+#include "ps2/tests/map_cycle.h"
 #include "ps2/builtin/builtin.h"
 
 #include <cstdio>
@@ -154,7 +155,7 @@ void DrawMemUsageOverlay()
     }
 
     constexpr int kLineHeight = kGlyphSize + 2;   // Matches DrawInternalString spacing.
-    constexpr int kNumLines   = MEMTAG_COUNT + 3; // Header + one per tag + total + sbrk left.
+    constexpr int kNumLines   = MEMTAG_COUNT + 4; // Header + one per tag + total + peak + sbrk left.
     constexpr int kPanelWidth = 176;
     constexpr int kPadding    = 4;
 
@@ -172,6 +173,7 @@ void DrawMemUsageOverlay()
     textY += kLineHeight;
 
     char line[64];
+    char unit[PS2_MEMUNIT_STR_SIZE];
     size_t totalBytes = 0;
     for (int i = 0; i < MEMTAG_COUNT; ++i)
     {
@@ -179,18 +181,29 @@ void DrawMemUsageOverlay()
         const size_t tagBytes = PS2_GetStatsForMemTag(tag)->totalBytes;
         totalBytes += tagBytes;
 
-        // PS2_FormatMemoryUnit returns a shared static buffer, so it must be
-        // consumed by this one snprintf before the next iteration reuses it.
         std::snprintf(line, sizeof(line), "%-10s %s",
                       PS2_GetNameForMemTag(tag),
-                      PS2_FormatMemoryUnit(tagBytes, true));
+                      PS2_FormatMemoryUnit(tagBytes, true, unit, sizeof(unit)));
 
         DrawInternalString(textX, textY, line);
         textY += kLineHeight;
     }
 
-    std::snprintf(line, sizeof(line), "%-10s %s", "Total", PS2_FormatMemoryUnit(totalBytes, true));
-    std::snprintf(line, sizeof(line), "%-10s %s", "Sbrk Left", PS2_FormatMemoryUnit(PS2_GetAvailableMemBytes(), true));
+    std::snprintf(line, sizeof(line), "%-10s %s", "Total",
+                  PS2_FormatMemoryUnit(totalBytes, true, unit, sizeof(unit)));
+    DrawInternalString(textX, textY, line);
+    textY += kLineHeight;
+
+    // The high-water of Total, which is the number that decides whether a map
+    // change fits: the transient where the old map is still resident while the new
+    // one loads is long gone by the time anyone reads Total off the screen.
+    std::snprintf(line, sizeof(line), "%-10s %s", "Peak",
+                  PS2_FormatMemoryUnit(PS2_GetPeakMemBytes(), true, unit, sizeof(unit)));
+    DrawInternalString(textX, textY, line);
+    textY += kLineHeight;
+
+    std::snprintf(line, sizeof(line), "%-10s %s", "Sbrk Left",
+                  PS2_FormatMemoryUnit(PS2_GetAvailableMemBytes(), true, unit, sizeof(unit)));
     DrawInternalString(textX, textY, line);
 }
 
@@ -227,17 +240,17 @@ void DrawVramUsageOverlay()
     textY += kLineHeight;
 
     char line[64];
+    char unit[PS2_MEMUNIT_STR_SIZE];
 
-    // PS2_FormatMemoryUnit returns a shared static buffer, so it must be consumed
-    // by this one snprintf before anything else reuses it - hence the two calls
-    // rather than one line with both figures.
     std::snprintf(line, sizeof(line), "%-10s %s", "Used",
-                  PS2_FormatMemoryUnit(static_cast<size_t>(stats.totalWords - stats.freeWords) * 4u, true));
+                  PS2_FormatMemoryUnit(static_cast<size_t>(stats.totalWords - stats.freeWords) * 4u,
+                                       true, unit, sizeof(unit)));
     DrawInternalString(textX, textY, line);
     textY += kLineHeight;
 
     std::snprintf(line, sizeof(line), "%-10s %s", "Total",
-                  PS2_FormatMemoryUnit(static_cast<size_t>(stats.totalWords) * 4u, true));
+                  PS2_FormatMemoryUnit(static_cast<size_t>(stats.totalWords) * 4u,
+                                       true, unit, sizeof(unit)));
     DrawInternalString(textX, textY, line);
     textY += kLineHeight;
 
@@ -285,6 +298,12 @@ void DrawDrawStatsOverlay()
         { "LmStyle", lmStats.styleUpdates   },
         { "LmDyn",   lmStats.dynamicUpdates },
         { "LmRest",  lmStats.restoreUpdates },
+        // Most qwords a per-frame DMA packet has ever held, against the capacity
+        // it was allocated with. The two frame packets are the whole Renderer
+        // memory tag, so a peak far below the capacity means kPacketQwords is
+        // oversized and can be cut.
+        { "DmaPeak", ps2::gs::FramePacketPeakQwords()     },
+        { "DmaCap",  ps2::gs::FramePacketCapacityQwords() },
     };
 
     constexpr int kLineHeight = kGlyphSize + 2; // Matches DrawInternalString spacing.
@@ -382,6 +401,21 @@ void PS2_EndRegistration()
 {
     ps2::mod::EndRegistration();
     ps2::tex::EndRegistration();
+}
+
+// Called by the server just before it builds the next map's collision model,
+// so the old world's hunk and lightmap atlases are not still held through
+// the whole of server init.
+//
+// The atlases go if and only if the world went. ReleaseWorldModel keeps the world
+// when the new map is the one already loaded (a restart, or a savegame load),
+// and then LoadWorldModel finds it in the cache and never needs to reload it.
+void PS2_ReleaseWorldModel(const char * bspName)
+{
+    if (ps2::mod::ReleaseWorldModel(bspName))
+    {
+        ps2::lm::ReleaseAtlases();
+    }
 }
 
 void PS2_SetSky(const char * name, float rotate, vec3_t axis)
@@ -505,6 +539,12 @@ void PS2_EndFrame()
     // fullscreen console Quake forces while disconnected (its batch programs
     // its own z-test). gs::EndFrame() then sends any remaining 2D and flips.
     ps2::test::DrawRotatingCube();
+
+    // Memory smoke test (cvar "ps2_testmaps 1"): loads every stock map in unit
+    // order and logs what each one costs. Draws nothing - it only queues console
+    // commands - but it lives here because this is the one place guaranteed to
+    // be reached once per frame.
+    ps2::test::RunMapCycle();
 #endif // PS2_QUAKE_DEBUG
 
     DrawFpsCounter();

@@ -10,14 +10,15 @@
  * ================================================================================================ */
 
 #include "ps2/common.h"
+#include "ps2/system/heap.h"
 
+#include <cstring> // memset
 #include <dma.h>
 #include <draw.h>
 #include <draw2d.h>
 #include <draw_buffers.h>
 #include <draw_sampling.h>
 #include <gif_tags.h>
-#include <packet.h>
 
 namespace ps2::gs {
 
@@ -30,39 +31,77 @@ public:
     RenderPacket(const RenderPacket &) = delete;
     RenderPacket & operator=(const RenderPacket &) = delete;
 
+    // Slack allocated past m_maxQwords. The libdraw draw_* helpers only report how
+    // much they wrote by returning the advanced cursor, so an emission that runs
+    // past capacity can only be detected after the fact - this is the room that
+    // makes "after the fact" still be inside our own allocation, so Advance() can
+    // halt on it instead of it becoming a heap corruption someone debugs later.
+    // Comfortably larger than any single emission: the biggest EnsureSpace request
+    // in the renderer is 64 qwords, and draw_texture_transfer's whole chain fits
+    // in the 128-qword upload packet.
+    static constexpr int kGuardQwords = 256;
+
     // Allocates the packet buffer. Call once, and not from a static constructor -
     // the heap must already be up.
     void Init(int maxQwords)
     {
-        // TODO: Can we also use packet2 lib (-lpacket2) here and get rid of old packet lib (-lpacket) dependency?
-        PS2_AssertMsg(m_packet == nullptr, "RenderPacket::Init called twice!");
-        m_packet = packet_init(maxQwords, PACKET_NORMAL);
-        PS2_AssertMsg(m_packet != nullptr, "packet_init failed!");
-        m_ptr = m_packet->data;
+        PS2_AssertMsg(m_base == nullptr, "RenderPacket::Init called twice!");
+        PS2_Assert(maxQwords > 0);
 
-        // packet_init mallocs the header struct plus the qword buffer; neither goes
-        // through the tagged allocators, so account for them here. Never freed.
-        PS2_TagsAddMem(MEMTAG_RENDERER, sizeof(packet_t) + (static_cast<size_t>(maxQwords) * sizeof(qword_t)));
+        // This used to be libpacket's packet_init(), which was the last thing in
+        // the link still pulling in -lpacket - and it was only ever used as an
+        // allocator: everything below writes through the cursor with libdraw's
+        // draw_* helpers, never a packet_* call. Allocating directly drops the
+        // dependency and puts the buffer behind the tagged allocator, so it shows
+        // up in the memory overlay instead of needing a hand-written TagsAddMem.
+        // Same shape packet_init produced: 64-byte (cache line) aligned, zeroed.
+        const size_t sizeBytes = static_cast<size_t>(maxQwords + kGuardQwords) * sizeof(qword_t);
+
+        m_base = static_cast<qword_t *>(PS2_MemAllocAligned(64, sizeBytes, MEMTAG_RENDERER));
+        std::memset(m_base, 0, sizeBytes);
+
+        m_maxQwords = maxQwords;
+        m_ptr       = m_base;
     }
 
-    // Rewinds the write cursor to the start of the buffer.
+    // Rewinds the write cursor to the start of the buffer, banking what the cycle
+    // just about to be discarded reached.
     void Reset()
     {
-        m_ptr = m_packet->data;
+        const int used = QwordCount();
+        if (used > m_peakQwords) { m_peakQwords = used; }
+        m_ptr = m_base;
     }
 
     // Qwords written since the last Reset().
     int QwordCount() const
     {
-        return static_cast<int>(m_ptr - m_packet->data);
+        return static_cast<int>(m_ptr - m_base);
     }
 
-    // Halt visibly if the next emission could overrun the buffer (silent overflow
-    // corrupts the heap). 'qwords' is a safe upper bound for what comes next.
+    // The most qwords this packet has ever held. Reset() banks it, and the current
+    // cycle is folded in here so a packet that is filled but never Reset (the clear
+    // and texture-upload chains) still reports honestly. This is what the capacity
+    // passed to Init() should be sized against - see kPacketQwords in gs.cpp.
+    int PeakQwords() const
+    {
+        const int used = QwordCount();
+        return (used > m_peakQwords) ? used : m_peakQwords;
+    }
+
+    int Capacity() const { return m_maxQwords; }
+
+    // Halt visibly if the next emission would overrun the buffer. 'qwords' is a
+    // safe upper bound for what comes next. Sys_Error, not PS2_Assert. Asserts
+    // compile out of the release build and an overflow here would stomp memory.
     void EnsureSpace(int qwords) const
     {
-        PS2_AssertMsg(QwordCount() + qwords <= static_cast<int>(m_packet->qwords),
-                      "Render packet overflow! Bump the packet size.");
+        if (QwordCount() + qwords > m_maxQwords) [[unlikely]]
+        {
+            Sys_Error("Render packet overflow: %d qwords in use + %d needed exceeds "
+                      "the %d capacity. Raise the size passed to Init().",
+                      QwordCount(), qwords, m_maxQwords);
+        }
     }
 
     // --------------------------------------------------------------------------------------------
@@ -71,12 +110,12 @@ public:
 
     void SetupEnvironment(int context, framebuffer_t & frame, zbuffer_t & zbuffer)
     {
-        m_ptr = draw_setup_environment(m_ptr, context, &frame, &zbuffer);
+        Advance(draw_setup_environment(m_ptr, context, &frame, &zbuffer));
     }
 
     void TextureWrapping(int context, texwrap_t & wrap)
     {
-        m_ptr = draw_texture_wrapping(m_ptr, context, &wrap);
+        Advance(draw_texture_wrapping(m_ptr, context, &wrap));
     }
 
     // Pixel tests for subsequent draws. Disable switches the z-test to ALLPASS
@@ -84,17 +123,17 @@ public:
     // environment's alpha test; Enable restores the z-buffer's test method.
     void DisableTests(int context, zbuffer_t & zbuffer)
     {
-        m_ptr = draw_disable_tests(m_ptr, context, &zbuffer);
+        Advance(draw_disable_tests(m_ptr, context, &zbuffer));
     }
 
     void EnableTests(int context, zbuffer_t & zbuffer)
     {
-        m_ptr = draw_enable_tests(m_ptr, context, &zbuffer);
+        Advance(draw_enable_tests(m_ptr, context, &zbuffer));
     }
 
     void Clear(int context, float x, float y, float width, float height, int r, int g, int b)
     {
-        m_ptr = draw_clear(m_ptr, context, x, y, width, height, r, g, b);
+        Advance(draw_clear(m_ptr, context, x, y, width, height, r, g, b));
     }
 
     // Writes one GS register directly, as a GIF tag + A+D data pair. For the
@@ -102,6 +141,8 @@ public:
     // write mask, which draw_enable/disable_tests never program).
     void SetRegister(u64 reg, u64 data)
     {
+        EnsureSpace(2); // Unlike the draw_* helpers, this one knows its own size.
+
         PACK_GIFTAG(m_ptr, GIF_SET_TAG(1, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
         ++m_ptr;
         PACK_GIFTAG(m_ptr, data, reg);
@@ -110,27 +151,27 @@ public:
 
     void RectFilled(int context, rect_t & rect)
     {
-        m_ptr = draw_rect_filled(m_ptr, context, &rect);
+        Advance(draw_rect_filled(m_ptr, context, &rect));
     }
 
     void RectFilledStrips(int context, rect_t & rect)
     {
-        m_ptr = draw_rect_filled_strips(m_ptr, context, &rect);
+        Advance(draw_rect_filled_strips(m_ptr, context, &rect));
     }
 
     void RectTextured(int context, texrect_t & rect)
     {
-        m_ptr = draw_rect_textured(m_ptr, context, &rect);
+        Advance(draw_rect_textured(m_ptr, context, &rect));
     }
 
     void TextureSampling(int context, lod_t & lod)
     {
-        m_ptr = draw_texture_sampling(m_ptr, context, &lod);
+        Advance(draw_texture_sampling(m_ptr, context, &lod));
     }
 
     void TextureBuffer(int context, texbuffer_t & texbuf, clutbuffer_t & clut)
     {
-        m_ptr = draw_texturebuffer(m_ptr, context, &texbuf, &clut);
+        Advance(draw_texturebuffer(m_ptr, context, &texbuf, &clut));
     }
 
     // Emits the DMA chain tags for a texture upload; the pixels are referenced
@@ -141,19 +182,19 @@ public:
     void TextureTransfer(const void * pixels, int width, int height, int psm,
                          vram::Address vramAddr, int destWidth)
     {
-        m_ptr = draw_texture_transfer(m_ptr, const_cast<void *>(pixels),
-                                      width, height, psm, static_cast<int>(vramAddr), destWidth);
+        Advance(draw_texture_transfer(m_ptr, const_cast<void *>(pixels),
+                                      width, height, psm, static_cast<int>(vramAddr), destWidth));
     }
 
     void TextureFlush()
     {
-        m_ptr = draw_texture_flush(m_ptr);
+        Advance(draw_texture_flush(m_ptr));
     }
 
     // Appends a FINISH event so draw_wait_finish() can tell when the GS is done.
     void Finish()
     {
-        m_ptr = draw_finish(m_ptr);
+        Advance(draw_finish(m_ptr));
     }
 
     // Wait until FINISH event occurs.
@@ -169,13 +210,13 @@ public:
     // Sends the packet contents as one normal transfer.
     void SendNormal()
     {
-        dma_channel_send_normal(DMA_CHANNEL_GIF, m_packet->data, QwordCount(), 0, 0);
+        dma_channel_send_normal(DMA_CHANNEL_GIF, m_base, QwordCount(), 0, 0);
     }
 
     // Sends the packet as a source-chain transfer (the packet holds the chain tags).
     void SendChain()
     {
-        dma_channel_send_chain(DMA_CHANNEL_GIF, m_packet->data, QwordCount(), 0, 0);
+        dma_channel_send_chain(DMA_CHANNEL_GIF, m_base, QwordCount(), 0, 0);
     }
 
     // Waits until channel is usable based on coprocessor status.
@@ -186,8 +227,27 @@ public:
     }
 
 private:
-    packet_t * m_packet = nullptr; // ps2sdk packet; owns the qword buffer
-    qword_t *  m_ptr    = nullptr; // write cursor, advanced by every append
+    // Takes the cursor a draw_* helper returned and halts if the emission went
+    // past capacity. Every wrapper above goes through here, so a caller that
+    // forgets EnsureSpace - or one whose upper bound turns out to be wrong - still
+    // gets a named error rather than corrupting the heap. kGuardQwords is what
+    // keeps the write that tripped this inside our own allocation.
+    void Advance(qword_t * const newPtr)
+    {
+        m_ptr = newPtr;
+
+        if (QwordCount() > m_maxQwords) [[unlikely]]
+        {
+            Sys_Error("Render packet overflow: emission ran to %d qwords, past the %d "
+                      "capacity (into the %d qword guard). Raise the size passed to Init().",
+                      QwordCount(), m_maxQwords, kGuardQwords);
+        }
+    }
+
+    qword_t * m_base       = nullptr; // owns the qword buffer
+    qword_t * m_ptr        = nullptr; // write cursor, advanced by every append
+    int       m_maxQwords  = 0;       // capacity of m_base, for EnsureSpace
+    int       m_peakQwords = 0;       // high-water of QwordCount, for sizing m_maxQwords
 };
 
 } // namespace ps2::gs

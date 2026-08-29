@@ -149,6 +149,11 @@ sfxcache_t * S_LoadSound(sfx_t * s);
 void S_IssuePlaysound(playsound_t * ps);
 void S_PaintChannels(int endtime);
 
+// [PS2_QUAKE]: Releases a decoded sound. The cache is not zone memory - it is tagged
+// MEMTAG_AUDIO so the memory overlay can show it as its own pool - so it must
+// be released with this rather than Z_Free. Null-safe.
+void S_FreeSoundCache(sfxcache_t * sc);
+
 // picks a channel based on priorities, empty slots, number of channels
 channel_t * S_PickChannel(int entnum, int entchannel);
 

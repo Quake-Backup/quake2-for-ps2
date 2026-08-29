@@ -81,7 +81,7 @@ void ExecIopModule(const char * name, void * image, u32 sizeBytes)
 
     // Negative id = the load itself failed; result 1 = the module's _start
     // bailed out (NO_RESIDENT_END) - either way the driver is not running.
-    if (id < 0 || moduleResult == 1)
+    if (id < 0 || moduleResult == 1) [[unlikely]]
     {
         Sys_Error("IOP boot: module '%s' failed (id %d, result %d)", name, id, moduleResult);
     }

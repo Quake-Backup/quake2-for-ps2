@@ -154,6 +154,16 @@ typedef struct
     void (*SetSky)(const char * name, float rotate, vec3_t axis);
     void (*EndRegistration)(void);
 
+    // [PS2_QUAKE] 2026-08-29
+    // Not part of id's original refexport_t. Drops the resident world model (and anything
+    // whose lifetime is tied to it, like lightmaps) unless it is already the map
+    // named by 'bsp_name' - "maps/<level>.bsp", or "" to drop it unconditionally.
+    // BeginRegistration frees the old world anyway, but only once the client gets
+    // as far as CL_PrepRefresh; on a 32 MB console the several megabytes it holds
+    // in the meantime are what makes the *next* map's server init run out of
+    // memory. See SV_SpawnServer, which is the only caller.
+    void (*ReleaseWorldModel)(const char * bsp_name);
+
     // renders a 3D game view.
     void (*RenderFrame)(refdef_t * fd);
 

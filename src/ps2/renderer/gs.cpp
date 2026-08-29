@@ -56,9 +56,21 @@ namespace {
 constexpr int kRenderWidth  = 640;
 constexpr int kRenderHeight = 448;
 
-// Per-frame packet headroom. Worst observed 2D load is a full console of text
-// (~2200 glyphs at 4 qwords each); 32K qwords (512 KB) leaves ample margin.
-constexpr int kPacketQwords = 32768;
+// Per-frame packet headroom, in qwords. There are two of these (double buffered)
+// and they are the whole MEMTAG_RENDERER budget, so the size is worth getting
+// right rather than rounding up out of caution.
+//
+// Was 32K (512 KB each, 1 MB total), chosen against an estimate: a full console of
+// text is ~2200 glyphs at 4 qwords. Measured instead - the DmaPeak counter in the
+// draw-stats overlay reports RenderPacket::PeakQwords() - the real high-water
+// across every stock map never passed 10,000. 15K keeps better than 50% headroom
+// on that and gives back ~512 KB, which on a 32 MB console is most of a map's
+// lightmap atlases.
+//
+// Overflow is not silent if this is ever too small: RenderPacket::EnsureSpace and
+// the post-emission check in RenderPacket::Advance both Sys_Error naming this
+// constant, in release as well as debug.
+constexpr int kPacketQwords = 15 * 1024;
 
 // Scratch packet for synchronous texture uploads (DMA chain tags only; the
 // pixel data is referenced in place).
@@ -215,6 +227,18 @@ void SetClearColor(u8 r, u8 g, u8 b)
     s_clearColor[0] = r;
     s_clearColor[1] = g;
     s_clearColor[2] = b;
+}
+
+int FramePacketPeakQwords()
+{
+    const int a = s_framePacket[0].PeakQwords();
+    const int b = s_framePacket[1].PeakQwords();
+    return (a > b) ? a : b;
+}
+
+int FramePacketCapacityQwords()
+{
+    return kPacketQwords;
 }
 
 // Sends one or two CLUTs to their fixed VRAM addresses and waits for the
@@ -603,7 +627,7 @@ static vram::Address AllocateVramFor(const tex::Texture & texture, int sizeWords
         s_vramReuseHazard |= evicted;
     }
 
-    if (addr == vram::Address::Invalid)
+    if (addr == vram::Address::Invalid) [[unlikely]]
     {
         vram::DumpAllBlocks();
         Sys_Error("GS VRAM allocation failed for '%s' (%d KB) even after draining and defragmenting!",
@@ -652,7 +676,7 @@ void EnsureTextureResident(const tex::Texture & texture)
         // Nothing below can service a texture bigger than the whole heap, and
         // trying would evict the entire working set first and then report it as
         // a working-set problem. Say what is actually wrong instead.
-        if (sizeWords > vram::HeapTotalWords())
+        if (sizeWords > vram::HeapTotalWords()) [[unlikely]]
         {
             Sys_Error("Texture '%s' (%dx%d) needs %d KB of GS VRAM, but the whole texture heap is only %d KB!",
                       texture.name, texture.width, texture.height,
@@ -697,8 +721,10 @@ void EnsureTextureResident(const tex::Texture & texture)
     }
 
     // Synchronous DMA upload; the chain references the pixels in EE RAM.
-    // TODO: TextureTransfer has no EnsureSpace - revisit the 128-qword scratch
-    // packet if large streamed assets ever exceed its chain-tag headroom.
+    // TextureTransfer cannot EnsureSpace up front - only draw_texture_transfer
+    // knows how many chain tags a given texture needs - but RenderPacket::Advance
+    // checks afterwards and Sys_Errors, so a texture that outgrows this 128-qword
+    // scratch packet says so instead of scribbling past it.
     RenderPacket & pkt = s_texUploadPacket;
     pkt.Reset();
     pkt.TextureTransfer(texture.pixels, texture.width, texture.height, psm, texture.vramAddr, stride);

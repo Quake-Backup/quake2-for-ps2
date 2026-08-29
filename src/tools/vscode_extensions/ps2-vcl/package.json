@@ -3,7 +3,7 @@
     "displayName": "PS2 VCL/VU Assembly",
     "description": "Syntax highlighting for PlayStation 2 VU microprograms written in VCL (openvcl/vclpp) and raw VU assembly (.vsm).",
     "version": "0.1.0",
-    "publisher": "guilherme",
+    "publisher": "PS2_QUAKE",
     "engines": {
         "vscode": "^1.75.0"
     },

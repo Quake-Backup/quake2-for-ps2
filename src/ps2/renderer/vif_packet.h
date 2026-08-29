@@ -62,12 +62,24 @@ public:
         return static_cast<int>(packet2_get_qw_count(m_packet));
     }
 
-    // Halt visibly if the next emission could overrun the buffer (silent overflow
-    // corrupts the heap). 'qwords' is a safe upper bound for what comes next.
+    // Halt visibly if the next emission would overrun the buffer. 'qwords' is a
+    // safe upper bound for what comes next.
+    //
+    // Sys_Error rather than PS2_Assert, for the same reason as
+    // RenderPacket::EnsureSpace: an assert compiles out of the release build, and
+    // a silent overflow writes DMA tags over whatever came next in the heap, which
+    // then fails somewhere unrelated. Unlike RenderPacket this has no guard region
+    // to fall back on - packet2 owns its buffer - so the pre-check is the only
+    // line of defence, which is exactly why it has to be live in release. Every
+    // emitter in vu1.cpp calls this before appending a chunk.
     void EnsureSpace(int qwords) const
     {
-        PS2_AssertMsg(QwordCount() + qwords <= m_maxQwords,
-                      "VIF packet overflow! Bump the packet size.");
+        if (QwordCount() + qwords > m_maxQwords) [[unlikely]]
+        {
+            Sys_Error("VIF packet overflow: %d qwords in use + %d needed exceeds the "
+                      "%d capacity. Raise the size passed to Init().",
+                      QwordCount(), qwords, m_maxQwords);
+        }
     }
 
     // --------------------------------------------------------------------------------------------

@@ -127,18 +127,269 @@ private:
     u32  m_capacity = 0;
 };
 
+// A polygon's three arrays (the ModelPoly, its vertices, its triangles) are
+// allocated as ONE hunk block rather than three. The hunk rounds every allocation
+// up to kHunkAlign, and a typical 5-edge face has 3 triangles - 9 bytes rounded to
+// 16, wasting more than it stores. Sizer and filler must agree to the byte (see
+// the PS2_Assert at the end of LoadBrushModel), so the total lives in one place
+// and both call it.
+constexpr u32 PolyBlockBytes(const int numVerts, const int numTriangles)
+{
+    return AlignUp(static_cast<u32>(sizeof(ModelPoly))
+                   + (static_cast<u32>(numVerts) * static_cast<u32>(sizeof(PolyVertex)))
+                   + (static_cast<u32>(numTriangles) * static_cast<u32>(sizeof(ModelTriangle))),
+                   kHunkAlign);
+}
+
+// Carves one such block. The block base is kHunkAlign-aligned and ModelPoly and
+// PolyVertex are both 4-byte-aligned types laid out at multiples of 4 from it,
+// with the byte-sized triangles last, so every member lands legally aligned.
+ModelPoly * AllocPolyBlock(HunkAllocator & hunk, const int numVerts, const int numTriangles)
+{
+    void * const block = hunk.Alloc(PolyBlockBytes(numVerts, numTriangles));
+    u8 * const bytes   = static_cast<u8 *>(block);
+
+    ModelPoly * const poly = static_cast<ModelPoly *>(block);
+    void * const vertsPtr  = bytes + sizeof(ModelPoly);
+
+    poly->numVerts  = numVerts;
+    poly->vertexes  = static_cast<PolyVertex *>(vertsPtr);
+    poly->triangles = nullptr;
+
+    if (numTriangles > 0)
+    {
+        void * const trisPtr = bytes + sizeof(ModelPoly)
+                             + (static_cast<u32>(numVerts) * sizeof(PolyVertex));
+        poly->triangles = static_cast<ModelTriangle *>(trisPtr);
+    }
+
+    return poly;
+}
+
+// The five lumps the hunk pre-pass has to walk together to measure the warp-face
+// subdivision. Everything else it needs comes from the header's lump lengths.
+struct PrePassLumps
+{
+    const void * faces;
+    const void * texInfo;
+    const void * surfEdges;
+    const void * edges;
+    const void * vertexes;
+};
+
+// ------------------------------------------------------------------------------------------------
+// Streamed BSP reader
+//
+// A world .bsp is 2-3 MB and the hunk built from it is another 4-7 MB, so reading
+// the whole file with FS_LoadFile meant both were resident at once - over 10 MB of
+// transient on the biggest map. Worse, the file buffer got carved out of the hole
+// the *previous* world hunk had just freed, splitting it in two and leaving neither
+// half big enough for the new one.
+//
+// So lumps are read one at a time through a single scratch buffer instead:
+//
+//   * one allocation, one free, reused for every lump in between - per-lump
+//     alloc/free churn would fragment the very hole this exists to protect;
+//   * sized from the header, which carries all 19 lump lengths, so it is exact
+//     per map and cannot silently under-run on a custom one;
+//   * the two lumps copied verbatim (lighting, visibility) bypass it entirely and
+//     are read straight into the hunk - lighting alone reaches 1.4 MB and would
+//     otherwise dominate the buffer.
+//
+// The pre-pass that sizes the hunk needs five lumps at once (see PrePassLumps), so
+// the buffer holds those together; every later lump is transformed one at a time,
+// each cross-reference resolving against hunk data that is already built. Those
+// five are therefore read twice, once to measure and once to fill - a little extra
+// I/O in exchange for not holding the file.
+// ------------------------------------------------------------------------------------------------
+
+class BspFileReader final
+{
+public:
+    BspFileReader() = default;
+    BspFileReader(const BspFileReader &) = delete;
+    BspFileReader & operator=(const BspFileReader &) = delete;
+
+    ~BspFileReader() { Close(); }
+
+    // Opens the file, validates the header and allocates the scratch buffer.
+    bool Open(const char * const name)
+    {
+        if (FS_FOpenFile(name, &m_file) < 0 || m_file == nullptr)
+        {
+            Com_Printf("ERROR: LoadBrushModel: Unable to open '%s'!\n", name);
+            return false;
+        }
+
+        // Lump offsets are relative to the start of the .bsp, which inside a pak
+        // is not the start of the stream - FS_FOpenFile leaves us seeked there.
+        m_baseOffset = std::ftell(m_file);
+        if (m_baseOffset < 0)
+        {
+            Com_Printf("ERROR: LoadBrushModel: Cannot tell position in '%s'!\n", name);
+            Close();
+            return false;
+        }
+
+        FS_Read(&m_header, static_cast<int>(sizeof(m_header)), m_file);
+
+        if (m_header.ident != IDBSPHEADER)
+        {
+            Com_Printf("ERROR: LoadBrushModel: '%s' has bad file ident!\n", name);
+            Close();
+            return false;
+        }
+        if (m_header.version != BSPVERSION)
+        {
+            Com_Printf("ERROR: LoadBrushModel: '%s' has wrong version (%i should be %i)\n",
+                       name, m_header.version, BSPVERSION);
+            Close();
+            return false;
+        }
+
+        for (const auto & l : m_header.lumps)
+        {
+            if (l.fileofs < 0 || l.filelen < 0)
+            {
+                Com_Printf("ERROR: LoadBrushModel: '%s' has a negative lump offset/length!\n", name);
+                Close();
+                return false;
+            }
+        }
+
+        m_scratchSize = RequiredScratchBytes();
+        m_scratch = static_cast<u8 *>(PS2_MemAllocAligned(kHunkAlign, m_scratchSize, MEMTAG_MDL_WORLD));
+        return true;
+    }
+
+    void Close()
+    {
+        if (m_scratch != nullptr)
+        {
+            PS2_MemFree(m_scratch, m_scratchSize, MEMTAG_MDL_WORLD);
+            m_scratch     = nullptr;
+            m_scratchSize = 0;
+        }
+        if (m_file != nullptr)
+        {
+            FS_FCloseFile(m_file);
+            m_file = nullptr;
+        }
+    }
+
+    const dheader_t & Header() const { return m_header; }
+
+    // Reads one lump into the scratch buffer at 'atOffset' and returns it. The
+    // result stays valid until another read overlaps it.
+    const void * ReadLump(const int lumpIndex, const u32 atOffset = 0)
+    {
+        const lump_t & l = m_header.lumps[lumpIndex];
+        const u32 len    = static_cast<u32>(l.filelen);
+
+        // The scratch was sized from these same lengths, so overflowing it means
+        // the header changed under us or the sizing rule below is wrong.
+        PS2_AssertMsg(atOffset + len <= m_scratchSize, "BSP lump overruns the scratch buffer!");
+
+        u8 * const dest = m_scratch + atOffset;
+        ReadAt(l, dest);
+        return dest;
+    }
+
+    // Reads a lump straight to 'dest', bypassing the scratch. For the lumps the
+    // loaders copy verbatim into the hunk.
+    void ReadLumpInto(const int lumpIndex, void * const dest)
+    {
+        ReadAt(m_header.lumps[lumpIndex], dest);
+    }
+
+    // Fills 'out' with the five pre-pass lumps packed back to back in scratch.
+    PrePassLumps ReadPrePassLumps()
+    {
+        PrePassLumps out{};
+        u32 ofs = 0;
+        for (int i = 0; i < kNumPrePassLumps; ++i)
+        {
+            const int lump = kPrePassLumps[i];
+            const void * const p = ReadLump(lump, ofs);
+            ofs += AlignUp(static_cast<u32>(m_header.lumps[lump].filelen), kHunkAlign);
+
+            switch (lump)
+            {
+            case LUMP_FACES     : out.faces     = p; break;
+            case LUMP_TEXINFO   : out.texInfo   = p; break;
+            case LUMP_SURFEDGES : out.surfEdges = p; break;
+            case LUMP_EDGES     : out.edges     = p; break;
+            case LUMP_VERTEXES  : out.vertexes  = p; break;
+            default             : break;
+            }
+        }
+        return out;
+    }
+
+private:
+    void ReadAt(const lump_t & l, void * const dest)
+    {
+        if (l.filelen <= 0)
+        {
+            return;
+        }
+        std::fseek(m_file, m_baseOffset + l.fileofs, SEEK_SET);
+        FS_Read(dest, l.filelen, m_file);
+    }
+
+    // The five the pre-pass walks together, and every lump read through the
+    // scratch afterwards. Lighting and visibility are absent from both: they go
+    // straight into the hunk.
+    static constexpr int kNumPrePassLumps = 5;
+    static constexpr int kPrePassLumps[kNumPrePassLumps] = {
+        LUMP_FACES, LUMP_TEXINFO, LUMP_SURFEDGES, LUMP_EDGES, LUMP_VERTEXES
+    };
+    static constexpr int kStreamedLumps[] = {
+        LUMP_FACES, LUMP_TEXINFO, LUMP_SURFEDGES, LUMP_EDGES, LUMP_VERTEXES,
+        LUMP_PLANES, LUMP_LEAFFACES, LUMP_LEAFS, LUMP_NODES, LUMP_MODELS
+    };
+
+    // Big enough for the pre-pass set held together, and for the largest single
+    // lump transformed after it - whichever is larger. Measured over the stock
+    // maps this peaks at ~0.91 MB (lab.bsp), against a 3.1 MB whole-file read.
+    u32 RequiredScratchBytes() const
+    {
+        u32 prePassTotal = 0;
+        for (int i = 0; i < kNumPrePassLumps; ++i)
+        {
+            prePassTotal += AlignUp(static_cast<u32>(m_header.lumps[kPrePassLumps[i]].filelen), kHunkAlign);
+        }
+
+        u32 largestSingle = 0;
+        for (const int lump : kStreamedLumps)
+        {
+            const u32 len = AlignUp(static_cast<u32>(m_header.lumps[lump].filelen), kHunkAlign);
+            if (len > largestSingle) { largestSingle = len; }
+        }
+
+        const u32 needed = (prePassTotal > largestSingle) ? prePassTotal : largestSingle;
+        return (needed != 0u) ? needed : kHunkAlign; // never a zero-size allocation
+    }
+
+    FILE *    m_file        = nullptr;
+    long      m_baseOffset  = 0;
+    dheader_t m_header      = {};
+    u8 *      m_scratch     = nullptr;
+    u32       m_scratchSize = 0;
+};
+
 // ------------------------------------------------------------------------------------------------
 // Small geometry helpers
 // ------------------------------------------------------------------------------------------------
 
-// Points into the model file data at a lump's offset. Cast through void* so the
-// higher-alignment result pointer doesn't trip -Wcast-align (the heap buffer is
-// aligned well past any of these structs).
+// Views a lump's bytes as its element type. The loaders are handed the lump's own
+// buffer rather than the whole file (see BspFileReader), so this is a plain cast -
+// through void* so the higher-alignment result doesn't trip -Wcast-align (the
+// scratch buffer is aligned well past any of these structs).
 template<typename T>
-inline const T * LumpData(const void * const fileData, const lump_t & l)
+inline const T * LumpAs(const void * const lumpData)
 {
-    const void * const p = static_cast<const u8 *>(fileData) + l.fileofs;
-    return static_cast<const T *>(p);
+    return static_cast<const T *>(lumpData);
 }
 
 // Element count of a lump; used by the loaders after the pre-pass has validated
@@ -186,9 +437,9 @@ inline const Vec3 & EdgeVertex(const ModelInstance & mdl, int surfEdgeIndex)
 // Brush model lumps
 // ------------------------------------------------------------------------------------------------
 
-void LoadVertexes(ModelInstance & mdl, HunkAllocator & hunk, const void * const fileData, const lump_t & l)
+void LoadVertexes(ModelInstance & mdl, HunkAllocator & hunk, const void * const lumpData, const lump_t & l)
 {
-    const auto * in = LumpData<dvertex_t>(fileData, l);
+    const auto * in = LumpAs<dvertex_t>(lumpData);
     const int count = LumpElemCount<dvertex_t>(l);
 
     ModelVertex * out = hunk.AllocArray<ModelVertex>(count);
@@ -201,9 +452,9 @@ void LoadVertexes(ModelInstance & mdl, HunkAllocator & hunk, const void * const 
     }
 }
 
-void LoadEdges(ModelInstance & mdl, HunkAllocator & hunk, const void * const fileData, const lump_t & l)
+void LoadEdges(ModelInstance & mdl, HunkAllocator & hunk, const void * const lumpData, const lump_t & l)
 {
-    const auto * in = LumpData<dedge_t>(fileData, l);
+    const auto * in = LumpAs<dedge_t>(lumpData);
     const int count = LumpElemCount<dedge_t>(l);
 
     // One extra sentinel edge, matching ref_gl.
@@ -218,9 +469,9 @@ void LoadEdges(ModelInstance & mdl, HunkAllocator & hunk, const void * const fil
     }
 }
 
-void LoadSurfEdges(ModelInstance & mdl, HunkAllocator & hunk, const void * const fileData, const lump_t & l)
+void LoadSurfEdges(ModelInstance & mdl, HunkAllocator & hunk, const void * const lumpData, const lump_t & l)
 {
-    const int * in  = LumpData<int>(fileData, l);
+    const int * in  = LumpAs<int>(lumpData);
     const int count = LumpElemCount<int>(l);
 
     int * out = hunk.AllocArray<int>(count);
@@ -230,7 +481,10 @@ void LoadSurfEdges(ModelInstance & mdl, HunkAllocator & hunk, const void * const
     std::memcpy(out, in, static_cast<size_t>(count) * sizeof(int));
 }
 
-void LoadLighting(ModelInstance & mdl, HunkAllocator & hunk, const void * const fileData, const lump_t & l)
+// Lighting is copied byte-for-byte, so it is read from the file straight into its
+// hunk slot - it never passes through the scratch buffer. It is the largest lump
+// on most maps (1.4 MB on space.bsp) and would otherwise size the scratch alone.
+void LoadLightingInto(ModelInstance & mdl, HunkAllocator & hunk, BspFileReader & bsp, const lump_t & l)
 {
     if (l.filelen <= 0)
     {
@@ -239,12 +493,12 @@ void LoadLighting(ModelInstance & mdl, HunkAllocator & hunk, const void * const 
     }
 
     mdl.lightData = hunk.AllocArray<u8>(l.filelen);
-    std::memcpy(mdl.lightData, LumpData<u8>(fileData, l), static_cast<size_t>(l.filelen));
+    bsp.ReadLumpInto(LUMP_LIGHTING, mdl.lightData);
 }
 
-void LoadPlanes(ModelInstance & mdl, HunkAllocator & hunk, const void * const fileData, const lump_t & l)
+void LoadPlanes(ModelInstance & mdl, HunkAllocator & hunk, const void * const lumpData, const lump_t & l)
 {
-    const auto * in = LumpData<dplane_t>(fileData, l);
+    const auto * in = LumpAs<dplane_t>(lumpData);
     const int count = LumpElemCount<dplane_t>(l);
 
     // Twice the count, matching ref_gl (the extra slots back opposite planes).
@@ -269,9 +523,9 @@ void LoadPlanes(ModelInstance & mdl, HunkAllocator & hunk, const void * const fi
     }
 }
 
-void LoadTexInfo(ModelInstance & mdl, HunkAllocator & hunk, const void * const fileData, const lump_t & l)
+void LoadTexInfo(ModelInstance & mdl, HunkAllocator & hunk, const void * const lumpData, const lump_t & l)
 {
-    const auto * in = LumpData<textureinfo_t>(fileData, l);
+    const auto * in = LumpAs<textureinfo_t>(lumpData);
     const int count = LumpElemCount<textureinfo_t>(l);
 
     ModelTexInfo * out = hunk.AllocArray<ModelTexInfo>(count);
@@ -470,9 +724,9 @@ void TriangulatePolygon(ModelPoly & poly)
             Com_Printf("ERROR: TriangulatePolygon: Triangle list overflowed!\n");
             return;
         }
-        trisPtr->vertexes[0] = static_cast<u16>(v0);
-        trisPtr->vertexes[1] = static_cast<u16>(v1);
-        trisPtr->vertexes[2] = static_cast<u16>(v2);
+        trisPtr->vertexes[0] = static_cast<u8>(v0);
+        trisPtr->vertexes[1] = static_cast<u8>(v1);
+        trisPtr->vertexes[2] = static_cast<u8>(v2);
         ++trisPtr;
         ++triesDone;
     };
@@ -561,13 +815,9 @@ void BuildPolygonFromSurface(ModelInstance & mdl, HunkAllocator & hunk, ModelSur
     const int numVerts     = surf.numEdges;
     const int numTriangles = (numVerts >= 3) ? (numVerts - 2) : 0;
 
-    ModelPoly * poly = hunk.AllocArray<ModelPoly>(1);
-    poly->next  = surf.polys;
-    surf.polys  = poly;
-
-    poly->numVerts  = numVerts;
-    poly->vertexes  = hunk.AllocArray<PolyVertex>(numVerts);
-    poly->triangles = hunk.AllocArray<ModelTriangle>(numTriangles);
+    ModelPoly * poly = AllocPolyBlock(hunk, numVerts, numTriangles);
+    poly->next = surf.polys;
+    surf.polys = poly;
 
     const ModelTexInfo * const tex = surf.texInfo;
     const float texW = static_cast<float>(tex->texture->width);
@@ -634,7 +884,7 @@ void BoundPoly(int numVerts, const Vec3 * verts, Vec3 & mins, Vec3 & maxs)
 template<typename EmitFn>
 void SubdividePolygon(int numVerts, const Vec3 * verts, EmitFn emit)
 {
-    if (numVerts > kSubdivideSize - 4)
+    if (numVerts > kSubdivideSize - 4) [[unlikely]]
     {
         Sys_Error("SubdividePolygon: Too many verts (%i)", numVerts);
     }
@@ -717,7 +967,7 @@ void SubdivideSurface(ModelInstance & mdl, HunkAllocator & hunk, ModelSurface & 
 {
     Vec3 verts[kSubdivideSize];
     const int count = GatherSurfaceVerts(mdl, surf, verts);
-    if (count < 0)
+    if (count < 0) [[unlikely]]
     {
         Sys_Error("SubdivideSurface: Max verts exceeded!");
     }
@@ -726,14 +976,12 @@ void SubdivideSurface(ModelInstance & mdl, HunkAllocator & hunk, ModelSurface & 
 
     SubdividePolygon(count, verts, [&](int numLeafVerts, const Vec3 * leafVerts)
     {
-        ModelPoly * poly = hunk.AllocArray<ModelPoly>(1);
-        poly->next  = surf.polys;
-        surf.polys  = poly;
-
         // +2: a center point (for the warp fan) plus a duplicate of the first.
-        poly->numVerts  = numLeafVerts + 2;
-        poly->vertexes  = hunk.AllocArray<PolyVertex>(numLeafVerts + 2);
-        poly->triangles = nullptr; // Warped polygons are drawn as fans, not triangulated.
+        // No triangles: warped polygons are drawn as fans, not triangulated,
+        // so AllocPolyBlock leaves poly->triangles null.
+        ModelPoly * poly = AllocPolyBlock(hunk, numLeafVerts + 2, 0);
+        poly->next = surf.polys;
+        surf.polys = poly;
 
         Vec3 total    = { 0.0f, 0.0f, 0.0f };
         float totalS  = 0.0f;
@@ -761,11 +1009,11 @@ void SubdivideSurface(ModelInstance & mdl, HunkAllocator & hunk, ModelSurface & 
     });
 }
 
-void LoadFaces(ModelInstance & mdl, HunkAllocator & hunk, const void * const fileData, const lump_t & l)
+void LoadFaces(ModelInstance & mdl, HunkAllocator & hunk, const void * const lumpData, const lump_t & l)
 {
     PS2_Assert(mdl.planes != nullptr && mdl.texInfos != nullptr); // Load these first.
 
-    const auto * in = LumpData<dface_t>(fileData, l);
+    const auto * in = LumpAs<dface_t>(lumpData);
     const int count = LumpElemCount<dface_t>(l);
 
     ModelSurface * out = hunk.AllocArray<ModelSurface>(count);
@@ -793,7 +1041,7 @@ void LoadFaces(ModelInstance & mdl, HunkAllocator & hunk, const void * const fil
         surf.plane = mdl.planes + in[surfNum].planenum;
 
         const int texNum = in[surfNum].texinfo;
-        if (texNum < 0 || texNum >= mdl.numTexInfos)
+        if (texNum < 0 || texNum >= mdl.numTexInfos) [[unlikely]]
         {
             Sys_Error("LoadFaces: Bad texinfo number: %i", texNum);
         }
@@ -840,11 +1088,11 @@ void LoadFaces(ModelInstance & mdl, HunkAllocator & hunk, const void * const fil
     lm::EndBuildingLightmaps();
 }
 
-void LoadMarkSurfaces(ModelInstance & mdl, HunkAllocator & hunk, const void * const fileData, const lump_t & l)
+void LoadMarkSurfaces(ModelInstance & mdl, HunkAllocator & hunk, const void * const lumpData, const lump_t & l)
 {
     PS2_Assert(mdl.surfaces != nullptr); // Load faces first.
 
-    const auto * in = LumpData<s16>(fileData, l);
+    const auto * in = LumpAs<s16>(lumpData);
     const int count = LumpElemCount<s16>(l);
 
     ModelSurface ** out = hunk.AllocArray<ModelSurface *>(count);
@@ -854,7 +1102,7 @@ void LoadMarkSurfaces(ModelInstance & mdl, HunkAllocator & hunk, const void * co
     for (int i = 0; i < count; ++i)
     {
         const int j = in[i];
-        if (j < 0 || j >= mdl.numSurfaces)
+        if (j < 0 || j >= mdl.numSurfaces) [[unlikely]]
         {
             Sys_Error("LoadMarkSurfaces: Bad surface number: %i", j);
         }
@@ -862,23 +1110,11 @@ void LoadMarkSurfaces(ModelInstance & mdl, HunkAllocator & hunk, const void * co
     }
 }
 
-void LoadVisibility(ModelInstance & mdl, HunkAllocator & hunk, const void * const fileData, const lump_t & l)
-{
-    if (l.filelen <= 0)
-    {
-        mdl.vis = nullptr;
-        return;
-    }
-
-    mdl.vis = hunk.Alloc(static_cast<u32>(l.filelen));
-    std::memcpy(mdl.vis, LumpData<u8>(fileData, l), static_cast<size_t>(l.filelen));
-}
-
-void LoadLeafs(ModelInstance & mdl, HunkAllocator & hunk, const void * const fileData, const lump_t & l)
+void LoadLeafs(ModelInstance & mdl, HunkAllocator & hunk, const void * const lumpData, const lump_t & l)
 {
     PS2_Assert(mdl.markSurfaces != nullptr); // Load mark surfaces first.
 
-    const auto * in = LumpData<dleaf_t>(fileData, l);
+    const auto * in = LumpAs<dleaf_t>(lumpData);
     const int count = LumpElemCount<dleaf_t>(l);
 
     ModelLeaf * out = hunk.AllocArray<ModelLeaf>(count);
@@ -900,6 +1136,21 @@ void LoadLeafs(ModelInstance & mdl, HunkAllocator & hunk, const void * const fil
         out[i].firstMarkSurface = mdl.markSurfaces + in[i].firstleafface;
         out[i].numMarkSurfaces  = in[i].numleaffaces;
     }
+
+    // MarkLeaves indexes CM_ClusterPVS rows by these cluster numbers, so the
+    // collision model has to be holding the same map we are. The load order
+    // guarantees it (SV_SpawnServer runs CM_LoadMap before CL_PrepRefresh gets
+    // here), and this is what catches it if that ever stops being true: both
+    // counts come from this same lump, so they cannot legitimately disagree.
+#if PS2_QUAKE_ASSERTS
+    int maxCluster = -1;
+    for (int i = 0; i < count; ++i)
+    {
+        if (out[i].cluster > maxCluster) { maxCluster = out[i].cluster; }
+    }
+    PS2_AssertMsg(maxCluster + 1 == CM_NumClusters(),
+                  "World leafs and the collision model disagree on the cluster count!");
+#endif // PS2_QUAKE_ASSERTS
 }
 
 void SetParentRecursive(ModelNode * node, ModelNode * parent)
@@ -913,11 +1164,11 @@ void SetParentRecursive(ModelNode * node, ModelNode * parent)
     SetParentRecursive(node->children[1], node);
 }
 
-void LoadNodes(ModelInstance & mdl, HunkAllocator & hunk, const void * const fileData, const lump_t & l)
+void LoadNodes(ModelInstance & mdl, HunkAllocator & hunk, const void * const lumpData, const lump_t & l)
 {
     PS2_Assert(mdl.planes != nullptr && mdl.leafs != nullptr); // Load these first.
 
-    const auto * in = LumpData<dnode_t>(fileData, l);
+    const auto * in = LumpAs<dnode_t>(lumpData);
     const int count = LumpElemCount<dnode_t>(l);
 
     ModelNode * out = hunk.AllocArray<ModelNode>(count);
@@ -965,9 +1216,9 @@ float RadiusFromBounds(const Vec3 & mins, const Vec3 & maxs)
     return math::Length(corner);
 }
 
-void LoadSubModels(ModelInstance & mdl, HunkAllocator & hunk, const void * const fileData, const lump_t & l)
+void LoadSubModels(ModelInstance & mdl, HunkAllocator & hunk, const void * const lumpData, const lump_t & l)
 {
-    const auto * in = LumpData<dmodel_t>(fileData, l);
+    const auto * in = LumpAs<dmodel_t>(lumpData);
     const int count = LumpElemCount<dmodel_t>(l);
 
     SubModelInfo * out = hunk.AllocArray<SubModelInfo>(count);
@@ -1008,7 +1259,7 @@ int CheckedLumpCount(const lump_t & l, size_t elemSize, const char * what, const
     return static_cast<int>(static_cast<size_t>(l.filelen) / elemSize);
 }
 
-bool ComputeBrushHunkSize(const dheader_t * header, const void * fileData, const char * name, u32 & outSize)
+bool ComputeBrushHunkSize(const dheader_t * header, const PrePassLumps & pre, const char * name, u32 & outSize)
 {
     HunkSizer m{};
 
@@ -1046,11 +1297,11 @@ bool ComputeBrushHunkSize(const dheader_t * header, const void * fileData, const
     // Per-face polygon memory. Predictable for normal faces (from numedges);
     // warped faces are measured by running the shared subdivision recursion.
     {
-        const auto * faces     = LumpData<dface_t>(fileData, header->lumps[LUMP_FACES]);
-        const auto * texInfos  = LumpData<textureinfo_t>(fileData, header->lumps[LUMP_TEXINFO]);
-        const auto * surfEdges = LumpData<int>(fileData, header->lumps[LUMP_SURFEDGES]);
-        const auto * edges     = LumpData<dedge_t>(fileData, header->lumps[LUMP_EDGES]);
-        const auto * verts     = LumpData<dvertex_t>(fileData, header->lumps[LUMP_VERTEXES]);
+        const auto * faces     = LumpAs<dface_t>(pre.faces);
+        const auto * texInfos  = LumpAs<textureinfo_t>(pre.texInfo);
+        const auto * surfEdges = LumpAs<int>(pre.surfEdges);
+        const auto * edges     = LumpAs<dedge_t>(pre.edges);
+        const auto * verts     = LumpAs<dvertex_t>(pre.vertexes);
 
         for (int f = 0; f < numFaces; ++f)
         {
@@ -1062,9 +1313,7 @@ bool ComputeBrushHunkSize(const dheader_t * header, const void * fileData, const
             if (!warp)
             {
                 const int numTris = (numEdgesForFace >= 3) ? (numEdgesForFace - 2) : 0;
-                m.AddArray<ModelPoly>(1);
-                m.AddArray<PolyVertex>(numEdgesForFace);
-                m.AddArray<ModelTriangle>(numTris);
+                m.Add(PolyBlockBytes(numEdgesForFace, numTris));
                 continue;
             }
 
@@ -1087,8 +1336,7 @@ bool ComputeBrushHunkSize(const dheader_t * header, const void * fileData, const
 
             SubdividePolygon(vertCount, polyVerts, [&m](int numLeafVerts, const Vec3 *)
             {
-                m.AddArray<ModelPoly>(1);
-                m.AddArray<PolyVertex>(numLeafVerts + 2);
+                m.Add(PolyBlockBytes(numLeafVerts + 2, 0));
             });
         }
     }
@@ -1097,8 +1345,8 @@ bool ComputeBrushHunkSize(const dheader_t * header, const void * fileData, const
     if (numMarkSurfaces < 0) { return false; }
     m.AddArray<ModelSurface *>(numMarkSurfaces);
 
-    const int visLen = header->lumps[LUMP_VISIBILITY].filelen;
-    if (visLen > 0) { m.Add(static_cast<u32>(visLen)); }
+    // No term for LUMP_VISIBILITY: cmodel.c holds that lump and the view walk
+    // reads it through CM_ClusterPVS (see MarkLeaves), so it is not in the hunk.
 
     const int numLeafs = CheckedLumpCount(header->lumps[LUMP_LEAFS], sizeof(dleaf_t), "leafs", name);
     if (numLeafs < 0) { return false; }
@@ -1122,29 +1370,38 @@ bool ComputeBrushHunkSize(const dheader_t * header, const void * fileData, const
 // BRUSH MODELS (WORLD MAP)
 // ------------------------------------------------------------------------------------------------
 
-bool LoadBrushModel(ModelInstance & mdl, const void * const modelData, const int dataLenBytes)
+bool LoadBrushModel(ModelInstance & mdl, const char * const fileName)
 {
-    PS2_Assert(modelData != nullptr);
-    PS2_Assert(dataLenBytes > 0);
+    PS2_Assert(fileName != nullptr);
 
-    const auto * header = static_cast<const dheader_t *>(modelData);
-    if (header->ident != IDBSPHEADER)
+    // The view walk reads this map's PVS out of the collision model rather than
+    // keeping its own copy (see MarkLeaves), so the two have to be the same .bsp.
+    // The load order gives us that - SV_SpawnServer runs CM_LoadMap before the
+    // client ever reaches CL_PrepRefresh - but "ever" has been wrong once already:
+    // clearing cl.refresh_prepped while the client was still ca_active made
+    // CL_Frame re-prep the *old* map on the spot, halfway through spawning a new
+    // server. Checking here costs a strcmp and names the problem, instead of
+    // surfacing a second later as mismatched cluster counts in LoadLeafs.
+    PS2_AssertMsg(std::strcmp(fileName, CM_MapName()) == 0,
+                  "Loading a world model the collision model is not holding!");
+
+    BspFileReader bsp{};
+    if (!bsp.Open(fileName))
     {
-        Com_Printf("ERROR: LoadBrushModel: '%s' has bad file ident!\n", mdl.name);
-        return false;
-    }
-    if (header->version != BSPVERSION)
-    {
-        Com_Printf("ERROR: LoadBrushModel: '%s' has wrong version (%i should be %i)\n",
-                   mdl.name, header->version, BSPVERSION);
-        return false;
+        return false; // Open() has already reported why.
     }
 
-    // Size the hunk to the model, validating the lumps in the process.
+    const dheader_t & header = bsp.Header();
+
+    // Pass 1: measure. Needs the five geometry lumps together, since the warp
+    // faces are sized by actually running the subdivision over their vertices.
     u32 hunkSize = 0;
-    if (!ComputeBrushHunkSize(header, modelData, mdl.name, hunkSize))
     {
-        return false;
+        const PrePassLumps pre = bsp.ReadPrePassLumps();
+        if (!ComputeBrushHunkSize(&header, pre, mdl.name, hunkSize))
+        {
+            return false;
+        }
     }
 
     HunkAllocator hunk{};
@@ -1153,19 +1410,26 @@ bool LoadBrushModel(ModelInstance & mdl, const void * const modelData, const int
     mdl.hunkSize = hunkSize;
     mdl.type     = ModelType::Brush;
 
-    // Load order matters: several lumps reference earlier ones.
-    LoadVertexes(mdl, hunk, modelData, header->lumps[LUMP_VERTEXES]);
-    LoadEdges(mdl, hunk, modelData, header->lumps[LUMP_EDGES]);
-    LoadSurfEdges(mdl, hunk, modelData, header->lumps[LUMP_SURFEDGES]);
-    LoadLighting(mdl, hunk, modelData, header->lumps[LUMP_LIGHTING]);
-    LoadPlanes(mdl, hunk, modelData, header->lumps[LUMP_PLANES]);
-    LoadTexInfo(mdl, hunk, modelData, header->lumps[LUMP_TEXINFO]);
-    LoadFaces(mdl, hunk, modelData, header->lumps[LUMP_FACES]);
-    LoadMarkSurfaces(mdl, hunk, modelData, header->lumps[LUMP_LEAFFACES]);
-    LoadVisibility(mdl, hunk, modelData, header->lumps[LUMP_VISIBILITY]);
-    LoadLeafs(mdl, hunk, modelData, header->lumps[LUMP_LEAFS]);
-    LoadNodes(mdl, hunk, modelData, header->lumps[LUMP_NODES]);
-    LoadSubModels(mdl, hunk, modelData, header->lumps[LUMP_MODELS]);
+    // Pass 2: fill, one lump at a time through the scratch. Order matters -
+    // several lumps reference earlier ones - but every such reference resolves
+    // against hunk data that is already built, never against another lump still
+    // in the file, which is what lets a single buffer serve them in turn.
+    // LUMP_LIGHTING is a verbatim copy, read straight into the hunk and skipping
+    // the scratch entirely; it keeps its original slot in the sequence because
+    // LoadFaces resolves surf.samples against mdl.lightData, which therefore has
+    // to be in place before it runs. LUMP_VISIBILITY is not read at all any more -
+    // cmodel.c owns it (see MarkLeaves).
+    LoadVertexes(mdl, hunk, bsp.ReadLump(LUMP_VERTEXES), header.lumps[LUMP_VERTEXES]);
+    LoadEdges(mdl, hunk, bsp.ReadLump(LUMP_EDGES), header.lumps[LUMP_EDGES]);
+    LoadSurfEdges(mdl, hunk, bsp.ReadLump(LUMP_SURFEDGES), header.lumps[LUMP_SURFEDGES]);
+    LoadLightingInto(mdl, hunk, bsp, header.lumps[LUMP_LIGHTING]);
+    LoadPlanes(mdl, hunk, bsp.ReadLump(LUMP_PLANES), header.lumps[LUMP_PLANES]);
+    LoadTexInfo(mdl, hunk, bsp.ReadLump(LUMP_TEXINFO), header.lumps[LUMP_TEXINFO]);
+    LoadFaces(mdl, hunk, bsp.ReadLump(LUMP_FACES), header.lumps[LUMP_FACES]);
+    LoadMarkSurfaces(mdl, hunk, bsp.ReadLump(LUMP_LEAFFACES), header.lumps[LUMP_LEAFFACES]);
+    LoadLeafs(mdl, hunk, bsp.ReadLump(LUMP_LEAFS), header.lumps[LUMP_LEAFS]);
+    LoadNodes(mdl, hunk, bsp.ReadLump(LUMP_NODES), header.lumps[LUMP_NODES]);
+    LoadSubModels(mdl, hunk, bsp.ReadLump(LUMP_MODELS), header.lumps[LUMP_MODELS]);
 
     mdl.numFrames = 2; // Regular and alternate animation.
 

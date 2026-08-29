@@ -21,7 +21,7 @@ namespace ps2::mod {
 
 using Vec3 = math::Vec3;
 
-enum class SurfaceFlags : u32
+enum class SurfaceFlags : u8
 {
     // Misc surface flags (same values used by ref_gl). These are the renderer's
     // own per-surface flags, distinct from the SURF_* texinfo flags on disk.
@@ -33,12 +33,12 @@ enum class SurfaceFlags : u32
 
 constexpr SurfaceFlags operator|(SurfaceFlags lhs, SurfaceFlags rhs)
 {
-    return SurfaceFlags(static_cast<u32>(lhs) | static_cast<u32>(rhs));
+    return SurfaceFlags(static_cast<u8>(lhs) | static_cast<u8>(rhs));
 }
 
 constexpr bool HasFlag(SurfaceFlags flags, SurfaceFlags test)
 {
-    return (static_cast<u32>(flags) & static_cast<u32>(test)) != 0;
+    return (static_cast<u8>(flags) & static_cast<u8>(test)) != 0;
 }
 
 enum class ModelType : u8
@@ -93,12 +93,14 @@ struct ModelVertex
 };
 
 //
-// Model triangle vertex indexes.
-// Limited to 16bits to save space.
+// Model triangle vertex indexes, into the owning ModelPoly's vertexes[].
+// A byte each: TriangulatePolygon refuses polygons above kTriangulationMaxVerts
+// (128), so an index never reaches 128, and there is one of these per triangle
+// of every world face - the two bytes saved add up.
 //
 struct ModelTriangle
 {
-    u16 vertexes[3];
+    u8 vertexes[3];
 };
 
 //
@@ -136,23 +138,31 @@ struct ModelPoly
 //
 // Surface description (holds a set of polygons).
 //
+// There is one of these per world face - over 11,000 on the biggest stock map -
+// so the field widths are chosen to pack rather than for uniformity: anything
+// that provably fits in 16 bits is s16, and the members are grouped so the
+// narrow ones share words instead of each taking one.
 struct ModelSurface
 {
     int visFrame; // should be drawn when node is crossed.
 
     cplane_s * plane;
-    SurfaceFlags flags;
     u32 color;
 
     int firstEdge; // look up in model->surfEdges[], negative numbers are backwards edges.
-    int numEdges;
+    s16 numEdges;  // dface_t::numedges is a s16 on disk, so this cannot truncate.
+
+    // lightmap tex coordinates, in luxels into the atlas - bounded by the
+    // lightmap texture dimensions, far inside s16.
+    s16 light_s;
+    s16 light_t;
+    s16 lightmapTextureNum; // kNotLightmapped if the surface has no lightmap.
 
     s16 textureMins[2]; // signed: turbulent surfaces use negative mins.
     s16 extents[2];
 
-    // lightmap tex coordinates.
-    int light_s;
-    int light_t;
+    SurfaceFlags flags; // u8-backed; see the enum.
+    u8 styles[kMaxLightmaps];
 
     ModelPoly * polys; // multiple if warped.
     const ModelSurface * textureChain;
@@ -161,10 +171,8 @@ struct ModelSurface
 
     // dynamic lighting info:
     int dlightFrame;
-    int dlightBits;
+    int dlightBits; // one bit per dlight, so this needs all 32.
 
-    int lightmapTextureNum; // kNotLightmapped if the surface has no lightmap.
-    u8 styles[kMaxLightmaps];
     float cachedLight[kMaxLightmaps]; // values currently used in lightmap.
     u8 * samples; // [numstyles * surfsize]
 
@@ -298,7 +306,9 @@ struct ModelInstance final
     int numMarkSurfaces;
     ModelSurface ** markSurfaces;
 
-    void * vis; // Raw visibility (PVS) lump; cast to dvis_t at the use site.
+    // No visibility lump here: the collision model already holds it verbatim in
+    // map_visibility[], so the view walk asks CM_ClusterPVS instead of carrying a
+    // second copy (saves up to 376 KB on 'jail5'). See MarkLeaves.
     u8 * lightData;
 
     const tex::Texture * skins[kMaxMD2Skins]; // For alias models and skins.
@@ -322,6 +332,17 @@ void BeginRegistration(const char * mapName);
 void EndRegistration();
 
 const ModelInstance * Find(const char * name);
+
+// Frees the resident world model, unless it is already 'fullName' (a "maps/*.bsp"
+// path; null or empty releases unconditionally). BeginRegistration does this
+// itself; call it directly to hand the hunk back before the next map's collision
+// model is built. GetWorldModel() reads null until the next BeginRegistration.
+//
+// Returns true only if it actually freed the world. Anything whose lifetime is
+// tied to the world - the lightmap atlases, which surfaces index by number - must
+// be released on that answer, not alongside the call: on the keep-it path the
+// surfaces survive, and so must whatever they point at.
+bool ReleaseWorldModel(const char * fullName);
 
 // The world map loaded by the last BeginRegistration; null before any map load.
 // NOTE: the view renderer stamps per-frame visibility into the world as it

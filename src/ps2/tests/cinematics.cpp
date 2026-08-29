@@ -12,7 +12,7 @@
 
 #if PS2_QUAKE_DEBUG
 #include "ps2/common.h"
-#include "ps2/renderer/tests/cinematics.h"
+#include "ps2/tests/cinematics.h"
 
 // From cl_cin.c (declared in client/screen.h, which the backend doesn't pull in).
 extern "C" qboolean CinematicTest_PlayDirect(const char * filename);

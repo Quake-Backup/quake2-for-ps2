@@ -471,7 +471,7 @@ void Touch(const tex::Texture & texture)
     PS2_AssertMsg(texture.vramAddr != tex::Texture::kNotResident, "Touch on a non-resident texture!");
 
     Block * block = FindBlockFor(texture);
-    if (block != nullptr)
+    if (block != nullptr) [[likely]]
     {
         block->lastBoundFrame = s_frame;
         return;
@@ -485,7 +485,7 @@ bool BoundThisFrame(const tex::Texture & texture)
     PS2_AssertMsg(texture.vramAddr != tex::Texture::kNotResident, "BoundThisFrame on a non-resident texture!");
 
     const Block * block = FindBlockFor(texture);
-    if (block != nullptr)
+    if (block != nullptr) [[likely]]
     {
         return block->lastBoundFrame == s_frame;
     }
@@ -502,7 +502,7 @@ void Free(const tex::Texture & texture)
     }
 
     Block * block = FindBlockFor(texture);
-    if (block != nullptr)
+    if (block != nullptr) [[likely]]
     {
         texture.vramAddr = tex::Texture::kNotResident;
         block->owner     = nullptr;

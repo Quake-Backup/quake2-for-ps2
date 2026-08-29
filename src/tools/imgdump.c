@@ -1,7 +1,6 @@
 /* ================================================================================================
  * -*- C -*-
  * File: imgdump.c
- * Author: Guilherme R. Lampert
  * Created on: 26/10/15
  * Brief:
  *  Hardcoded command line tool that dumps PCX image files into

@@ -139,6 +139,47 @@ void SCR_LoadPCX(char * filename, byte ** pic, byte ** palette, int * width, int
     FS_FreeFile(pcx);
 }
 
+// [PS2_QUAKE] 2026-08-27
+// SCR_ReadNextFrame's frame scratch. These started as stack locals in id's code,
+// then became function statics here because 128 KB would blow the PS2's 128 KB EE
+// stack. As statics they were reserved for the whole run, but cinematics only play
+// between levels - exactly when the freshly loaded map wants that RAM back - so
+// they are now heap, allocated on the first frame and released by SCR_StopCinematic
+// alongside cin.pic / cin.hnodes1. Not threaded, so one shared pair is fine.
+#define CIN_MAX_COMPRESSED 0x20000          // 128 KB
+#define CIN_MAX_SAMPLES    (22050 / 14 * 4) // 6.2 KB
+
+static byte * cin_compressed;
+static byte * cin_samples;
+
+// Z_Malloc is fatal on failure (Sys_Error), so there is no error path here -
+// same contract the rest of this file already relies on for cin.hnodes1.
+static void SCR_AllocCinematicScratch(void)
+{
+    if (cin_compressed == NULL)
+    {
+        cin_compressed = Z_Malloc(CIN_MAX_COMPRESSED);
+    }
+    if (cin_samples == NULL)
+    {
+        cin_samples = Z_Malloc(CIN_MAX_SAMPLES);
+    }
+}
+
+static void SCR_FreeCinematicScratch(void)
+{
+    if (cin_compressed)
+    {
+        Z_Free(cin_compressed);
+        cin_compressed = NULL;
+    }
+    if (cin_samples)
+    {
+        Z_Free(cin_samples);
+        cin_samples = NULL;
+    }
+}
+
 /*
 ==================
 SCR_StopCinematic
@@ -147,6 +188,9 @@ SCR_StopCinematic
 void SCR_StopCinematic(void)
 {
     cl.cinematictime = 0; // done
+
+    SCR_FreeCinematicScratch();
+
     if (cin.pic)
     {
         Z_Free(cin.pic);
@@ -429,13 +473,6 @@ SCR_ReadNextFrame
 */
 byte * SCR_ReadNextFrame(void)
 {
-    // LAMPERT:
-    // These were originally stack variables, but I fear they
-    // are dangerously big and would stress the PS2 stack. Since
-    // this is not threaded code, no worries with race conditions.
-    static byte samples[22050 / 14 * 4] __attribute__((aligned(16))); // 6.2KB
-    static byte compressed[0x20000] __attribute__((aligned(16)));     // 128KB
-
     int r;
     int command;
     int size;
@@ -448,6 +485,8 @@ byte * SCR_ReadNextFrame(void)
         Com_DPrintf("Cinematic at the end of file!\n");
         return NULL;
     }
+
+    SCR_AllocCinematicScratch();
 
     // read the next frame
     r = fread(&command, 4, 1, cl.cinematic_file);
@@ -481,24 +520,24 @@ byte * SCR_ReadNextFrame(void)
     FS_Read(&size, 4, cl.cinematic_file);
     size = LittleLong(size);
 
-    if (size > sizeof(compressed) || size < 1)
+    if (size > CIN_MAX_COMPRESSED || size < 1)
     {
-        Com_DPrintf("Cinematic error: Bad compressed frame size! %d of %u\n", size, sizeof(compressed));
+        Com_DPrintf("Cinematic error: Bad compressed frame size! %d of %d\n", size, CIN_MAX_COMPRESSED);
         return NULL;
     }
 
-    FS_Read(compressed, size, cl.cinematic_file);
+    FS_Read(cin_compressed, size, cl.cinematic_file);
 
     // read sound
     start = cl.cinematicframe * cin.s_rate / 14;
     end = (cl.cinematicframe + 1) * cin.s_rate / 14;
     count = end - start;
 
-    FS_Read(samples, count * cin.s_width * cin.s_channels, cl.cinematic_file);
+    FS_Read(cin_samples, count * cin.s_width * cin.s_channels, cl.cinematic_file);
 
-    S_RawSamples(count, cin.s_rate, cin.s_width, cin.s_channels, samples);
+    S_RawSamples(count, cin.s_rate, cin.s_width, cin.s_channels, cin_samples);
 
-    in.data = compressed;
+    in.data = cin_compressed;
     in.count = size;
 
     huf1 = Huff1Decompress(in);
@@ -694,7 +733,7 @@ void SCR_PlayCinematic(const char * arg)
 ==================
 CinematicTest_PlayDirect
 
-LAMPERT 2015-10-23
+[PS2_QUAKE] 2015-10-23
 Plays a cinematic directly from a ".cin" file in the file system (not from a pak).
 This is used for testing in the PS2 port.
 ==================
@@ -758,7 +797,7 @@ qboolean CinematicTest_PlayDirect(const char * filename)
 ==================
 CinematicTest_RunFrame
 
-LAMPERT 2015-10-23
+[PS2_QUAKE] 2015-10-23
 Used in combination with CinematicTest_PlayDirect for testing cinematics in the PS2 port.
 Draws the current cinematic frame, advancing to the next one at the 14 fps cadence the
 .cin format is authored for (same pacing as SCR_RunCinematic). Must be called every

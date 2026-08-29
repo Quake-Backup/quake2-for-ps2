@@ -67,6 +67,7 @@ void Sys_Init()
     });
 }
 
+__attribute__((cold))
 void Sys_Quit()
 {
     Qcommon_Shutdown();
@@ -74,6 +75,7 @@ void Sys_Quit()
     std::exit(0);
 }
 
+__attribute__((cold))
 void Sys_Error(const char * error, ...)
 {
     va_list argptr;
@@ -86,9 +88,9 @@ void Sys_Error(const char * error, ...)
 
     ps2::debug::ScrInit();
     ps2::debug::ScrSetTextColor(0xFF0000FF); // red text
-    ps2::debug::ScrPrintf("**************************************************************\n");
+    ps2::debug::ScrPrintf("***************************************************************\n");
     ps2::debug::ScrPrintf("Sys_Error:\n%s\n", tempbuff);
-    ps2::debug::ScrPrintf("**************************************************************\n");
+    ps2::debug::ScrPrintf("***************************************************************\n");
 
     // Draw the error to the screen and halt so the
     // message stays readable in the emulator/console.

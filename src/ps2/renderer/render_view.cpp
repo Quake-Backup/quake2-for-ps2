@@ -123,14 +123,16 @@ static cplane_t s_frustum[4] = {};
 // Wall texture animation frame (viewDef.time * 2, as in ref_gl).
 static int s_textureAnimFrame = 0;
 
-// Scratch for one decompressed cluster PVS, and for the two-cluster union used
-// when the camera straddles a solid water boundary. Static: 8 KB each.
-alignas(16) static u8 s_dvisPvs[MAX_MAP_LEAFS / 8];
+// Scratch for the two-cluster PVS union used when the camera straddles a solid
+// water boundary. The single-cluster row comes from CM_ClusterPVS, which owns its
+// own buffer - this only exists because combining two clusters needs the first row
+// kept while the second is decompressed over it.
 alignas(16) static u8 s_fatPvs[MAX_MAP_LEAFS / 8];
 
 // Textures that received surfaces this frame; DrawTextureChains draws and
-// resets exactly these. Sized to the texture cache capacity.
-constexpr int kMaxChainTextures = 1024;
+// resets exactly these. One entry per live texture is the true ceiling, so it
+// tracks the cache's own capacity.
+constexpr int kMaxChainTextures = static_cast<int>(tex::kMaxTextures);
 static const tex::Texture * s_chainTextures[kMaxChainTextures];
 static int s_chainTextureCount = 0;
 
@@ -162,7 +164,7 @@ static int s_alphaEntityMatrixCount = 0;
 
 // Triangle gather buffer: texture chains append here and flush through
 // vu1::DrawTriangles when full (see batch.h).
-constexpr int kBatchMaxVerts = 3072; // whole triangles (3 * 1024); 96 KB
+constexpr int kBatchMaxVerts = 3 * 768; // 768 whole triangles per batch
 static batch::TriangleBatch<kBatchMaxVerts> s_batch;
 
 // Performance counters for the frame, reset by RenderFrame and read through
@@ -324,55 +326,20 @@ const mod::ModelLeaf * FindLeafNodeForPoint(const float * point, const mod::Mode
     }
 }
 
-// Decompresses a cluster's RLE visibility row into 'out' (zero runs are
-// length-encoded). A null 'in' (no vis data) decompresses to all-visible.
-const u8 * DecompressModelVis(u8 * out, const u8 * in, const mod::ModelInstance & model)
+// Returns the decompressed PVS row for 'cluster'.
+//
+// This used to decompress from a copy of the VISIBILITY lump kept in the world
+// hunk. The collision model has the identical lump in map_visibility[] and an
+// identical decoder, so the copy is gone (up to 376 KB of the hunk on jail5) and
+// this defers to CM_ClusterPVS - whose decoder is the better of the two, since it
+// clamps a zero-run to the row length instead of running off the end.
+//
+// The row lives in a shared buffer that the next call overwrites, so don't hold
+// on to it (MarkLeaves copies it into s_fatPvs before asking for the second one).
+inline const u8 * GetClusterPVS(const int cluster)
 {
-    const auto * vis = static_cast<const dvis_t *>(model.vis);
-    int row = (vis->numclusters + 7) >> 3;
-    u8 * dst = out;
-
-    if (in == nullptr)
-    {
-        while (row-- > 0)
-        {
-            *dst++ = 0xFF;
-        }
-        return out;
-    }
-
-    do
-    {
-        if (*in != 0)
-        {
-            *dst++ = *in++;
-            continue;
-        }
-
-        int c = in[1];
-        in += 2;
-        while (c-- > 0)
-        {
-            *dst++ = 0;
-        }
-    } while (dst - out < row);
-
-    return out;
-}
-
-// Returns the decompressed PVS row for 'cluster' (shared s_dvisPvs buffer, so
-// don't hold on to it across calls).
-const u8 * GetClusterPVS(int cluster, const mod::ModelInstance & model)
-{
-    if (cluster == kInvalidCluster || model.vis == nullptr)
-    {
-        std::memset(s_dvisPvs, 0xFF, sizeof(s_dvisPvs)); // All visible.
-        return s_dvisPvs;
-    }
-
-    const auto * vis = static_cast<const dvis_t *>(model.vis);
-    const u8 * compressed = static_cast<const u8 *>(model.vis) + vis->bitofs[cluster][DVIS_PVS];
-    return DecompressModelVis(s_dvisPvs, compressed, model);
+    PS2_Assert(cluster != kInvalidCluster); // MarkLeaves handles that case itself.
+    return CM_ClusterPVS(cluster);
 }
 
 // Finds the clusters the camera sees from this frame. Two clusters when near a
@@ -413,7 +380,7 @@ void MarkLeaves(const mod::ModelInstance & world)
     s_oldViewCluster  = s_viewCluster;
     s_oldViewCluster2 = s_viewCluster2;
 
-    if (s_viewCluster == kInvalidCluster || world.vis == nullptr)
+    if (s_viewCluster == kInvalidCluster || !CM_HasVisibility())
     {
         // Outside the map or no PVS data: mark everything visible.
         for (int i = 0; i < world.numLeafs; ++i)
@@ -427,13 +394,15 @@ void MarkLeaves(const mod::ModelInstance & world)
         return;
     }
 
-    const u8 * vis = GetClusterPVS(s_viewCluster, world);
+    const u8 * vis = GetClusterPVS(s_viewCluster);
 
     // May have to combine two clusters because of solid water boundaries:
     if (s_viewCluster2 != s_viewCluster)
     {
+        // Copy the first row out before asking for the second: CM_ClusterPVS
+        // decompresses both into the same buffer.
         std::memcpy(s_fatPvs, vis, static_cast<size_t>((world.numLeafs + 7) / 8));
-        vis = GetClusterPVS(s_viewCluster2, world);
+        vis = GetClusterPVS(s_viewCluster2);
 
         // Both buffers are 16-byte aligned, so OR them a word at a time.
         u32 * fat = static_cast<u32 *>(static_cast<void *>(s_fatPvs));

@@ -247,6 +247,52 @@ void V_TestLights(void)
 
 /*
 =================
+CL_ReleaseWorldModel
+
+[PS2_QUAKE] 2026-08-29
+Hands the resident world model back to the allocator ahead of time. The refresh
+frees the old map anyway, but not until CL_PrepRefresh below - and on a 32MB
+console the several megabytes it holds until then are precisely what the *next*
+map's CM_LoadMap needs, so SV_SpawnServer calls this first.
+
+'bsp_name' is the map about to be loaded ("maps/<level>.bsp"); the refresh keeps
+the world if it is already that one, so restarting a level or loading a savegame
+does not pay for a needless reload. Pass "" to release unconditionally.
+
+Taking the client out of ca_active is the other half, and it is not optional. Two
+things key off that state and both are wrong once the world is gone:
+
+  - V_RenderView would draw a freed world model.
+  - CL_Frame re-preps by itself: "if (!cl.refresh_prepped && cls.state ==
+    ca_active) CL_PrepRefresh();". Clearing refresh_prepped on its own therefore
+    does not guard anything, it *triggers* an immediate reload - of the OLD map,
+    since cl.configstrings still describes it, against a collision model
+    SV_SpawnServer is in the middle of replacing. That fired the cluster-count
+    assert in the refresh's LoadLeafs when the demo loop rolled from base2 into
+    idlog.cin.
+
+ca_connected is the state CL_Changing_f puts the client in for exactly this
+transition - not active any more, but not disconnected. The server broadcasts
+"changing" around here anyway; doing it directly means the release does not depend
+on when the loopback packet is parsed, which matters because only SV_Map's ss_game
+branch flushes it (via SV_SendClientMessages) before spawning. Reconnecting brings
+ca_active back through the normal path.
+=================
+*/
+void CL_ReleaseWorldModel(const char * bsp_name)
+{
+    if (!re.ReleaseWorldModel)
+        return; // no refresh yet (very early startup)
+
+    if (cls.state == ca_active)
+        cls.state = ca_connected;
+
+    cl.refresh_prepped = false;
+    re.ReleaseWorldModel(bsp_name ? bsp_name : "");
+}
+
+/*
+=================
 CL_PrepRefresh
 
 Call before entering a new level, or after changing dlls

@@ -62,7 +62,7 @@ typedef struct
 } carea_t;
 
 //
-// LAMPERT 2015-10-27
+// [PS2_QUAKE] 2015-10-27
 // Made a bunch of local data in this file 'static',
 // since most global variables in here are never exported.
 //
@@ -115,7 +115,14 @@ static int floodvalid;
 static mapsurface_t nullsurface;
 static qboolean portalopen[MAX_MAP_AREAPORTALS];
 
-static byte * cmod_base;
+//
+// [PS2_QUAKE] 2026-08-29
+// Was 'cmod_base', a pointer to the whole .bsp held in memory, with every loader
+// indexing it as cmod_base + l->fileofs. CM_LoadMap now streams the file a lump at
+// a time (see bspreader_t below), so this points at the one lump being loaded
+// instead and the loaders read it from offset zero.
+//
+static byte * cmod_lump;
 static cvar_t * map_noareas;
 
 // These counters are referenced by Qcommon_Frame().
@@ -145,7 +152,7 @@ void CMod_LoadSubmodels(lump_t * l)
     cmodel_t * out;
     int i, j, count;
 
-    in = (void *)(cmod_base + l->fileofs);
+    in = (void *)cmod_lump;
     if (l->filelen % sizeof(*in))
         Com_Error(ERR_DROP, "MOD_LoadBmodel: funny lump size");
 
@@ -184,7 +191,7 @@ void CMod_LoadSurfaces(lump_t * l)
     mapsurface_t * out;
     int i, count;
 
-    in = (void *)(cmod_base + l->fileofs);
+    in = (void *)cmod_lump;
     if (l->filelen % sizeof(*in))
         Com_Error(ERR_DROP, "MOD_LoadBmodel: funny lump size");
 
@@ -219,7 +226,7 @@ void CMod_LoadNodes(lump_t * l)
     cnode_t * out;
     int i, j, count;
 
-    in = (void *)(cmod_base + l->fileofs);
+    in = (void *)cmod_lump;
     if (l->filelen % sizeof(*in))
         Com_Error(ERR_DROP, "MOD_LoadBmodel: funny lump size");
 
@@ -257,7 +264,7 @@ void CMod_LoadBrushes(lump_t * l)
     cbrush_t * out;
     int i, count;
 
-    in = (void *)(cmod_base + l->fileofs);
+    in = (void *)cmod_lump;
     if (l->filelen % sizeof(*in))
         Com_Error(ERR_DROP, "MOD_LoadBmodel: funny lump size");
 
@@ -290,7 +297,7 @@ void CMod_LoadLeafs(lump_t * l)
     dleaf_t * in;
     int count;
 
-    in = (void *)(cmod_base + l->fileofs);
+    in = (void *)cmod_lump;
     if (l->filelen % sizeof(*in))
         Com_Error(ERR_DROP, "MOD_LoadBmodel: funny lump size");
 
@@ -299,9 +306,12 @@ void CMod_LoadLeafs(lump_t * l)
     if (count < 1)
         Com_Error(ERR_DROP, "Map with no leafs");
 
-    // need to save space for box planes
-    if (count > MAX_MAP_PLANES)
-        Com_Error(ERR_DROP, "Map has too many planes");
+    // [PS2_QUAKE] 2026-08-27
+    // id tested MAX_MAP_PLANES here while filling map_leafs[MAX_MAP_LEAFS]. It was
+    // harmless while every MAX_MAP_* was 65536, but the PS2 port sizes them apart,
+    // so the wrong constant would let a map overrun the array.
+    if (count > MAX_MAP_LEAFS)
+        Com_Error(ERR_DROP, "Map has too many leafs");
 
     out = map_leafs;
     numleafs = count;
@@ -350,7 +360,7 @@ void CMod_LoadPlanes(lump_t * l)
     int count;
     int bits;
 
-    in = (void *)(cmod_base + l->fileofs);
+    in = (void *)cmod_lump;
     if (l->filelen % sizeof(*in))
         Com_Error(ERR_DROP, "MOD_LoadBmodel: funny lump size");
 
@@ -394,7 +404,7 @@ void CMod_LoadLeafBrushes(lump_t * l)
     unsigned short * in;
     int count;
 
-    in = (void *)(cmod_base + l->fileofs);
+    in = (void *)cmod_lump;
     if (l->filelen % sizeof(*in))
         Com_Error(ERR_DROP, "MOD_LoadBmodel: funny lump size");
 
@@ -427,7 +437,7 @@ void CMod_LoadBrushSides(lump_t * l)
     int count;
     int num;
 
-    in = (void *)(cmod_base + l->fileofs);
+    in = (void *)cmod_lump;
     if (l->filelen % sizeof(*in))
         Com_Error(ERR_DROP, "MOD_LoadBmodel: funny lump size");
 
@@ -465,7 +475,7 @@ void CMod_LoadAreas(lump_t * l)
     darea_t * in;
     int count;
 
-    in = (void *)(cmod_base + l->fileofs);
+    in = (void *)cmod_lump;
     if (l->filelen % sizeof(*in))
         Com_Error(ERR_DROP, "MOD_LoadBmodel: funny lump size");
 
@@ -498,14 +508,16 @@ void CMod_LoadAreaPortals(lump_t * l)
     dareaportal_t * in;
     int count;
 
-    in = (void *)(cmod_base + l->fileofs);
+    in = (void *)cmod_lump;
     if (l->filelen % sizeof(*in))
         Com_Error(ERR_DROP, "MOD_LoadBmodel: funny lump size");
 
     count = l->filelen / sizeof(*in);
 
-    if (count > MAX_MAP_AREAS)
-        Com_Error(ERR_DROP, "Map has too many areas");
+    // [PS2_QUAKE] 2026-08-27
+    // Same copy-paste as CMod_LoadLeafs above: this fills map_areaportals, not map_areas.
+    if (count > MAX_MAP_AREAPORTALS)
+        Com_Error(ERR_DROP, "Map has too many areaportals");
 
     out = map_areaportals;
     numareaportals = count;
@@ -526,11 +538,21 @@ void CMod_LoadVisibility(lump_t * l)
 {
     int i;
 
+    // [PS2_QUAKE] 2026-08-29
+    // Read straight into map_visibility by the caller rather than copied out of
+    // the file image, so this lump never passes through the lump scratch buffer.
+    // The bounds check above the (former) memcpy is now the caller's, done before
+    // the read rather than after it.
     numvisibility = l->filelen;
-    if (l->filelen > MAX_MAP_VISIBILITY)
-        Com_Error(ERR_DROP, "Map has too large visibility lump");
 
-    memcpy(map_visibility, cmod_base + l->fileofs, l->filelen);
+    // [PS2_QUAKE] 2026-08-29: bail out on a map with no vis data. id's version
+    // fell through and byte-swapped whatever numclusters and bitofs[] the previous
+    // map had left in the buffer. Harmless in practice - every shipped map has vis,
+    // and CM_DecompressVis checks numvisibility before it reads any of it - but
+    // CM_HasVisibility now exports "does this map have vis" to the refresh, so the
+    // state behind that answer should be consistent rather than stale.
+    if (numvisibility <= 0)
+        return;
 
     map_vis->numclusters = LittleLong(map_vis->numclusters);
     for (i = 0; i < map_vis->numclusters; i++)
@@ -547,11 +569,224 @@ CMod_LoadEntityString
 */
 void CMod_LoadEntityString(lump_t * l)
 {
+    // [PS2_QUAKE] 2026-08-29
+    // Read straight into map_entitystring by the caller, like the visibility lump
+    // above; nothing left to do here but record the length.
     numentitychars = l->filelen;
-    if (l->filelen > MAX_MAP_ENTSTRING)
-        Com_Error(ERR_DROP, "Map has too large entity lump");
+}
 
-    memcpy(map_entitystring, cmod_base + l->fileofs, l->filelen);
+/*
+===============================================================================
+
+[PS2_QUAKE] 2026-08-29
+STREAMED BSP READING
+
+CM_LoadMap used to FS_LoadFile the whole .bsp - up to 3.1 MB (space.bsp) - and
+hold it while it filled the static map_* arrays. On a 32 MB console that was
+fatal, because it happens during SV_SpawnServer while the *previous* map's
+renderer geometry is still resident: leaving power2 for cool1 needed 2.7 MB and
+there were 2.0 MB left.
+
+Nothing here ever wants two lumps at once, so the file is read one lump at a time
+into a scratch buffer sized from the header (the largest single transformed lump
+across every stock map is 291,880 bytes, strike.bsp). VISIBILITY and ENTITIES are
+verbatim copies, so they skip the scratch and are read straight into
+map_visibility[] / map_entitystring[].
+
+The loose end is the checksum. Com_BlockChecksum covered the whole file, but the
+loaders now touch under a third of it, so CM_BspChecksum makes its own sequential
+pass over every byte through the same scratch, feeding the streaming
+Com_BlockChecksum* API. That costs one extra read of the file per map load (~25%
+more I/O: the lump reads are the small half), and it is deliberate - keeping the
+value identical to stock means this change cannot alter behaviour anywhere the
+checksum is used.
+
+It is worth knowing how little that is, before anyone is tempted to trade it away.
+CS_MAPCHECKSUM is compared in exactly one place, cl_main.c's CL_RequestNextDownload,
+against a string SV_SpawnServer wrote from this same file moments earlier - so any
+deterministic function of the map would do. Demo playback does *not* check it: old
+demos stuff a bare "precache", which takes CL_Precache_f's argc < 2 branch and
+skips the comparison entirely. Hashing only the lumps we read would therefore work
+today, and would save the extra pass; it is not done because it buys load time, not
+memory, and this change is about memory.
+
+===============================================================================
+*/
+
+typedef struct
+{
+    FILE * file;
+    long base;   // where the .bsp starts in the stream (nonzero inside a pak)
+    int length;  // whole-file length, for the checksum pass
+    byte * scratch;
+    int scratchSize;
+} bspreader_t;
+
+// The lumps loaded element by element, each read into the scratch buffer on its
+// own. VISIBILITY and ENTITIES are deliberately absent - see above.
+static const int cm_streamedLumps[] = {
+    LUMP_TEXINFO, LUMP_LEAFS, LUMP_LEAFBRUSHES, LUMP_PLANES, LUMP_BRUSHES,
+    LUMP_BRUSHSIDES, LUMP_MODELS, LUMP_NODES, LUMP_AREAS, LUMP_AREAPORTALS
+};
+
+#define CM_NUM_STREAMED_LUMPS ((int)(sizeof(cm_streamedLumps) / sizeof(cm_streamedLumps[0])))
+
+// Enough for the largest lump we transform. Floored so that the checksum pass,
+// which reuses this buffer, does not end up doing hundreds of tiny reads on a map
+// whose lumps all happen to be small.
+#define CM_MIN_SCRATCH_BYTES (64 * 1024)
+
+static int CM_BspScratchBytes(const dheader_t * header)
+{
+    int i, len;
+    int most = CM_MIN_SCRATCH_BYTES;
+
+    for (i = 0; i < CM_NUM_STREAMED_LUMPS; i++)
+    {
+        len = header->lumps[cm_streamedLumps[i]].filelen;
+        if (len > most)
+            most = len;
+    }
+    return most;
+}
+
+static void CM_BspClose(bspreader_t * r)
+{
+    if (r->scratch)
+    {
+        Z_Free(r->scratch);
+        r->scratch = NULL;
+    }
+    if (r->file)
+    {
+        FS_FCloseFile(r->file);
+        r->file = NULL;
+    }
+    cmod_lump = NULL;
+}
+
+static void CM_BspSeek(bspreader_t * r, const lump_t * l)
+{
+    if (fseek(r->file, r->base + l->fileofs, SEEK_SET) != 0)
+    {
+        int ofs = l->fileofs;
+        CM_BspClose(r);
+        Com_Error(ERR_DROP, "CM_BspSeek: seek to lump offset %i failed", ofs);
+    }
+}
+
+// Reads one lump into the scratch buffer and points cmod_lump at it for the
+// CMod_Load* function that follows.
+static void CM_BspReadLump(bspreader_t * r, const lump_t * l)
+{
+    // The scratch was sized from these same lengths, so this can only trip if the
+    // header is inconsistent - better here than as a silent heap overrun, since
+    // the CMod_Load* bounds checks all happen after the bytes have landed.
+    if (l->filelen > r->scratchSize)
+    {
+        int len = l->filelen, cap = r->scratchSize;
+        CM_BspClose(r);
+        Com_Error(ERR_DROP, "CM_BspReadLump: lump of %i bytes overruns the %i byte scratch", len, cap);
+    }
+
+    cmod_lump = r->scratch;
+
+    if (l->filelen <= 0)
+        return;
+
+    CM_BspSeek(r, l);
+    FS_Read(r->scratch, l->filelen, r->file);
+}
+
+// Reads a lump straight to 'dest', bypassing the scratch. For the two the loaders
+// copy verbatim; 'destSize' is the destination array's capacity.
+static void CM_BspReadLumpInto(bspreader_t * r, const lump_t * l, void * dest, int destSize, const char * what)
+{
+    if (l->filelen > destSize)
+    {
+        int len = l->filelen;
+        CM_BspClose(r);
+        Com_Error(ERR_DROP, "CM_BspReadLumpInto: Map has too large %s lump (%i bytes)", what, len);
+    }
+
+    if (l->filelen <= 0)
+        return;
+
+    CM_BspSeek(r, l);
+    FS_Read(dest, l->filelen, r->file);
+}
+
+// Hashes every byte of the file, so the value matches what the old whole-file
+// Com_BlockChecksum produced. Reuses the scratch as the read buffer.
+static unsigned CM_BspChecksum(bspreader_t * r)
+{
+    blockchecksum_t ctx;
+    int remaining, chunk;
+
+    Com_BlockChecksumBegin(&ctx);
+
+    if (fseek(r->file, r->base, SEEK_SET) != 0)
+    {
+        CM_BspClose(r);
+        Com_Error(ERR_DROP, "CM_BspChecksum: seek to start of file failed");
+    }
+
+    for (remaining = r->length; remaining > 0; remaining -= chunk)
+    {
+        chunk = (remaining < r->scratchSize) ? remaining : r->scratchSize;
+        FS_Read(r->scratch, chunk, r->file);
+        Com_BlockChecksumUpdate(&ctx, r->scratch, chunk);
+    }
+
+    return Com_BlockChecksumEnd(&ctx);
+}
+
+static void CM_BspOpen(bspreader_t * r, const char * name, dheader_t * header)
+{
+    int i;
+
+    memset(r, 0, sizeof(*r));
+
+    r->length = FS_FOpenFile(name, &r->file);
+    if (r->length <= 0 || !r->file)
+        Com_Error(ERR_DROP, "CM_BspOpen: Couldn't load %s", name);
+
+    // Lump offsets are relative to the start of the .bsp, which inside a pak is
+    // not the start of the stream - FS_FOpenFile leaves us seeked there.
+    r->base = ftell(r->file);
+    if (r->base < 0)
+    {
+        CM_BspClose(r);
+        Com_Error(ERR_DROP, "CM_BspOpen: cannot tell position in %s", name);
+    }
+
+    FS_Read(header, sizeof(*header), r->file);
+    for (i = 0; i < sizeof(dheader_t) / 4; i++)
+        ((int *)header)[i] = LittleLong(((int *)header)[i]);
+
+    if (header->version != BSPVERSION)
+    {
+        int version = header->version;
+        CM_BspClose(r);
+        Com_Error(ERR_DROP, "CM_BspOpen: %s has wrong version number (%i should be %i)",
+                  name, version, BSPVERSION);
+    }
+
+    // Nothing validated the lump table before, because it indexed a buffer that
+    // was already known to be 'length' bytes long. Now the offsets drive seeks and
+    // the lengths drive reads, so a corrupt header has to be caught up front.
+    for (i = 0; i < HEADER_LUMPS; i++)
+    {
+        if (header->lumps[i].fileofs < 0 || header->lumps[i].filelen < 0 ||
+            header->lumps[i].fileofs + header->lumps[i].filelen > r->length)
+        {
+            CM_BspClose(r);
+            Com_Error(ERR_DROP, "CM_BspOpen: %s has a bad lump table (lump %i)", name, i);
+        }
+    }
+
+    r->scratchSize = CM_BspScratchBytes(header);
+    r->scratch = Z_Malloc(r->scratchSize);
 }
 
 /*
@@ -563,10 +798,8 @@ Loads in the map and all submodels
 */
 cmodel_t * CM_LoadMap(char * name, qboolean clientload, unsigned * checksum)
 {
-    unsigned * buf;
-    int i;
+    bspreader_t bsp;
     dheader_t header;
-    int length;
     static unsigned last_checksum;
 
     map_noareas = Cvar_Get("map_noareas", "0", 0);
@@ -602,42 +835,54 @@ cmodel_t * CM_LoadMap(char * name, qboolean clientload, unsigned * checksum)
     }
 
     //
-    // load the file
+    // [PS2_QUAKE] 2026-08-29
+    // Stream the file rather than loading it whole - see the STREAMED BSP READING
+    // block above. CM_BspOpen validates the header and allocates the one scratch
+    // buffer every lump below is read through; CM_BspClose frees it.
     //
-    length = FS_LoadFile(name, (void **)&buf);
-    if (!buf)
-        Com_Error(ERR_DROP, "Couldn't load %s", name);
+    CM_BspOpen(&bsp, name, &header);
 
-    last_checksum = LittleLong(Com_BlockChecksum(buf, length));
+    last_checksum = LittleLong(CM_BspChecksum(&bsp));
     *checksum = last_checksum;
 
-    header = *(dheader_t *)buf;
-    for (i = 0; i < sizeof(dheader_t) / 4; i++)
-        ((int *)&header)[i] = LittleLong(((int *)&header)[i]);
+    // Load into the static map_* arrays, one lump at a time - each read overwrites
+    // the scratch, so only one lump is ever in memory.
+    //
+    // Nothing here actually depends on the order: the cross-references (nodes and
+    // brush sides pointing into map_planes, leafs into map_leafbrushes) are offsets
+    // into fixed static arrays, which exist whether or not they have been filled
+    // yet. id's order is kept anyway, so this change cannot shift behaviour.
+#define CM_LOAD_LUMP(lump, loader)                 \
+    do {                                           \
+        CM_BspReadLump(&bsp, &header.lumps[lump]); \
+        loader(&header.lumps[lump]);               \
+    } while (0)
 
-    if (header.version != BSPVERSION)
-    {
-        Com_Error(ERR_DROP, "CMod_LoadBrushModel: %s has wrong version number (%i should be %i)",
-                  name, header.version, BSPVERSION);
-    }
+    CM_LOAD_LUMP(LUMP_TEXINFO,     CMod_LoadSurfaces);
+    CM_LOAD_LUMP(LUMP_LEAFS,       CMod_LoadLeafs);
+    CM_LOAD_LUMP(LUMP_LEAFBRUSHES, CMod_LoadLeafBrushes);
+    CM_LOAD_LUMP(LUMP_PLANES,      CMod_LoadPlanes);
+    CM_LOAD_LUMP(LUMP_BRUSHES,     CMod_LoadBrushes);
+    CM_LOAD_LUMP(LUMP_BRUSHSIDES,  CMod_LoadBrushSides);
+    CM_LOAD_LUMP(LUMP_MODELS,      CMod_LoadSubmodels);
+    CM_LOAD_LUMP(LUMP_NODES,       CMod_LoadNodes);
+    CM_LOAD_LUMP(LUMP_AREAS,       CMod_LoadAreas);
+    CM_LOAD_LUMP(LUMP_AREAPORTALS, CMod_LoadAreaPortals);
 
-    cmod_base = (byte *)buf;
+#undef CM_LOAD_LUMP
 
-    // load into heap
-    CMod_LoadSurfaces(&header.lumps[LUMP_TEXINFO]);
-    CMod_LoadLeafs(&header.lumps[LUMP_LEAFS]);
-    CMod_LoadLeafBrushes(&header.lumps[LUMP_LEAFBRUSHES]);
-    CMod_LoadPlanes(&header.lumps[LUMP_PLANES]);
-    CMod_LoadBrushes(&header.lumps[LUMP_BRUSHES]);
-    CMod_LoadBrushSides(&header.lumps[LUMP_BRUSHSIDES]);
-    CMod_LoadSubmodels(&header.lumps[LUMP_MODELS]);
-    CMod_LoadNodes(&header.lumps[LUMP_NODES]);
-    CMod_LoadAreas(&header.lumps[LUMP_AREAS]);
-    CMod_LoadAreaPortals(&header.lumps[LUMP_AREAPORTALS]);
+    // These two are verbatim copies, so they are read straight into their arrays
+    // and never occupy the scratch. The size check the loaders used to do after
+    // the memcpy is now done by CM_BspReadLumpInto before the read.
+    CM_BspReadLumpInto(&bsp, &header.lumps[LUMP_VISIBILITY],
+                       map_visibility, MAX_MAP_VISIBILITY, "visibility");
     CMod_LoadVisibility(&header.lumps[LUMP_VISIBILITY]);
+
+    CM_BspReadLumpInto(&bsp, &header.lumps[LUMP_ENTITIES],
+                       map_entitystring, MAX_MAP_ENTSTRING, "entity");
     CMod_LoadEntityString(&header.lumps[LUMP_ENTITIES]);
 
-    FS_FreeFile(buf);
+    CM_BspClose(&bsp);
 
     CM_InitBoxHull();
 
@@ -672,6 +917,24 @@ cmodel_t * CM_InlineModel(char * name)
 int CM_NumClusters(void)
 {
     return numclusters;
+}
+
+// [PS2_QUAKE] 2026-08-29
+// For the renderer, which shares these PVS rows and needs the same "no vis data,
+// everything is visible" shortcut CM_DecompressVis takes internally - it wants to
+// mark every leaf and node at once rather than ask per cluster.
+qboolean CM_HasVisibility(void)
+{
+    return numvisibility > 0;
+}
+
+// [PS2_QUAKE] 2026-08-29
+// The .bsp currently loaded here, or "" for none. Also for the renderer: it reads
+// this map's PVS through CM_ClusterPVS, so its world model has to be the same one,
+// and this lets it say so up front instead of finding out from mismatched data.
+const char * CM_MapName(void)
+{
+    return map_name;
 }
 
 int CM_NumInlineModels(void)
@@ -1557,8 +1820,15 @@ static void CM_DecompressVis(byte * in, byte * out)
     } while (out_p - out < row);
 }
 
-static byte pvsrow[MAX_MAP_LEAFS / 8];
-static byte phsrow[MAX_MAP_LEAFS / 8];
+//
+// [PS2_QUAKE] 2026-08-29
+// 16-byte aligned because the renderer shares these rows now (it dropped its own
+// copy of the visibility lump and its own decompressor - see MarkLeaves in
+// ps2/renderer/render_view.cpp). Combining two clusters' PVS there ORs the rows a
+// word at a time, and MIPS will not load a word from an odd address.
+//
+static byte pvsrow[MAX_MAP_LEAFS / 8] __attribute__((aligned(16)));
+static byte phsrow[MAX_MAP_LEAFS / 8] __attribute__((aligned(16)));
 
 byte * CM_ClusterPVS(int cluster)
 {

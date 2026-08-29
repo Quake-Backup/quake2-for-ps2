@@ -95,9 +95,12 @@ PS2_CXX_SRC =                         \
 	ps2/renderer/vid.cpp              \
 	ps2/renderer/ref.cpp              \
 	ps2/renderer/vu1.cpp              \
-	ps2/renderer/tests/draw_cube.cpp  \
-	ps2/renderer/tests/cinematics.cpp \
-	ps2/debug/scr_print.cpp
+	ps2/tests/draw_cube.cpp           \
+	ps2/tests/cinematics.cpp          \
+	ps2/tests/map_cycle.cpp           \
+	ps2/debug/scr_print.cpp           \
+	ps2/debug/stack_trace.cpp         \
+	ps2/debug/exception_handler.cpp
 
 # Doug Lea's allocator + a small amount of embedded data kept as plain C:
 PS2_C_SRC = \
@@ -139,6 +142,33 @@ ENGINE_C_SRC = \
 C_SRC   = $(PS2_C_SRC) $(ENGINE_C_SRC)
 CXX_SRC = $(PS2_CXX_SRC)
 
+# Backend sources that run at load time or not at all in a normal frame: asset
+# parsing, IOP module boot, device setup, the debug screen printer. None of them
+# are on the per-frame path, so they are built for size instead of speed - worth
+# ~9 KB of .text, which is RAM the levels get to use instead.
+#
+# The hot renderer (render_view/render_md2/render_sky/gs/vu1/vram/lightmap/ref),
+# the math backend and the whole stock engine keep $(EE_OPTFLAGS).
+SIZE_OPT_CXX_SRC =                    \
+	ps2/renderer/model_load.cpp       \
+	ps2/renderer/image_load.cpp       \
+	ps2/renderer/texture.cpp          \
+	ps2/renderer/model.cpp            \
+	ps2/renderer/scrap_atlas.cpp      \
+	ps2/system/iop_boot.cpp           \
+	ps2/audio/audsrv_device.cpp       \
+	ps2/input/keyboard.cpp            \
+	ps2/input/pad.cpp                 \
+	ps2/renderer/vid.cpp              \
+	ps2/tests/draw_cube.cpp           \
+	ps2/tests/cinematics.cpp          \
+	ps2/tests/map_cycle.cpp           \
+	ps2/debug/scr_print.cpp           \
+	ps2/debug/stack_trace.cpp         \
+	ps2/debug/exception_handler.cpp
+
+SIZE_OPT_OBJS = $(addprefix $(OUTPUT_DIR)/$(SRC_DIR)/, $(SIZE_OPT_CXX_SRC:.cpp=.o))
+
 C_OBJS   = $(addprefix $(OUTPUT_DIR)/$(SRC_DIR)/, $(C_SRC:.c=.o))
 CXX_OBJS = $(addprefix $(OUTPUT_DIR)/$(SRC_DIR)/, $(CXX_SRC:.cpp=.o))
 
@@ -154,10 +184,12 @@ VU_OBJS   = $(addprefix $(BUILD_DIR)/vu/, $(VCL_FILES:.vcl=.o))
 # Standalone command line tools under src/tools, built with the HOST compiler
 # (not the EE toolchain) since they run on the development machine. Being host
 # binaries they are config-independent, so they live outside build/<config>/.
-TOOLS_PATH   = $(SRC_DIR)/tools
-TOOLS_BINS   = $(addprefix $(BUILD_DIR)/tools/, imgdump unpak)
-HOST_CC     ?= cc
-HOST_CFLAGS ?= -O2 -Wall
+TOOLS_PATH    = $(SRC_DIR)/tools
+TOOLS_CC_BINS = $(addprefix $(BUILD_DIR)/tools/, imgdump unpak bspinfo)
+TOOLS_PY_BINS = $(addprefix $(BUILD_DIR)/tools/, symbolize)
+TOOLS_BINS    = $(TOOLS_CC_BINS) $(TOOLS_PY_BINS)
+HOST_CC      ?= cc
+HOST_CFLAGS  ?= -O2 -Wall
 
 # IOP/IRX modules embedded into the ELF: the BDM USB mass-storage stack, booted
 # by ps2/system/iop_boot.cpp when the game data isn't on host: (real hardware),
@@ -236,7 +268,11 @@ EE_CXXFLAGS += -std=gnu++20 -fno-exceptions -fno-rtti -fno-threadsafe-statics \
 	$(EE_CXX_WARNFLAGS) $(EE_CXX_SYSINCS) \
 	-MMD -MP
 
-EE_LIBS += -ldraw -lgraph -lpacket -lpacket2 -ldma -lpad -lkbd -laudsrv -lpatches -lfileXio -lkernel
+# -leedebug supplies the level 1 exception vector that src/ps2/debug/exception_handler.cpp
+# hangs its post-mortem off. It contributes nothing to a release build - the whole
+# handler is behind PS2_QUAKE_DEBUG - but the linker only pulls in what is referenced,
+# so leaving it on the line for both configs costs nothing.
+EE_LIBS += -lkernel -ldraw -lgraph -lpacket2 -ldma -lpad -lkbd -laudsrv -lpatches -lfileXio -leedebug
 
 # ----------------------------------------------------------------------------
 #  Rules
@@ -279,7 +315,13 @@ $(C_OBJS): $(OUTPUT_DIR)/$(SRC_DIR)/%.o: $(SRC_DIR)/%.c
 
 $(CXX_OBJS): $(OUTPUT_DIR)/$(SRC_DIR)/%.o: $(SRC_DIR)/%.cpp
 	@mkdir -p $(dir $@)
-	$(EE_CXX) $(EE_CXXFLAGS) $(EE_INCS) -c $< -o $@
+	$(EE_CXX) $(EE_CXXFLAGS) $(EE_INCS) $(CXX_OPTFLAGS_FOR) -c $< -o $@
+
+# Per-object optimization override for the cold sources listed above. EE_CXXFLAGS
+# already carries $(EE_OPTFLAGS) from Makefile.eeglobal; appending -Os after it
+# wins, since the last -O on the command line is the one GCC applies. Target-
+# specific variables are inherited by the rule above, so only these objects see it.
+$(SIZE_OPT_OBJS): CXX_OPTFLAGS_FOR = -Os
 
 # VU1 microprograms.
 $(BUILD_DIR)/vu/%.o: $(VCL_PATH)/%.vcl
@@ -297,9 +339,16 @@ $(OUTPUT_DIR)/irx/%.o: $(IRX_PATH)/%.irx
 # Host tools: each is a single self-contained .c compiled straight to a binary.
 tools: $(TOOLS_BINS)
 
-$(TOOLS_BINS): $(BUILD_DIR)/tools/%: $(TOOLS_PATH)/%.c
+$(TOOLS_CC_BINS): $(BUILD_DIR)/tools/%: $(TOOLS_PATH)/%.c
 	@mkdir -p $(dir $@)
 	$(HOST_CC) $(HOST_CFLAGS) $< -o $@
+
+# Script tools are published into build/tools/ under the same extensionless names
+# as the compiled ones, so everything in there is invoked the same way.
+$(TOOLS_PY_BINS): $(BUILD_DIR)/tools/%: $(TOOLS_PATH)/%.py
+	@mkdir -p $(dir $@)
+	cp -f $< $@
+	@chmod +x $@
 
 # PCSX2 exposes the ELF's directory as host:, so the game data must be reachable
 # as build/<config>/baseq2. A symlink back to the repo's baseq2/ does it.

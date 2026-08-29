@@ -67,7 +67,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #elif defined PS2_QUAKE
 
-// LAMPERT: 2015-10-26
+// [PS2_QUAKE]: 2015-10-26
 // So the console prints a proper version string, instead of "NON-WIN32"
 #define BUILDSTRING "PS2-QUAKE"
 #define CPUSTRING   "EE-MIPS-R5900-LE"
@@ -631,6 +631,17 @@ cmodel_t * CM_InlineModel(char * name); // *1, *2, etc
 
 int CM_NumClusters(void);
 int CM_NumInlineModels(void);
+
+// [PS2_QUAKE] 2026-08-29
+// False on a map with no VISIBILITY lump, where CM_ClusterPVS would decompress to
+// all-visible for every cluster. The refresh checks this to take its own
+// mark-everything shortcut instead. See CM_ClusterPVS below.
+qboolean CM_HasVisibility(void);
+
+// The .bsp loaded here right now ("maps/<level>.bsp"), or "" for none. The refresh
+// checks its world model against this, since the two have to be the same map for
+// CM_ClusterPVS to mean anything.
+const char * CM_MapName(void);
 char * CM_EntityString(void);
 
 // creates a clipping hull for an arbitrary box
@@ -649,6 +660,18 @@ trace_t CM_TransformedBoxTrace(vec3_t start, vec3_t end,
                                int headnode, int brushmask,
                                vec3_t origin, vec3_t angles);
 
+// The decompressed (numclusters+7)/8-byte row for one cluster. Each returns a
+// shared static buffer that the next call to the same function overwrites, so
+// copy it if you need two at once. 16-byte aligned, so callers may read it a word
+// at a time. -1 means "outside the map": PVS answers nothing visible, PHS nothing
+// audible. Both are all-visible when the map has no vis data (CM_HasVisibility).
+//
+// [PS2_QUAKE] 2026-08-29
+// The refresh uses CM_ClusterPVS rather than carrying its own copy of the
+// visibility lump in the world hunk - the lump is up to 376 KB and was byte-for-
+// byte the same data. That makes the refresh's PVS depend on cmodel having the
+// same map loaded, which the load order guarantees: SV_SpawnServer runs CM_LoadMap
+// before the client ever reaches CL_PrepRefresh.
 byte * CM_ClusterPVS(int cluster);
 byte * CM_ClusterPHS(int cluster);
 
@@ -742,6 +765,26 @@ int Com_ServerState(void); // this should have just been a cvar...
 void Com_SetServerState(int state);
 
 unsigned Com_BlockChecksum(void * buffer, int length);
+
+// [PS2_QUAKE] 2026-08-29
+// Streaming form of Com_BlockChecksum, for data that is never all in memory at
+// once. Feeding the same bytes produces the same value however they are chunked,
+// which is what lets CM_LoadMap keep hashing the whole .bsp now that it reads the
+// file one lump at a time instead of holding it.
+//
+// Opaque on purpose - the real state is md4.c's MD4_CTX, which checks at compile
+// time that it fits in here. A union rather than a bare byte array so the storage
+// is aligned for the cast: MD4_CTX is words, and MIPS will not load one from an
+// odd address.
+typedef union
+{
+    unsigned char opaque[128];
+    double align_;
+} blockchecksum_t;
+
+void Com_BlockChecksumBegin(blockchecksum_t * ctx);
+void Com_BlockChecksumUpdate(blockchecksum_t * ctx, const void * buffer, int length);
+unsigned Com_BlockChecksumEnd(blockchecksum_t * ctx);
 byte COM_BlockSequenceCRCByte(byte * base, int length, int sequence);
 
 float frand(void); //  0 to 1
@@ -794,7 +837,7 @@ char * Sys_ConsoleInput(void);
 void Sys_ConsoleOutput(const char * string);
 void Sys_SendKeyEvents(void);
 
-void Sys_Quit(void);
+void Sys_Quit(void) __attribute__((cold));
 
 char * Sys_GetClipboardData(void);
 void Sys_CopyProtect(void);
@@ -813,6 +856,12 @@ void CL_Shutdown(void);
 void CL_Frame(int msec);
 void Con_Print(char * text);
 void SCR_BeginLoadingPlaque(void);
+
+// [PS2_QUAKE] 2026-08-29
+// Frees the refresh's world model before the next map is built, unless it is
+// already the one named. See the definition in cl_view.c; SV_SpawnServer is the
+// only caller.
+void CL_ReleaseWorldModel(const char * bsp_name);
 
 void SV_Init(void);
 void SV_Shutdown(char * finalmsg, qboolean reconnect);

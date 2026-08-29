@@ -10,7 +10,10 @@ namespace ps2::mod {
 
 struct ModelInstance;
 
-bool LoadBrushModel(ModelInstance & outModel, const void * modelData, int dataLenBytes);
+// Takes the file name rather than a loaded buffer: a world .bsp is 2-3 MB and the
+// hunk built from it another 4-7 MB, so this streams the lumps through a small
+// scratch buffer instead of holding both at once. See BspFileReader in the .cpp.
+bool LoadBrushModel(ModelInstance & outModel, const char * fileName);
 bool LoadSpriteModel(ModelInstance & outModel, const void * modelData, int dataLenBytes);
 bool LoadAliasMD2Model(ModelInstance & outModel, const void * modelData, int dataLenBytes);
 

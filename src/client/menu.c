@@ -1177,12 +1177,12 @@ static void ConsoleFunc(void * unused)
 static void UpdateSoundQualityFunc(void * unused)
 {
     //
-    // LAMPERT 2015-10-29
+    // [PS2_QUAKE] 2015-10-29
     //
     // FIXME:
-    // Can't for the life of me figure out what's wrong here!
+    // Can't figure out what's wrong here!
     // Somehow this still gets called outside Begin/End frame,
-    // breaking on the PS2. Commenting it out for now.
+    // breaking on the PS2 renderer. Commenting it out for now.
     //
 
     /*
@@ -1206,8 +1206,8 @@ static void UpdateSoundQualityFunc(void * unused)
 
     // the text box won't show up unless we do a buffer swap
     //
-    // LAMPERT 2015-10-29:
-    // FIXME This won't work in the PS2, we need consistent Begin/End frame states!
+    // [PS2_QUAKE] 2015-10-29:
+    // FIXME This won't work on the PS2, we need consistent Begin/End frame states!
     //re.EndFrame();
 
     CL_Snd_Restart_f();
@@ -2314,10 +2314,10 @@ void NullCursorDraw(void * self)
 void SearchLocalGames(void)
 {
     //
-    // LAMPERT 2015-10-29
+    // [PS2_QUAKE] 2015-10-29
     //
     // FIXME:
-    // Can't for the life of me figure out what's wrong here!
+    // Can't figure out what's wrong here!
     // Somehow this still gets called outside Begin/End frame,
     // breaking on the PS2. Commenting it out for now.
     //
@@ -2336,8 +2336,8 @@ void SearchLocalGames(void)
 
     // the text box won't show up unless we do a buffer swap
     //
-    // LAMPERT 2015-10-29:
-    // FIXME This won't work in the PS2, we need consistent Begin/End frame states!
+    // [PS2_QUAKE] 2015-10-29:
+    // FIXME This won't work on the PS2, we need consistent Begin/End frame states!
     //re.EndFrame();
 
     // send out info packets
@@ -3441,8 +3441,14 @@ static menuaction_s s_player_download_action;
 
 enum
 {
-    MAX_DISPLAYNAME  = 16,
-    MAX_PLAYERMODELS = 1024
+    MAX_DISPLAYNAME = 16,
+
+    // [PS2_QUAKE] 2026-08-27
+    // Was 1024, which reserved 94 KB of .bss for a list nobody can scroll through.
+    // This is only the player-config menu's model picker, and the port caps out at
+    // 8 clients; baseq2 ships 15 player models. LoadPlayerModels already clamps to
+    // this, so a bigger players/ directory just lists the first 64.
+    MAX_PLAYERMODELS = 64
 };
 
 typedef struct

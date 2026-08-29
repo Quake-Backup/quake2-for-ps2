@@ -212,26 +212,44 @@ typedef struct miptex_s
 
 // upper design bounds
 // leaffaces, leafbrushes, planes, and verts are still bounded by 16 bit short limits
-#define MAX_MAP_MODELS      1024
-#define MAX_MAP_BRUSHES     8192
+//
+// [PS2_QUAKE] 2026-08-27
+// These are id's design bounds for the BSP compiler, not what any shipped map needs,
+// and cmodel.c reserves a worst-case static array for most of them - 5.5 MB of .bss on
+// a 32 MB console, which was leaving too little heap to load the bigger levels.
+//
+// The ones cmodel.c sizes an array with are retuned to ~1.2-1.3x the largest value any
+// map in baseq2/pak0.pak actually uses (the 'was'/'worst' columns below; run
+// `build/tools/bspinfo` to regenerate them for another pak). Every CMod_Load* already
+// Com_Error's past its cap, so a map that outgrows one of these fails to load with a
+// readable message rather than corrupting memory.
+//
+// Untouched below: the lumps only the renderer reads (VERTS/FACES/LEAFFACES/EDGES/
+// SURFEDGES/LIGHTING), which are validation bounds rather than array sizes, plus
+// PORTALS/ENTITIES which nothing here allocates against, and AREAS - it sizes
+// areabits[MAX_MAP_AREAS/8] in the network protocol for all of 4 KB.
+//
+//                                    was      worst shipped map
+#define MAX_MAP_MODELS      224  //   1024        184 (city3)
+#define MAX_MAP_BRUSHES     6144 //   8192       4760 (hangar2)
 #define MAX_MAP_ENTITIES    2048
-#define MAX_MAP_ENTSTRING   0x40000
-#define MAX_MAP_TEXINFO     8192
-#define MAX_MAP_AREAS       256
-#define MAX_MAP_AREAPORTALS 1024
-#define MAX_MAP_PLANES      65536
-#define MAX_MAP_NODES       65536
-#define MAX_MAP_BRUSHSIDES  65536
-#define MAX_MAP_LEAFS       65536
+#define MAX_MAP_ENTSTRING   0x28000 // 0x40000  134523 (lab)
+#define MAX_MAP_TEXINFO     1536 //   8192       1186 (lab)
+#define MAX_MAP_AREAS       256  //                20 (command)
+#define MAX_MAP_AREAPORTALS 64   //   1024         47 (bunk1)
+#define MAX_MAP_PLANES      16384 //  65536      14594 (strike)
+#define MAX_MAP_NODES       12288 //  65536       9245 (lab)
+#define MAX_MAP_BRUSHSIDES  40960 //  65536      36077 (hangar2)
+#define MAX_MAP_LEAFS       12288 //  65536       9396 (city3)
 #define MAX_MAP_VERTS       65536
 #define MAX_MAP_FACES       65536
 #define MAX_MAP_LEAFFACES   65536
-#define MAX_MAP_LEAFBRUSHES 65536
+#define MAX_MAP_LEAFBRUSHES 16384 //  65536      12537 (city3)
 #define MAX_MAP_PORTALS     65536
 #define MAX_MAP_EDGES       128000
 #define MAX_MAP_SURFEDGES   256000
 #define MAX_MAP_LIGHTING    0x200000
-#define MAX_MAP_VISIBILITY  0x100000
+#define MAX_MAP_VISIBILITY  0x70000 // 0x100000 376172 (jail5)
 
 // key / value pair sizes
 #define MAX_KEY   32

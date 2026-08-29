@@ -443,7 +443,8 @@ Build a client frame structure
 =============================================================================
 */
 
-byte fatpvs[65536 / 8]; // 32767 is MAX_MAP_LEAFS
+// [PS2_QUAKE]: Align to 16, cast to long in the function below.
+static byte fatpvs[MAX_MAP_LEAFS / 8] __attribute__((aligned(16))); // one bit per cluster, and clusters <= leafs
 
 /*
 ============

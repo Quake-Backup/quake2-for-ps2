@@ -45,7 +45,7 @@ typedef struct
     qboolean ladder;
 } pml_t;
 
-// LAMPERT 2015-10-27
+// [PS2_QUAKE] 2015-10-27
 // Marked these locals as 'static'
 static pmove_t * pm;
 static pml_t pml;

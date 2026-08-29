@@ -72,7 +72,7 @@ typedef struct searchpath_s
     struct searchpath_s * next;
 } searchpath_t;
 
-// LAMPERT 2015-10-27
+// [PS2_QUAKE] 2015-10-27
 // Marked these locals as 'static'
 
 static char fs_gamedir[MAX_OSPATH];
@@ -367,7 +367,7 @@ Properly handles partial reads
 void FS_Read(void * buffer, int len, FILE * fp)
 {
     //
-    // LAMPERT 2016-01-26:
+    // [PS2_QUAKE] 2016-01-26:
     // Added the unchunked file reading code to
     // speed up testing on the PS2 from a USB drive.
     //
@@ -503,7 +503,7 @@ pack_t * FS_LoadPackFile(char * packfile)
     int numpackfiles;
     pack_t * pack;
     FILE * packhandle;
-    dpackfile_t info[MAX_FILES_IN_PACK];
+    dpackfile_t * info;
     unsigned checksum;
 
     packhandle = fopen(packfile, "rb");
@@ -522,10 +522,33 @@ pack_t * FS_LoadPackFile(char * packfile)
     header.dirlen = LittleLong(header.dirlen);
     numpackfiles = header.dirlen / sizeof(dpackfile_t);
 
-    if (numpackfiles > MAX_FILES_IN_PACK)
+    // [PS2_QUAKE]: this is a hard stop, not a Com_Error. Pack loading happens inside
+    // Qcommon_Init, before the console, the renderer or the ERR_FATAL longjmp
+    // target exist, so Com_Error here would unwind into machinery that is not up
+    // yet. Sys_Error paints the message on its own panic screen and halts.
+    if (header.dirlen < 0 || numpackfiles < 0 || numpackfiles > MAX_FILES_IN_PACK)
     {
-        Com_Error(ERR_FATAL, "%s has %i files", packfile, numpackfiles);
+        Sys_Error("Pack file %s has %i entries; this build supports at most %i.",
+                  packfile, numpackfiles, MAX_FILES_IN_PACK);
     }
+
+    // [PS2_QUAKE]: the pack directory is staged on the heap, NOT on the stack.
+    //
+    // id read it into a `dpackfile_t info[MAX_FILES_IN_PACK]` local, which is
+    // 4096 * 64 = 256 KB of stack frame - against the 128 KB the EE gets from
+    // ps2sdk's linkfile (_stack_size). Entering this function moved $sp clean
+    // through the bottom of the stack and into the heap arena on every single
+    // call, and the fread below then wrote the whole directory across the two.
+    // Nothing complained: the EE has no MMU, so the overflow only corrupted
+    // whatever the allocator had already handed out down there - silently, and
+    // only once the heap had grown far enough up to meet it.
+    //
+    // baseq2/pak0.pak alone is 3307 entries, a 211 KB directory, so this was not
+    // a large-pack edge case; it happened at every boot. Capping the array to
+    // something that fits the stack would reject the game's own pak, so the
+    // staging buffer moved to the heap instead, sized to the directory actually
+    // being read. Do not put it back on the stack.
+    info = Z_Malloc(header.dirlen);
 
     newfiles = Z_Malloc(numpackfiles * sizeof(packfile_t));
 
@@ -538,6 +561,7 @@ pack_t * FS_LoadPackFile(char * packfile)
 #ifdef NO_ADDONS
     if (checksum != PAK0_CHECKSUM)
     {
+        Z_Free(info); // [PS2_QUAKE] NOTE: id leaks newfiles and packhandle here; left as-is.
         return NULL;
     }
 #endif
@@ -549,6 +573,8 @@ pack_t * FS_LoadPackFile(char * packfile)
         newfiles[i].filepos = LittleLong(info[i].filepos);
         newfiles[i].filelen = LittleLong(info[i].filelen);
     }
+
+    Z_Free(info); // [PS2_QUAKE] NOTE: Staging buffer only; newfiles is what the pack_t keeps.
 
     pack = Z_Malloc(sizeof(pack_t));
     strcpy(pack->filename, packfile);
@@ -929,8 +955,8 @@ char * FS_NextPath(char * prevpath)
 ================
 FS_SetDefaultBasePath
 
-LAMPERT:
-Added for QPS2 so we can change the game path prior to
+[PS2_QUAKE]:
+Added for PS2 Quake so we can change the game path prior to
 FS init and look for files in the USB drive or CDFS.
 ================
 */

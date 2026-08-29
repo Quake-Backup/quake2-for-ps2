@@ -41,7 +41,7 @@ constexpr int ArrayLength(const T (&)[N])
 #if PS2_QUAKE_ASSERTS
     #define PS2_Assert(cond)                               \
         do {                                               \
-            if (!(cond))                                   \
+            if (!(cond)) [[unlikely]]                      \
             {                                              \
                 Sys_Error("Assert Failed: %s", #cond);     \
             }                                              \
@@ -49,7 +49,7 @@ constexpr int ArrayLength(const T (&)[N])
 
     #define PS2_AssertMsg(cond, message)                   \
         do {                                               \
-            if (!(cond))                                   \
+            if (!(cond)) [[unlikely]]                      \
             {                                              \
                 Sys_Error("Assert Failed: %s", (message)); \
             }                                              \

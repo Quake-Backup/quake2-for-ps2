@@ -21,6 +21,7 @@ struct image_s * PS2_RegisterSkin(const char * name);
 struct image_s * PS2_RegisterPic(const char * name);
 void PS2_SetSky(const char * name, float rotate, vec3_t axis);
 void PS2_EndRegistration();
+void PS2_ReleaseWorldModel(const char * bspName);
 void PS2_RenderFrame(refdef_t * fd);
 void PS2_DrawGetPicSize(int * w, int * h, const char * name);
 void PS2_DrawPic(int x, int y, const char * name);
@@ -51,6 +52,7 @@ void VID_Init()
     re.RegisterPic         = PS2_RegisterPic;
     re.SetSky              = PS2_SetSky;
     re.EndRegistration     = PS2_EndRegistration;
+    re.ReleaseWorldModel   = PS2_ReleaseWorldModel;
     re.RenderFrame         = PS2_RenderFrame;
     re.DrawGetPicSize      = PS2_DrawGetPicSize;
     re.DrawPic             = PS2_DrawPic;
@@ -65,7 +67,7 @@ void VID_Init()
     re.EndFrame            = PS2_EndFrame;
     re.AppActivate         = PS2_AppActivate;
 
-    if (!re.Init(nullptr, nullptr))
+    if (!re.Init(nullptr, nullptr)) [[unlikely]]
     {
         Sys_Error("VID_Init: PS2 refresh failed to initialise!");
     }

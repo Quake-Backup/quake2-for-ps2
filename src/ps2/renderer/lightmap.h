@@ -116,6 +116,13 @@ void CreateSurfaceLightmap(mod::ModelSurface & surf);
 // BeginBuildingLightmaps.
 void EndBuildingLightmaps();
 
+// Frees the atlases (EE RAM and GS VRAM) without starting a new build.
+// BeginBuildingLightmaps does this for you; call it directly only to give the
+// memory back early, and only together with dropping the world model - the
+// atlases are reachable only through ModelSurface::lightmapTextureNum, so
+// releasing them while surfaces still point at them leaves dangling indices.
+void ReleaseAtlases();
+
 // ------------------------------------------------------------------------------------------------
 // Frame time
 // ------------------------------------------------------------------------------------------------

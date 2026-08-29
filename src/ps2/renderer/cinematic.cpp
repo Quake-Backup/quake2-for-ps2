@@ -14,9 +14,10 @@
 #include "ps2/renderer/cinematic.h"
 #include "ps2/renderer/gs.h"
 #include "ps2/renderer/texture.h"
+#include "ps2/system/heap.h"
 #include "ps2/builtin/builtin.h" // global_palette
 
-#include <cstring> // memcpy
+#include <cstring> // memcpy, memset
 
 namespace ps2::cin {
 namespace {
@@ -26,19 +27,24 @@ namespace {
 // the per-frame conversion + upload stay cheap.
 constexpr int kFrameDim = 256;
 
-// The expanded frame and the RGBA palette it is expanded with. Static .bss
-// buffers (~128 KB + 1 KB) rather than heap, matching the old renderer: the
-// buffers exist for the life of the program, only the VRAM copy is transient.
-// Zero-initialization also guarantees the rows past a short frame stay black.
-alignas(16) static u16 s_frameBuffer[kFrameDim * kFrameDim];
+// The expanded frame, allocated on first use and released when playback stops.
+// 128 KB is worth reclaiming: cinematics play *between* levels, so as .bss this
+// was reserved for the whole run, competing with the map that has just loaded.
+// The allocation is zeroed so rows past a short frame stay black.
+constexpr size_t kFrameBufferBytes = kFrameDim * kFrameDim * sizeof(u16);
+static u16 * s_frameBuffer = nullptr;
+
+// The palette frames are expanded with. Only 1 KB, and SetPalette can arrive
+// before the first frame does, so this one stays static.
 alignas(16) static u32 s_palette[256];
 
 // The frame texture, drawn through the regular 2D texture path. Linear
 // filtering smooths the stretch to screen size (the GS does the upscale).
+// 'pixels' is patched to the frame buffer by EnsureFrameBuffer below.
 static tex::Texture s_frameTexture = {
     .name         = "cinematic_frame",
     .regSequence  = 0, // never in the texture cache; not part of the registration cycle.
-    .pixels       = s_frameBuffer,
+    .pixels       = nullptr,
     .width        = kFrameDim,
     .height       = kFrameDim,
     .type         = tex::ImageType::Pic,
@@ -57,6 +63,38 @@ static tex::Texture s_frameTexture = {
     .dirtyPixels  = false,
 };
 
+// Allocates the frame buffer on the first frame of a cinematic. Zeroed, so the
+// rows a short frame never writes draw black instead of the previous movie's
+// leftovers. PS2_MemAllocAligned is fatal on failure, so there is no error path.
+void EnsureFrameBuffer()
+{
+    if (s_frameBuffer != nullptr)
+    {
+        return;
+    }
+
+    void * const mem = PS2_MemAllocAligned(16, kFrameBufferBytes, MEMTAG_RENDERER);
+    std::memset(mem, 0, kFrameBufferBytes);
+
+    s_frameBuffer         = static_cast<u16 *>(mem);
+    s_frameTexture.pixels = s_frameBuffer;
+}
+
+// Drops the frame buffer at end of playback. Safe to call when nothing is
+// allocated, which is the common case - the engine resets the palette on every
+// SCR_StopCinematic, including ones that never drew a frame.
+void ReleaseFrameBuffer()
+{
+    if (s_frameBuffer == nullptr)
+    {
+        return;
+    }
+
+    PS2_MemFree(s_frameBuffer, kFrameBufferBytes, MEMTAG_RENDERER);
+    s_frameBuffer         = nullptr;
+    s_frameTexture.pixels = nullptr;
+}
+
 } // namespace
 
 void SetPalette(const u8 * palette)
@@ -69,6 +107,9 @@ void SetPalette(const u8 * palette)
         // so the frame texture's VRAM can go back to the texture heap. Harmless
         // if a cinematic draws again later - the texture re-uploads on bind.
         gs::ReleaseTexture(s_frameTexture);
+
+        // ...and the EE-side frame buffer with it; the next cinematic re-allocates.
+        ReleaseFrameBuffer();
         return;
     }
 
@@ -88,6 +129,8 @@ void DrawFrame(int x, int y, int w, int h, int cols, int rows, const u8 * data)
 {
     PS2_Assert(data != nullptr);
     PS2_Assert(cols > 0 && rows > 0);
+
+    EnsureFrameBuffer();
 
     // Rows map 1:1 when the source fits vertically; taller sources downsample
     // by row skipping. Columns always resample to the fixed 256-px width.

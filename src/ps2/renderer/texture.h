@@ -194,6 +194,12 @@ void SetSkyDownsample(bool enable);
 // a Find() to refresh their sequence number.
 void TouchTexture(const Texture & texture);
 
+// Capacity of the texture cache: world textures, model skins, HUD/menu pics.
+// Exported because render_view.cpp sizes its per-frame texture chain array to
+// the same bound - a chain can hold at most one entry per live texture.
+// Running out is a Sys_Error telling you to bump this.
+constexpr u32 kMaxTextures = 640;
+
 // Number of built-in debug checkerboard variants (distinct colors).
 constexpr int kNumDebugTextures = PS2_QUAKE_DEBUG ? 6 : 1;
 

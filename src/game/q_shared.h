@@ -280,7 +280,7 @@ byte * Hunk_BlockAlloc(mem_hunk_t * hunk, int block_size);
 // Get the offset to the end of the allocated region.
 int Hunk_GetTail(mem_hunk_t * hunk);
 
-// LAMPERT 2015-10-30:
+// [PS2_QUAKE] 2015-10-30:
 // Original Hunk allocator API used by Quake2
 // relied on global data. We provide a cleaner
 // global-state-free replacement.
@@ -314,7 +314,7 @@ char * Sys_FindNext(unsigned musthave, unsigned canthave);
 void Sys_FindClose(void);
 
 // this is only here so the functions in q_shared.c and q_shwin.c can link
-void Sys_Error(const char * error, ...) Q_PRINTF_FUNC(1, 2);
+void Sys_Error(const char * error, ...) Q_PRINTF_FUNC(1, 2) __attribute__((cold));
 void Com_Printf(const char * msg, ...) Q_PRINTF_FUNC(1, 2);
 
 /*

@@ -2,6 +2,10 @@
 
 #include <string.h>
 
+/* [PS2_QUAKE] 2026-08-29: for blockchecksum_t, the opaque form of MD4_CTX that the
+   streaming Com_BlockChecksum* entry points at the bottom of this file exposes. */
+#include "common/q_common.h"
+
 /* POINTER defines a generic pointer type */
 typedef unsigned char * POINTER;
 
@@ -20,11 +24,11 @@ typedef unsigned long int UINT4;
 /* Copyright (C) 1991-2, RSA Data Security, Inc. Created 1991. 
 
 All rights reserved.
-  
-License to copy and use this software is granted provided that it is identified as the “RSA Data Security, Inc. MD4 Message-Digest Algorithm” in all material mentioning or referencing this software or this function.
-License is also granted to make and use derivative works provided that such works are identified as “derived from the RSA Data Security, Inc. MD4 Message-Digest Algorithm” in all material mentioning or referencing the derived work.
-RSA Data Security, Inc. makes no representations concerning either the merchantability of this software or the suitability of this software for any particular purpose. It is provided “as is” without express or implied warranty of any kind.
-  
+
+License to copy and use this software is granted provided that it is identified as the RSA Data Security, Inc. MD4 Message-Digest Algorithm in all material mentioning or referencing this software or this function.
+License is also granted to make and use derivative works provided that such works are identified as derived from the RSA Data Security, Inc. MD4 Message-Digest Algorithm in all material mentioning or referencing the derived work.
+RSA Data Security, Inc. makes no representations concerning either the merchantability of this software or the suitability of this software for any particular purpose. It is provided as is without express or implied warranty of any kind.
+
 These notices must be retained in any copies of any part of this documentation and/or software. */
 
 /* MD4 context. */
@@ -270,15 +274,46 @@ static void Decode(UINT4 * output, unsigned char * input, unsigned int len)
 
 unsigned Com_BlockChecksum(void * buffer, int length)
 {
+    blockchecksum_t ctx;
+
+    Com_BlockChecksumBegin(&ctx);
+    Com_BlockChecksumUpdate(&ctx, buffer, length);
+    return Com_BlockChecksumEnd(&ctx);
+}
+
+/*
+===================================================================
+[PS2_QUAKE] 2026-08-29
+
+Streaming checksum, declared in q_common.h. blockchecksum_t is an opaque byte
+blob there so the rest of the engine does not need MD4's internals; this is
+where the two are tied together, and the typedef below fails to compile if the
+blob ever stops being big enough.
+
+CM_LoadMap uses this to keep hashing the whole .bsp while reading it one lump at
+a time - see the comment on the declaration for why the value has to stay
+identical to what the original whole-file MD4 produced.
+===================================================================
+*/
+typedef char md4_ctx_fits_in_blockchecksum_t
+    [(sizeof(MD4_CTX) <= sizeof(((blockchecksum_t *)0)->opaque)) ? 1 : -1];
+
+void Com_BlockChecksumBegin(blockchecksum_t * ctx)
+{
+    MD4Init((MD4_CTX *)ctx);
+}
+
+void Com_BlockChecksumUpdate(blockchecksum_t * ctx, const void * buffer, int length)
+{
+    if (length > 0)
+        MD4Update((MD4_CTX *)ctx, (unsigned char *)buffer, length);
+}
+
+unsigned Com_BlockChecksumEnd(blockchecksum_t * ctx)
+{
     int digest[4];
-    unsigned val;
-    MD4_CTX ctx;
 
-    MD4Init(&ctx);
-    MD4Update(&ctx, (unsigned char *)buffer, length);
-    MD4Final((unsigned char *)digest, &ctx);
+    MD4Final((unsigned char *)digest, (MD4_CTX *)ctx);
 
-    val = digest[0] ^ digest[1] ^ digest[2] ^ digest[3];
-
-    return val;
+    return digest[0] ^ digest[1] ^ digest[2] ^ digest[3];
 }

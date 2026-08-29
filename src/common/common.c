@@ -1096,7 +1096,7 @@ void Info_Print(char * s)
 */
 
 //
-// LAMPERT 2015-10-28
+// [PS2_QUAKE] 2015-10-28
 // Replaced malloc/free with the PS2 memory allocation wrappers to keep
 // count of all memory allocations, plus a few other minor changes.
 //
@@ -1432,9 +1432,9 @@ void Qcommon_Init(int argc, char ** argv)
     Cmd_Init();
     Cvar_Init();
     Key_Init();
-    Con_Init(); // LAMPERT: Early console init so we can debug initialization problems.
+    Con_Init(); // [PS2_QUAKE]: Early console init so we can debug initialization problems.
 
-    // LAMPERT 2015-10-26:
+    // [PS2_QUAKE] 2015-10-26:
 	// Developer mode by default in debug builds, unless specified otherwise.
     developer = Cvar_Get("developer", PS2_QUAKE_DEBUG ? "1" : "0", 0);
 
@@ -1511,8 +1511,9 @@ void Qcommon_Init(int argc, char ** argv)
         SCR_EndLoadingPlaque();
     }
 
-    // NOTE (LAMPERT): Uncomment these two lines to force loading straight
+    // [PS2_QUAKE] NOTE: Uncomment these two lines to force loading straight
     // into a level without any monsters (deathmatch 1), e.g.: map base1.
+    // Useful for rendering bring-up tests.
     //
     //Cbuf_AddText("killserver ; maxclients 1 ; deathmatch 1 ; cheats 1 ; map base1\n");
     //Cbuf_Execute();

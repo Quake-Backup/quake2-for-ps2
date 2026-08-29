@@ -7,7 +7,7 @@
 
 #if PS2_QUAKE_DEBUG
 #include "ps2/common.h"
-#include "ps2/renderer/tests/draw_cube.h"
+#include "ps2/tests/draw_cube.h"
 #include "ps2/renderer/texture.h"
 #include "ps2/renderer/vu1.h"
 #include "ps2/renderer/gs.h"

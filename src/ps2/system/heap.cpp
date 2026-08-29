@@ -7,8 +7,9 @@
  * This source code is released under the GNU GPL v2 license.
  * ================================================================================================ */
 
-#include "ps2/system/heap.h"
 #include "ps2/common.h" // Sys_Error, etc
+#include "ps2/system/heap.h"
+#include "ps2/debug/stack_trace.h" // PrintStackTrace
 
 #include <new>
 #include <cstdio>  // snprintf
@@ -67,30 +68,43 @@ static PS2MemStats s_memTagCounts[MEMTAG_COUNT] = {};
 
 // NOTE: These should match the PS2MemTag declaration order!
 static const char * const s_memTagNames[MEMTAG_COUNT] = {
-    "Misc",
+    "ELF_Sys",
     "OpNew",
     "Quake",
     "Renderer",
     "TexImage",
-    "Mdl_Alias",
-    "Mdl_Sprite",
-    "Mdl_World",
+    "Alias",
+    "Sprite",
+    "World",
     "Lightmap",
+    "Audio",
 };
 
 static inline size_t MemTagToIndex(PS2MemTag tag)
 {
     const int t = static_cast<int>(tag);
-    return (t >= 0 && t < MEMTAG_COUNT) ? static_cast<size_t>(t) : static_cast<size_t>(MEMTAG_MISC);
+    return (t >= 0 && t < MEMTAG_COUNT) ? static_cast<size_t>(t) : static_cast<size_t>(MEMTAG_ELF_SYS);
 }
+
+// Running sum of every tag's totalBytes, and the largest it has ever been. Kept
+// incrementally rather than summed on demand so the peak is sampled at every
+// allocation - the map-change transient we care about lasts milliseconds and would
+// be missed by anything that only looks when asked.
+static size_t s_liveTotalBytes = 0;
+static size_t s_peakTotalBytes = 0;
 
 static inline void AccountAlloc(PS2MemTag tag, size_t bytes)
 {
     PS2MemStats * c = &s_memTagCounts[MemTagToIndex(tag)];
     c->totalBytes  += bytes;
     c->totalAllocs += 1u;
+
     if (c->smallestAlloc == 0u || bytes < c->smallestAlloc) { c->smallestAlloc = bytes; }
     if (bytes > c->largestAlloc) { c->largestAlloc = bytes; }
+    if (c->totalBytes > c->peakBytes) { c->peakBytes = c->totalBytes; }
+
+    s_liveTotalBytes += bytes;
+    if (s_liveTotalBytes > s_peakTotalBytes) { s_peakTotalBytes = s_liveTotalBytes; }
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -103,11 +117,25 @@ void * PS2_MemAlloc(size_t sizeBytes, PS2MemTag tag)
 {
     const size_t n = (sizeBytes != 0u ? sizeBytes : 1u);
     void * p = dlmalloc(n);
-    if (p == nullptr)
+
+    if (p == nullptr) [[unlikely]]
     {
+        // The call stack goes to stdout, not to Sys_Error: the panic screen it
+        // paints has 24 lines to spend on the message and the memtag table, and
+        // stdout is where the PCSX2/ps2client log goes.
+        std::printf("PS2_MemAlloc: failed to allocate %zu bytes (%s)\n",
+                    n, s_memTagNames[MemTagToIndex(tag)]);
+        ps2::debug::PrintStackTrace();
+
+        // On the stack, not a static: this path is out-of-memory, so the last
+        // thing it should do is depend on 2 KB of .bss the failure just proved
+        // is scarce. There is plenty of room on the EE's 128 KB stack.
+        char dump[PS2_MEMTAGS_DUMP_SIZE];
         Sys_Error("PS2_MemAlloc: failed to allocate %zu bytes (%s)\n"
-                  "%s", n, s_memTagNames[MemTagToIndex(tag)], PS2_DumpMemTags());
+                  "%s", n, s_memTagNames[MemTagToIndex(tag)],
+                  PS2_DumpMemTags(dump, sizeof(dump)));
     }
+
     AccountAlloc(tag, n);
     return p;
 }
@@ -116,11 +144,19 @@ void * PS2_MemAllocAligned(size_t alignment, size_t sizeBytes, PS2MemTag tag)
 {
     const size_t n = (sizeBytes != 0u ? sizeBytes : 1u);
     void * p = dlmemalign(alignment, n);
-    if (p == nullptr)
+
+    if (p == nullptr) [[unlikely]]
     {
+        std::printf("PS2_MemAllocAligned: failed to allocate %zu bytes (align %zu, %s)\n",
+                    n, alignment, s_memTagNames[MemTagToIndex(tag)]);
+        ps2::debug::PrintStackTrace(); // Stdout, for the same reason as above.
+
+        char dump[PS2_MEMTAGS_DUMP_SIZE]; // Stack, for the same reason as above.
         Sys_Error("PS2_MemAllocAligned: failed to allocate %zu bytes (align %zu, %s)\n"
-                  "%s", n, alignment, s_memTagNames[MemTagToIndex(tag)], PS2_DumpMemTags());
+                  "%s", n, alignment, s_memTagNames[MemTagToIndex(tag)],
+                  PS2_DumpMemTags(dump, sizeof(dump)));
     }
+
     AccountAlloc(tag, n);
     return p;
 }
@@ -132,7 +168,9 @@ void PS2_MemFree(void * ptr, size_t sizeBytes, PS2MemTag tag)
     c->totalFrees += 1u;
     if (sizeBytes != 0u)
     {
-        c->totalBytes = (c->totalBytes >= sizeBytes) ? (c->totalBytes - sizeBytes) : 0u;
+        const size_t taken = (c->totalBytes >= sizeBytes) ? sizeBytes : c->totalBytes;
+        c->totalBytes     -= taken;
+        s_liveTotalBytes  -= (s_liveTotalBytes >= taken) ? taken : s_liveTotalBytes;
     }
     dlfree(ptr);
 }
@@ -185,15 +223,20 @@ void PS2_TagsAddSystemMem()
                              static_cast<double>(availBytes) / 1024.0 / 1024.0,
                              static_cast<double>(totalUsedBytes) / 1024.0 / 1024.0));
 
-        PS2_TagsAddMem(MEMTAG_MISC, totalUsedBytes);
+        PS2_TagsAddMem(MEMTAG_ELF_SYS, totalUsedBytes);
     }
 }
 
-const char * PS2_FormatMemoryUnit(size_t memorySizeInBytes, int abbreviated)
+const char * PS2_FormatMemoryUnit(size_t memorySizeInBytes, int abbreviated,
+                                  char * outBuffer, size_t outBufferSize)
 {
-    static char s_str[64];
     const char * unit;
     double value;
+
+    if (outBuffer == nullptr || outBufferSize == 0u)
+    {
+        return "";
+    }
 
     if (memorySizeInBytes >= (1024u * 1024u * 1024u))
     {
@@ -216,8 +259,8 @@ const char * PS2_FormatMemoryUnit(size_t memorySizeInBytes, int abbreviated)
         value = static_cast<double>(memorySizeInBytes);
     }
 
-    std::snprintf(s_str, sizeof(s_str), "%.2f %s", value, unit);
-    return s_str;
+    std::snprintf(outBuffer, outBufferSize, "%.2f %s", value, unit);
+    return outBuffer;
 }
 
 const PS2MemStats * PS2_GetStatsForMemTag(PS2MemTag tag)
@@ -230,34 +273,62 @@ const char * PS2_GetNameForMemTag(PS2MemTag tag)
     return s_memTagNames[MemTagToIndex(tag)];
 }
 
-const char * PS2_DumpMemTags()
+size_t PS2_GetPeakMemBytes()
 {
-    static char s_memTagsDumpBuff[2048];
-    char * ptr = s_memTagsDumpBuff;
+    return s_peakTotalBytes;
+}
+
+const char * PS2_DumpMemTags(char * outBuffer, size_t outBufferSize)
+{
+    char unitStr[PS2_MEMUNIT_STR_SIZE];
+    char peakStr[PS2_MEMUNIT_STR_SIZE];
+    char * ptr;
+    char * const end = outBuffer + outBufferSize;
     size_t memTotal = 0;
 
-    ptr += std::sprintf(ptr, "--------------------------- MEMTAGS ---------------------------\n");
-    ptr += std::sprintf(ptr, "Tag Name          Bytes      Allocs  Frees   Small    Large\n");
+    if (outBuffer == nullptr || outBufferSize == 0u)
+    {
+        return "";
+    }
+
+    // snprintf clamps and reports the *untruncated* length, so advance by
+    // whichever is smaller: a dump that outgrows the caller's buffer stops
+    // filling it instead of walking off the end.
+    ptr = outBuffer;
+    const auto append = [&ptr, end](const char * fmt, auto... args)
+    {
+        if (ptr >= end) { return; }
+        const size_t left = static_cast<size_t>(end - ptr);
+        const int n = std::snprintf(ptr, left, fmt, args...);
+        ptr += (n < 0) ? 0 : ((static_cast<size_t>(n) < left) ? n : static_cast<int>(left - 1u));
+    };
+
+    append("%s", "--------------------------- MEMTAGS ---------------------------\n");
+    append("%s", "Tag      Total     Peak      Allocs  Frees   Small    Large\n");
 
     for (int i = 0; i < MEMTAG_COUNT; ++i)
     {
         memTotal += s_memTagCounts[i].totalBytes;
-        const char * const totalStr = PS2_FormatMemoryUnit(s_memTagCounts[i].totalBytes, true);
 
-        ptr += std::sprintf(ptr, "%-17s %-10s %-7zu %-7zu %-8zu %-8zu\n",
-                            s_memTagNames[i], totalStr,
-                            s_memTagCounts[i].totalAllocs,
-                            s_memTagCounts[i].totalFrees,
-                            s_memTagCounts[i].smallestAlloc,
-                            s_memTagCounts[i].largestAlloc);
+        append("%-8s %-9s %-9s %-7zu %-7zu %-8zu %-8zu\n",
+               s_memTagNames[i],
+               PS2_FormatMemoryUnit(s_memTagCounts[i].totalBytes, true, unitStr, sizeof(unitStr)),
+               PS2_FormatMemoryUnit(s_memTagCounts[i].peakBytes,  true, peakStr, sizeof(peakStr)),
+               s_memTagCounts[i].totalAllocs,
+               s_memTagCounts[i].totalFrees,
+               s_memTagCounts[i].smallestAlloc,
+               s_memTagCounts[i].largestAlloc);
     }
 
-    ptr += std::sprintf(ptr, "\nTOTAL MEM: %s\n", PS2_FormatMemoryUnit(memTotal, true));
-    ptr += std::sprintf(ptr, "FREE MEM (sbrk):  %s\n", PS2_FormatMemoryUnit(PS2_GetAvailableMemBytes(), true));
-    ptr += std::sprintf(ptr, "--------------------------- MEMTAGS ---------------------------");
+    // PEAK MEM is the high-water of the sum, not the sum of the per-tag peaks:
+    // those happen at different moments, so adding them up would over-report.
+    append("\nTOTAL MEM: %s", PS2_FormatMemoryUnit(memTotal, true, unitStr, sizeof(unitStr)));
+    append("   PEAK MEM: %s\n", PS2_FormatMemoryUnit(s_peakTotalBytes, true, peakStr, sizeof(peakStr)));
+    append("FREE MEM (sbrk): %s\n", PS2_FormatMemoryUnit(PS2_GetAvailableMemBytes(), true, unitStr, sizeof(unitStr)));
+    append("%s", "--------------------------- MEMTAGS ---------------------------");
 
-    s_memTagsDumpBuff[sizeof(s_memTagsDumpBuff) - 1] = '\0';
-    return s_memTagsDumpBuff;
+    outBuffer[outBufferSize - 1u] = '\0';
+    return outBuffer;
 }
 
 } // extern "C"

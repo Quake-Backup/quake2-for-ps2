@@ -207,7 +207,7 @@ void InitGame(void)
     // items
     InitItems();
 
-    // LAMPERT: Why not memset in the fist place???
+    // [PS2_QUAKE]: Why not memset in the fist place???
     memset(game.helpmessage1, 0, sizeof(game.helpmessage1));
     memset(game.helpmessage2, 0, sizeof(game.helpmessage2));
     //Com_sprintf(game.helpmessage1, sizeof(game.helpmessage1), "");

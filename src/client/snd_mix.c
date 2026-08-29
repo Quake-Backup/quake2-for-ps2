@@ -374,7 +374,7 @@ void S_PaintChannelFrom8(channel_t * ch, sfxcache_t * sc, int count, int offset)
     if (ch->rightvol > 255)
         ch->rightvol = 255;
 
-    // LAMPERT NOTE: id's C reference path had ">> 11" here, which is always zero for a
+    // [PS2_QUAKE] NOTE: id's C reference path had ">> 11" here, which is always zero for a
     // volume clamped to 0-255 just above - row zero of the table is all zeros, so
     // every 8-bit sample mixed to silence. The x86 asm path below indexes the table
     // correctly (and eax,0F8h / shl eax,7 == row vol>>3), which is why the bug never

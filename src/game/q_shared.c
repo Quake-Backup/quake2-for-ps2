@@ -1044,8 +1044,7 @@ varargs versions of all text functions.
 */
 char * va(const char * format, ...)
 {
-	// LAMPERT:
-	// Modified to use multiple buffers, like on Doom3.
+	// [PS2_QUAKE]: Modified to use multiple buffers, like on Doom3.
     enum
     {
         NUM_VA_BUFS   = 2, // Two should be good enough. Original Quake2 relied on just one...
@@ -1234,8 +1233,8 @@ int Q_strcasecmp(const char * s1, const char * s2)
 
 void Com_sprintf(char * dest, int size, const char * fmt, ...)
 {
-	// LAMPERT: made the print buffer a bit smaller and also static.
-	// It was crazy big for a stack variable on the PS2!
+	// [PS2_QUAKE]: Made the print buffer a bit smaller and also static.
+	// It was too big for a stack variable on the PS2 (128KB EE stack)!
     static char bigbuffer[8192];
 
     va_list argptr;

@@ -243,6 +243,11 @@ void SV_SpawnServer(char * server, char * spawnpoint, server_state_t serverstate
 
     if (serverstate != ss_game)
     {
+        // [PS2_QUAKE] 2026-08-29
+        // Nothing after this draws the world, so hand its memory back before we
+        // build anything else. See the ss_game branch below for why.
+        CL_ReleaseWorldModel("");
+
         sv.models[1] = CM_LoadMap("", false, &checksum); // no real map
     }
     else
@@ -250,6 +255,17 @@ void SV_SpawnServer(char * server, char * spawnpoint, server_state_t serverstate
         Com_sprintf(sv.configstrings[CS_MODELS + 1],
                     sizeof(sv.configstrings[CS_MODELS + 1]),
                     "maps/%s.bsp", server);
+
+        // [PS2_QUAKE] 2026-08-29
+        // Drop the previous map's geometry before CM_LoadMap reads the next one.
+        // The refresh frees it on its own, but not until CL_PrepRefresh, which is
+        // several seconds and one whole entity spawn away - and on a 32MB console
+        // the old world hunk (7.1MB on power2) plus its lightmaps is more than the
+        // headroom CM_LoadMap needs, so leaving power2 used to die right here.
+        // Passing the new map's name means a restart or savegame load of the same
+        // level keeps the world instead of reloading it, matching CM_LoadMap's own
+        // early-out just below.
+        CL_ReleaseWorldModel(sv.configstrings[CS_MODELS + 1]);
 
         sv.models[1] = CM_LoadMap(sv.configstrings[CS_MODELS + 1], false, &checksum);
     }

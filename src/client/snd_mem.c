@@ -21,10 +21,26 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include "client.h"
 #include "snd_loc.h"
+#include "ps2/system/heap.h" // [PS2_QUAKE]: PS2_MemAlloc/PS2_MemFree + MEMTAG_AUDIO
 
 int cache_full_cycle;
 
-byte * S_Alloc(int size);
+/*
+==============
+[PS2_QUAKE]: S_FreeSoundCache
+
+The allocation was 'length * width' data bytes plus the header, and ResampleSfx
+leaves both fields describing exactly what it wrote, so the size is recoverable
+here without storing it separately.
+==============
+*/
+void S_FreeSoundCache(sfxcache_t * sc)
+{
+    if (!sc)
+        return;
+
+    PS2_MemFree(sc, (size_t)(sc->length * sc->width) + sizeof(sfxcache_t), MEMTAG_AUDIO);
+}
 
 /*
 ================
@@ -100,6 +116,7 @@ sfxcache_t * S_LoadSound(sfx_t * s)
     byte * data;
     wavinfo_t info;
     int len;
+    int outwidth;
     float stepscale;
     sfxcache_t * sc;
     int size;
@@ -146,9 +163,23 @@ sfxcache_t * S_LoadSound(sfx_t * s)
     stepscale = (float)info.rate / dma.speed;
     len = info.samples / stepscale;
 
-    len = len * info.width * info.channels;
+    // [PS2_QUAKE] 2026-08-27
+    // Size this with the width ResampleSfx will actually WRITE, not the width the
+    // source file happens to have. With s_loadas8bit set (the default here) it
+    // stores one byte per sample regardless of a 16-bit source, so using
+    // info.width allocated exactly twice what was ever touched - and since every
+    // shipped Quake II sound is 16-bit, that wasted half of ~8 MB of sound cache
+    // on a 32 MB console, which was enough on its own to fail a level load.
+    // S_EndRegistration already measures the cache the same way this does now
+    // (cache->length * cache->width), so the two agree.
+    outwidth = s_loadas8bit->value ? 1 : info.width;
+    len = len * outwidth * info.channels;
 
-    sc = s->cache = Z_Malloc(len + sizeof(sfxcache_t));
+    // Not Z_Malloc: the decoded sound cache is one of the biggest pools in the
+    // game, and inside the zone it was invisible behind the generic "Quake"
+    // memtag. Tagging it MEMTAG_AUDIO puts it on its own row in the memory
+    // overlay. Freed by S_FreeSoundCache, never Z_Free.
+    sc = s->cache = PS2_MemAlloc(len + sizeof(sfxcache_t), MEMTAG_AUDIO);
     if (!sc)
     {
         FS_FreeFile(data);

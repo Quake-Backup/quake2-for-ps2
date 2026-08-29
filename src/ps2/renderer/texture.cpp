@@ -5,6 +5,7 @@
  * This source code is released under the GNU GPL v2 license.
  * ================================================================================================ */
 
+#include "ps2/hash_map.h"
 #include "ps2/renderer/texture.h"
 #include "ps2/renderer/image_load.h"
 #include "ps2/renderer/scrap_atlas.h" // small Pics share an atlas instead of a GS page each
@@ -15,7 +16,6 @@
 
 #include <cstdio>
 #include <cstring>
-#include <unordered_map>
 
 #include <draw_sampling.h> // LOD_*
 #include <gs_psm.h>
@@ -354,9 +354,9 @@ private:
     void Unload(u16 slot);
 
     // Worst case for a full level plus UI (walls, skins, sprites, sky and
-    // pics); matches ref_gl's MAX_GLTEXTURES. Fixed-size pool: running out is
-    // a Sys_Error telling you to bump this.
-    static constexpr u32 kMaxTextures = 1024;
+    // pics). ref_gl's MAX_GLTEXTURES was 1024, but that is a PC-era bound and
+    // each idle slot still costs .bss here - the cap lives in texture.h now
+    // (render_view.cpp sizes its texture chain to it too).
     using TexturePool = SmallPool<Texture, kMaxTextures>;
 
     TexturePool m_texturePool;
@@ -365,10 +365,15 @@ private:
 
     // Level load/change cycle counter; textures stamped with an older value
     // are the ones EndRegistration() frees. See tex::BeginRegistration().
-    u32 m_regSequence = 1;
+    // Starts at 1, not 0, so a freshly zeroed Texture slot (regSequence 0) never
+    // looks like it was registered this cycle. Init() applies that, rather than a
+    // default member initializer here: this cache is a file-level static, and one
+    // non-zero word in it is enough to move the whole ~90 KB object out of .bss
+    // and into .data, where the zeros cost ELF file size for nothing.
+    u32 m_regSequence = 0;
 
     // Lookup: FNV-1a hash of the full path + image type -> pool slot of the texture.
-    std::unordered_map<u64, u16> m_lookup;
+    HashMap<kMaxTextures> m_lookup;
 };
 
 const Texture * TextureCache::Find(const char * name, const ImageType type)
@@ -379,13 +384,13 @@ const Texture * TextureCache::Find(const char * name, const ImageType type)
     char fullname[MAX_QPATH];
     NormalizeName(name, type, fullname);
 
-    const auto it = m_lookup.find(LookupKey(fullname, type));
-    if (it == m_lookup.end())
+    const u16 slot = m_lookup.Find(LookupKey(fullname, type));
+    if (slot == m_lookup.kInvalidValue)
     {
         return LoadFromFile(fullname, type);
     }
 
-    Texture & texture = m_texturePool.Slot(it->second);
+    Texture & texture = m_texturePool.Slot(slot);
 
     // 64-bit FNV-1a collisions are vanishingly rare, but a miss here would
     // silently draw the wrong image - verify the actual name and type.
@@ -538,23 +543,19 @@ void TextureCache::EndRegistration()
     // Free the level assets this registration cycle no longer references.
     // Pics are exempt like in ref_gl - the client caches pointers to them
     // across levels and they are small; built-ins are permanent.
-    int freedCount = 0;
-    for (auto it = m_lookup.begin(); it != m_lookup.end(); )
-    {
-        const Texture & texture = m_texturePool.Slot(it->second);
+    const int freedCount = static_cast<int>(m_lookup.RemoveIf([this](u64, u16 slot) {
+        const Texture & texture = m_texturePool.Slot(slot);
         if (HasFlag(texture.flags, TexFlags::Builtin) ||
             texture.type == ImageType::Pic ||
             texture.regSequence == m_regSequence)
         {
-            ++it;
-            continue;
+            return false;
         }
 
         Com_DPrintf("Freeing unused texture '%s'\n", texture.name);
-        Unload(it->second);
-        it = m_lookup.erase(it);
-        ++freedCount;
-    }
+        Unload(slot);
+        return true;
+    }));
 
     if (freedCount > 0)
     {
@@ -586,9 +587,9 @@ Texture & TextureCache::Register(const char * name, const void * pixels, int wid
     PS2_Assert(width > 0 && height > 0 && pixels != nullptr);
 
     const u16 slot = m_texturePool.Alloc();
-    if (slot == TexturePool::kInvalidIndex)
+    if (slot == TexturePool::kInvalidIndex) [[unlikely]]
     {
-        Sys_Error("Out of texture cache slots for '%s'! Bump TextureCache::kMaxTextures (%u).",
+        Sys_Error("Out of texture cache slots for '%s'! Bump tex::kMaxTextures (%u).",
                   name, kMaxTextures);
     }
 
@@ -624,8 +625,8 @@ Texture & TextureCache::Register(const char * name, const void * pixels, int wid
                                      // the first upload must flush them (built-ins were
                                      // written by the ELF loader and need no flush).
 
-    const auto inserted = m_lookup.emplace(LookupKey(texture.name, texture.type), slot);
-    PS2_AssertMsg(inserted.second, "Duplicate texture name+type!");
+    const bool inserted = m_lookup.Insert(LookupKey(texture.name, texture.type), slot);
+    PS2_AssertMsg(inserted, "Duplicate texture name+type!");
 
     return texture;
 }
@@ -633,10 +634,7 @@ Texture & TextureCache::Register(const char * name, const void * pixels, int wid
 void TextureCache::Init()
 {
     m_texturePool.Init(); // One-shot; asserts if called twice.
-
-    // A level load registers hundreds of textures; reserving up front keeps
-    // the lookup from rehashing in the middle of it.
-    m_lookup.reserve(kMaxTextures);
+    m_regSequence = 1;    // See the member declaration for why it starts here.
 
     struct BuiltinImage
     {

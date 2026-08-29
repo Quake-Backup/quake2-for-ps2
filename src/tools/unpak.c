@@ -1,8 +1,6 @@
-
 /* ================================================================================================
  * -*- C -*-
  * File: unpak.c
- * Author: Guilherme R. Lampert
  * Created on: 26/10/15
  * Brief: Very simple command line tool to unpack a Quake 2 PAK archive into a normal directory.
  *

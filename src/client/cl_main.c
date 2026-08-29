@@ -417,7 +417,7 @@ void CL_SendConnectPacket(void)
 
     if (!NET_StringToAdr(cls.servername, &adr))
     {
-        // LAMPERT 2015-10-26: This message pollutes the console without the check.
+        // [PS2_QUAKE] 2015-10-26: This message pollutes the console without the check.
         static qboolean console_notified = false;
         if (!console_notified)
         {
@@ -477,7 +477,7 @@ void CL_CheckForResend(void)
 
     if (!NET_StringToAdr(cls.servername, &adr))
     {
-        // LAMPERT 2015-10-26: This message pollutes the console without the check.
+        // [PS2_QUAKE] 2015-10-26: This message pollutes the console without the check.
         static qboolean console_notified = false;
         if (!console_notified)
         {
@@ -1789,8 +1789,8 @@ void CL_Frame(int msec)
     // predict all unacknowledged movements
     CL_PredictMovement();
 
-    // LAMPERT:
-    // We don't use a separate DLL on QPS2, so this is useless.
+    // [PS2_QUAKE]:
+    // We don't use a separate DLL on PS2 Quake, so this is useless.
     //
     // allow rendering DLL change
     //VID_CheckChanges();
@@ -1880,7 +1880,7 @@ void CL_Init(void)
 
     M_Init();                   // menu init
     SCR_Init();                 // screen init
-    cls.disable_screen = false; // LAMPERT: allow it to draw ASAP, was true originally.
+    cls.disable_screen = false; // [PS2_QUAKE]: allow it to draw ASAP, was true originally.
 
     CDAudio_Init();
     CL_InitLocal();

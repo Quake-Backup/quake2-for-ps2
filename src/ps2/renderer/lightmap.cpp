@@ -89,6 +89,7 @@ public:
     void BeginBuilding();
     void CreateSurfaceLightmap(mod::ModelSurface & surf);
     void EndBuilding();
+    void ReleaseAtlases();
 
     void BeginFrame();
     void ChainSurface(mod::ModelSurface & surf, const refdef_t & viewDef, int frameCount);
@@ -117,7 +118,6 @@ public:
     Stats GetStats() const { return m_stats; }
 
 private:
-    void ReleaseAtlases();
     void NextAtlas();
     int  CurrentAtlas() const { return m_atlasCount - 1; }
 
@@ -201,7 +201,7 @@ void LightmapManager::ReleaseAtlases()
 
 void LightmapManager::NextAtlas()
 {
-    if (m_atlasCount == kMaxLightmapTextures)
+    if (m_atlasCount == kMaxLightmapTextures) [[unlikely]]
     {
         Sys_Error("Out of lightmap atlases! Bump lm::kMaxLightmapTextures (%d).",
                   kMaxLightmapTextures);
@@ -504,19 +504,28 @@ void LightmapManager::CreateSurfaceLightmap(mod::ModelSurface & surf)
     const int smax = LuxelsWide(surf);
     const int tmax = LuxelsHigh(surf);
 
-    if (!AllocBlock(smax, tmax, &surf.light_s, &surf.light_t))
+    // ModelSurface stores the atlas coordinates as s16 (they are luxel offsets
+    // into a lightmap texture, so they cannot approach the limit), while
+    // AllocBlock works in int - hence the locals.
+    int lightS = 0;
+    int lightT = 0;
+
+    if (!AllocBlock(smax, tmax, &lightS, &lightT))
     {
         // Atlas full: start a fresh one and try once more. A surface that will
         // not fit an empty atlas is a broken map, not a packing failure.
         NextAtlas();
 
-        if (!AllocBlock(smax, tmax, &surf.light_s, &surf.light_t))
+        if (!AllocBlock(smax, tmax, &lightS, &lightT)) [[unlikely]]
         {
             Sys_Error("Consecutive lightmap AllocBlock(%d, %d) failures!", smax, tmax);
         }
     }
 
-    surf.lightmapTextureNum   = CurrentAtlas();
+    surf.light_s = static_cast<s16>(lightS);
+    surf.light_t = static_cast<s16>(lightT);
+
+    surf.lightmapTextureNum   = static_cast<s16>(CurrentAtlas());
     surf.lightmapDynamicFrame = kNoDynamicFrame;
 
     BuildLightmap(surf, s_defaultLightStyles, nullptr, 0, /* addDynamic = */ false);
@@ -628,6 +637,11 @@ void CreateSurfaceLightmap(mod::ModelSurface & surf)
 void EndBuildingLightmaps()
 {
     s_manager.EndBuilding();
+}
+
+void ReleaseAtlases()
+{
+    s_manager.ReleaseAtlases();
 }
 
 void BeginFrame()

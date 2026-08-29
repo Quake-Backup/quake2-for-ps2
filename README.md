@@ -139,14 +139,55 @@ and skip autodetection.
 
 #### Host tools
 
-Built with the *host* compiler, not the EE toolchain:
+Built with the *host* compiler, not the EE toolchain (`symbolize` is a Python 3 script and
+is simply copied into place):
 
+- `build/tools/symbolize` — turns a stack trace dump printed by the running game into
+  function names, files and line numbers. See [Reading a stack trace](#reading-a-stack-trace)
+  below.
 - `build/tools/unpak` — extracts a Quake II `.pak` archive into a normal directory.
 - `build/tools/imgdump` — dumps `.pcx` images into C byte arrays (RGB or raw 8-bit
   palettized), which is how the built-in console font, console background, HUD backtile and
   the global palette under [src/ps2/builtin/](src/ps2/builtin/) were generated. Those are
   compiled into the ELF so the executable can boot and print errors before any game data
   is found.
+
+#### Reading a stack trace
+
+Fatal allocation failures print the call stack to stdout before halting (see
+[src/ps2/debug/stack_trace.cpp](src/ps2/debug/stack_trace.cpp)). Because the ELF that runs
+is stripped, what comes out is raw addresses:
+
+```
+PS2_MemAlloc: failed to allocate 262144 bytes (Audio)
+------------------------- STACK TRACE -------------------------
+#0  0x00195020
+#1  0x001331bc
+#2  0x00130f10
+------------------------- STACK TRACE -------------------------
+```
+
+Pipe that at `symbolize`, which resolves it against the `quake2_unstripped.elf` sitting
+next to the stripped one:
+
+```
+$ build/tools/symbolize < emulog.txt
+ELF: build/debug/quake2_unstripped.elf
+
+#0  0x00195020  PS2_MemAlloc                       src/ps2/system/heap.cpp:116
+#1  0x001331bc  S_LoadSound                        src/client/snd_mem.c:184
+#2  0x00130f10  S_RegisterSound                    src/client/snd_dma.c:308
+```
+
+Paste in as much surrounding log as you like — banner lines, `[Q2]` prefixes and other
+noise are ignored, and anything shaped like a `#N 0xADDR` frame is picked out. It also
+accepts a file argument, or bare addresses (`symbolize 0x00195020 0x001331bc`).
+
+It defaults to the most recently built `build/<config>/quake2_unstripped.elf`; pass
+`-e <elf>` to choose. **The dump and the ELF must come from the same build** — addresses
+from a different one will silently resolve to the wrong names. Inlined frames are expanded
+by default (`--no-inlines` turns that off). Note that only the debug config carries DWARF:
+against a release ELF you get function names from the symbol table but no file or line.
 
 ### Running in PCSX2
 
@@ -248,7 +289,7 @@ source files are added or removed.
 src/
   client/ common/ game/ server/   id's original Quake II C code
   null/                           cd_null.c - the only remaining null stub (no CD audio)
-  tools/                          host-side command line tools (imgdump, unpak)
+  tools/                          host-side command line tools (imgdump, unpak, bspinfo, symbolize)
   ps2/                            the PS2 backend - all new C++ code
     system/                       main() entry point, Sys_* seam, IOP boot, dlmalloc heap
     renderer/                     GS front-end, VRAM heap, textures, models, VU1 path
@@ -424,7 +465,7 @@ Memory is a single program-wide `dlmalloc` heap ([heap.h](src/ps2/system/heap.h)
 `operator new`/`delete` and the engine's `Z_Malloc` routed through a tag-accounting layer
 (`MEMTAG_QUAKE`, `MEMTAG_RENDERER`, `MEMTAG_TEXIMAGE`, `MEMTAG_MDL_*`, `MEMTAG_LIGHTMAP`, …).
 The RAM the game can never allocate — EE kernel, ELF image, stack — is booked against
-`MEMTAG_MISC` at startup so the tags add up to a faithful picture of the console's 32 MB.
+`MEMTAG_ELF_SYS` at startup so the tags add up to a faithful picture of the console's 32 MB.
 Built with `-fno-exceptions`, so a failed allocation is a fatal `Sys_Error`, not a throw.
 
 Networking is loopback only ([net/net.cpp](src/ps2/net/net.cpp)) — enough for a local
@@ -432,10 +473,10 @@ single-player/listen-server game; remote sends are dropped.
 
 ---
 
-## Debugging aids
+## Debugging tools and Cvars
 
-All of these are cvars unless noted. The four overlays default to on; everything else
-defaults to the normal rendering path.
+All of these are cvars unless noted. The four overlays default to on in debug builds;
+everything else defaults to the normal rendering path.
 
 **Overlays:** `ps2_show_fps`, `ps2_show_memstats` (per-tag heap usage), `ps2_show_vramstats`
 (texture heap occupancy and per-frame uploads), `ps2_show_drawstats` (nodes walked, surfaces,
@@ -455,10 +496,43 @@ triangles drawn/clipped/culled, batches, entities, particles, dlights).
 `ps2_testcube_vulerp`, `ps2_testcube_vram_tex_eviction`), `ps2_testcin 1` (cinematic
 playback test).
 
+**Memory smoke test:** `ps2_testmaps 1` loads all 39 stock maps in single-player unit order,
+staying in each for `ps2_testmaps_dwell` seconds (default 8) once it has finished loading, and
+prints a line per map:
+
+```
+MapCycle [23/39] power2    World 6.84 MB  Audio 3.51 MB  Tex 3.23 MB  Mdl 2.21 MB  TOTAL 24.09 MB  PEAK 26.31 MB  FREE 1.94 MB  <- NEW PEAK
+```
+
+The maps matter less than the transitions between them: a map change is the worst moment in
+the program, because the outgoing map's data can still be resident while the next one is
+built, and that is where every out-of-memory failure in this port has happened. `PEAK` is the
+global high-water (`PS2_GetPeakMemBytes`), so `NEW PEAK` marks the transition that cost the
+most - which is the number to watch. A full pass takes roughly fifteen minutes at the default
+dwell. Debug builds only; the whole test compiles out of release.
+
+**CPU exception handling:** Debug builds install EE level-1 exception handlers at the top
+of `main()` (`src/ps2/debug/exception_handler.cpp`, on ps2sdk's `libeedebug`). A bad pointer that
+would otherwise hang the console with three lines of emulator output instead prints the cause,
+EPC, BadVAddr, the argument registers and an unwound call stack:
+
+```
+=============== EE CPU EXCEPTION ===============
+Cause    : 2 (TLB refill (load/fetch))
+EPC      : 0x001b4d20   <- the faulting instruction
+BadVAddr : 0x00000000   <- the address it touched
+...
+Resolve with: mips64r5900el-ps2-elf-addr2line -f -C -e build/debug/quake2_unstripped.elf <addr>
+```
+
+When EPC lands outside the program's own `.text` - a kernel or library routine handed a bad
+pointer - it says so and unwinds from `$ra` instead, since the backward prologue scan the
+unwinder uses cannot read code it has no symbols for.
+
 **Commands:** `ps2_dump_iop_mods` lists the currently loaded IOP modules;
 `in_keyboardmap <usage> <key>` remaps a USB scan code.
 
-**Loading a quiet map for renderer work.** `deathmatch 1` is the switch that frees every monster at spawn. Both it and `cheats` are latched, so they must be set *before* `map`:
+**Loading an empty map for renderer work:** `deathmatch 1` is the switch that frees every monster at spawn. Both it and `cheats` are latched, so they must be set *before* `map`:
 
 ```
 killserver ; deathmatch 1 ; cheats 1 ; map base1

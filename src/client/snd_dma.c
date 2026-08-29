@@ -118,7 +118,7 @@ void S_Init(void)
     else
     {
         s_volume = Cvar_Get("s_volume", "0.7", CVAR_ARCHIVE);
-        // LAMPERT: 22 rather than id's 11 - the PS2 backend upsamples to the SPU2's
+        // [PS2_QUAKE]: 22 rather than id's 11 - the PS2 backend upsamples to the SPU2's
         // native 48kHz regardless, and 22050 also matches the audio in the .cin videos,
         // which spares us a snd_restart every time one plays. See ps2/audio/snd.cpp.
         s_khz = Cvar_Get("s_khz", "22", CVAR_ARCHIVE);
@@ -180,8 +180,7 @@ void S_Shutdown(void)
     {
         if (!sfx->name[0])
             continue;
-        if (sfx->cache)
-            Z_Free(sfx->cache);
+        S_FreeSoundCache(sfx->cache);
         memset(sfx, 0, sizeof(*sfx));
     }
 
@@ -329,10 +328,9 @@ void S_EndRegistration(void)
         if (!sfx->name[0])
             continue;
         if (sfx->registration_sequence != s_registration_sequence)
-        {                           // don't need this sound
-            if (sfx->cache)         // it is possible to have a leftover
-                Z_Free(sfx->cache); // from a server that didn't finish loading
-            memset(sfx, 0, sizeof(*sfx));
+        {                                      // don't need this sound
+            S_FreeSoundCache(sfx->cache);      // may be a leftover from a server
+            memset(sfx, 0, sizeof(*sfx));      // that didn't finish loading
         }
         else
         { // make sure it is paged in

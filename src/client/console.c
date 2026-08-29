@@ -612,7 +612,7 @@ void Con_DrawConsole(float frac)
     char version[64];
     char dlbar[1024];
 
-    // LAMPERT 2015-10-26
+    // [PS2_QUAKE] 2015-10-26
     // 2 extra pixels of spacing between lines of text.
     enum
     {

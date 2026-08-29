@@ -56,6 +56,12 @@ float IntensityScale();
 // Background colour used by BeginFrame()'s screen clear.
 void SetClearColor(u8 r, u8 g, u8 b);
 
+// The most qwords either per-frame DMA packet has ever held, against the capacity
+// both were allocated with. The two packets are the whole MEMTAG_RENDERER budget
+// - shown as "DmaPeak" in the draw-stats overlay.
+int FramePacketPeakQwords();
+int FramePacketCapacityQwords();
+
 // Per-frame lifecycle: BeginFrame() clears the back buffer (color + depth,
 // sent immediately); EndFrame() flushes any pending 2D (see below), waits for
 // vsync and flips to the front. 2D and 3D may be drawn in any order between them.

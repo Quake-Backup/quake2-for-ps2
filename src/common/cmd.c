@@ -19,7 +19,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 */
 
 //
-// LAMPERT 2015-10-29:
+// [PS2_QUAKE] 2015-10-29:
 // Added 'static' to local data and 'const' to char* pointer parameters.
 //
 

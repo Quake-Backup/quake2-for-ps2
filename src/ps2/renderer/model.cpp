@@ -7,6 +7,7 @@
  * This source code is released under the GNU GPL v2 license.
  * ================================================================================================ */
 
+#include "ps2/hash_map.h"
 #include "ps2/renderer/model.h"
 #include "ps2/renderer/model_load.h"
 #include "ps2/renderer/texture.h"
@@ -17,7 +18,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <unordered_map>
 
 extern "C" {
     #include "common/q_files.h" // IDBSPHEADER / dsprite_t / dmdl_t / MAX_SKINNAME
@@ -49,6 +49,7 @@ public:
 
     void BeginRegistration(const char * mapName);
     void EndRegistration();
+    bool ReleaseWorldModel(const char * fullName);
 
     const ModelInstance * Find(const char * name);
     const ModelInstance * WorldModel() { return m_worldModel; }
@@ -64,24 +65,33 @@ private:
     void Unload(u16 slot);
 
     // A level references the world plus a few hundred entity/sprite models.
-    // Fixed-size pool: running out is a Sys_Error telling you to bump this.
-    static constexpr u32 kMaxModels = 512;
+    // The protocol caps model configstrings at MAX_MODELS (256); the slack on
+    // top covers view-weapon and per-client player models, which are resolved
+    // by name outside that table. Fixed-size pool: running out is a Sys_Error
+    // telling you to bump this.
+    static constexpr u32 kMaxModels = 320;
     using ModelPool = SmallPool<ModelInstance, kMaxModels>;
 
     ModelPool m_modelPool;
 
     // Inline (*N) brush submodels of the current map. They alias the world
     // model's geometry and are set up on each world load, so they live outside
-    // the pool and are never looked up by name. Bounds submodels per map.
-    static constexpr u32 kMaxInlineModels = 256;
+    // the pool and are never looked up by name. Bounds submodels per map, so it
+    // mirrors cmodel.c's own cap rather than standing on its own.
+    static constexpr u32 kMaxInlineModels = MAX_MAP_MODELS;
     ModelInstance m_inlineModels[kMaxInlineModels] = {};
 
     // Lookup: FNV-1a hash of the model path -> pool slot.
-    std::unordered_map<u64, u16> m_lookup;
+    HashMap<kMaxModels> m_lookup;
 
     // Level load/change cycle counter; models stamped with an older value are
     // the ones EndRegistration() frees.
-    u32 m_regSequence = 1;
+    // Starts at 1, not 0, so a freshly zeroed ModelInstance (regSequence 0) never
+    // looks like it was registered this cycle. Init() applies that, rather than a
+    // default member initializer here: this cache is a file-level static, and one
+    // non-zero word in it is enough to move the whole ~200 KB object out of .bss
+    // and into .data, where the zeros cost ELF file size for nothing.
+    u32 m_regSequence = 0;
 
     // Currently loaded world map (a pointer into m_modelPool).
     const ModelInstance * m_worldModel = nullptr;
@@ -90,7 +100,7 @@ private:
 void ModelCache::Init()
 {
     m_modelPool.Init(); // One-shot; asserts if called twice.
-    m_lookup.reserve(kMaxModels);
+    m_regSequence = 1;  // See the member declaration for why it starts here.
     Com_Printf("Model cache initialised.\n");
 }
 
@@ -104,10 +114,10 @@ const ModelInstance * ModelCache::Find(const char * const name)
         return FindInlineModel(name);
     }
 
-    const auto it = m_lookup.find(HashStr64(name));
-    if (it != m_lookup.end())
+    const u16 slot = m_lookup.Find(HashStr64(name));
+    if (slot != m_lookup.kInvalidValue)
     {
-        ModelInstance & mdl = m_modelPool.Slot(it->second);
+        ModelInstance & mdl = m_modelPool.Slot(slot);
 
         // 64-bit FNV-1a collisions are vanishingly rare, but verify the name.
         PS2_AssertMsg(std::strcmp(mdl.name, name) == 0, "Model lookup hash collision!");
@@ -125,33 +135,44 @@ const ModelInstance * ModelCache::Find(const char * const name)
     return LoadModel(name);
 }
 
-const ModelInstance * ModelCache::LoadModel(const char * const name)
+// Reads just the 4-byte format id, without loading the file. Brush models are
+// streamed lump by lump (LoadBrushModel opens the file itself), so the format has
+// to be known before deciding whether to pull the whole thing into memory.
+static bool PeekModelType(const char * const name, ModelType & outType)
 {
-    void * fileData = nullptr;
-    const int fileLen = FS_LoadFile(name, &fileData);
-    if (fileData == nullptr || fileLen < static_cast<int>(sizeof(u32)))
+    FILE * file = nullptr;
+    if (FS_FOpenFile(name, &file) < static_cast<int>(sizeof(u32)) || file == nullptr)
     {
-        Com_Printf("WARNING: Unable to load model '%s'! Failed to open file.\n", name);
-        if (fileData != nullptr) { FS_FreeFile(fileData); }
-        return nullptr;
+        if (file != nullptr) { FS_FCloseFile(file); }
+        return false;
     }
 
-    // The first 4 bytes identify the format.
-    const u32 id = *static_cast<const u32 *>(fileData);
-    ModelType type;
+    u32 id = 0;
+    FS_Read(&id, static_cast<int>(sizeof(id)), file);
+    FS_FCloseFile(file);
+
     switch (id)
     {
-    case IDBSPHEADER    : type = ModelType::Brush;    break;
-    case IDSPRITEHEADER : type = ModelType::Sprite;   break;
-    case IDALIASHEADER  : type = ModelType::AliasMD2; break;
+    case IDBSPHEADER    : outType = ModelType::Brush;    return true;
+    case IDSPRITEHEADER : outType = ModelType::Sprite;   return true;
+    case IDALIASHEADER  : outType = ModelType::AliasMD2; return true;
     default :
         Com_Printf("ERROR: ModelCache: Unknown file id (0x%X) for '%s'!\n", id, name);
-        FS_FreeFile(fileData);
+        return false;
+    }
+}
+
+const ModelInstance * ModelCache::LoadModel(const char * const name)
+{
+    ModelType type;
+    if (!PeekModelType(name, type))
+    {
+        Com_Printf("WARNING: Unable to load model '%s'! Failed to open file.\n", name);
         return nullptr;
     }
 
     const u16 slot = m_modelPool.Alloc();
-    if (slot == ModelPool::kInvalidIndex)
+    if (slot == ModelPool::kInvalidIndex) [[unlikely]]
     {
         Sys_Error("Out of model cache slots for '%s'! Bump ModelCache::kMaxModels (%u).", name, kMaxModels);
     }
@@ -162,21 +183,30 @@ const ModelInstance * ModelCache::LoadModel(const char * const name)
     mdl.regSequence = m_regSequence;
 
     bool ok = false;
-    switch (type)
+    if (type == ModelType::Brush)
     {
-    case ModelType::Brush :
-        ok = LoadBrushModel(mdl, fileData, fileLen);
+        // Streams the file itself - never holds the whole .bsp.
+        ok = LoadBrushModel(mdl, name);
         if (ok) { SetUpInlineModels(mdl); }
-        break;
-    case ModelType::Sprite :
-        ok = LoadSpriteModel(mdl, fileData, fileLen);
-        break;
-    case ModelType::AliasMD2 :
-        ok = LoadAliasMD2Model(mdl, fileData, fileLen);
-        break;
     }
+    else
+    {
+        // Sprites and MD2s are copied into their hunk verbatim, so the loaded
+        // file and the hunk are the same size; loading whole file is fine for those.
+        void * fileData = nullptr;
+        const int fileLen = FS_LoadFile(name, &fileData);
+        if (fileData == nullptr || fileLen <= 0)
+        {
+            Com_Printf("WARNING: Unable to load model '%s'! Failed to read file.\n", name);
+            if (fileData != nullptr) { FS_FreeFile(fileData); }
+            Unload(slot);
+            return nullptr;
+        }
 
-    FS_FreeFile(fileData);
+        ok = (type == ModelType::Sprite) ? LoadSpriteModel(mdl, fileData, fileLen)
+                                         : LoadAliasMD2Model(mdl, fileData, fileLen);
+        FS_FreeFile(fileData);
+    }
 
     if (!ok)
     {
@@ -184,7 +214,8 @@ const ModelInstance * ModelCache::LoadModel(const char * const name)
         return nullptr;
     }
 
-    m_lookup.emplace(HashStr64(name), slot);
+    const bool inserted = m_lookup.Insert(HashStr64(name), slot);
+    PS2_AssertMsg(inserted, "Duplicate model name!");
 
     if (kVerboseModelCache)
     {
@@ -207,7 +238,7 @@ const ModelInstance * ModelCache::FindInlineModel(const char * const name)
 
 void ModelCache::SetUpInlineModels(ModelInstance & world)
 {
-    if (world.numSubModels > static_cast<int>(kMaxInlineModels))
+    if (world.numSubModels > static_cast<int>(kMaxInlineModels)) [[unlikely]]
     {
         Sys_Error("Map '%s' has too many submodels (%i)! Bump ModelCache::kMaxInlineModels (%u).",
                   world.name, world.numSubModels, kMaxInlineModels);
@@ -237,7 +268,7 @@ void ModelCache::SetUpInlineModels(ModelInstance & world)
         // never walk the leaf array; only the world's LoadLeafs count matters.
         inl.numLeafs = 0;
 
-        if (inl.firstNode >= world.numNodes)
+        if (inl.firstNode >= world.numNodes) [[unlikely]]
         {
             Sys_Error("Inline model %i of '%s' has a bad first node!", i, world.name);
         }
@@ -316,6 +347,47 @@ void ModelCache::BeginRegistration(const char * const mapName)
     LoadWorldModel(mapName);
 }
 
+// Frees the resident world, unless it is already 'fullName' - a null or empty
+// name releases whatever is loaded. Splitting this out of LoadWorldModel lets the
+// server call it before it builds the next map's collision model: the old world
+// hunk is the single largest allocation in the game (7.1 MB on 'power2' map) and
+// it was otherwise held for the whole of server init, which is exactly when the next
+// map's BSP needs the room.
+//
+// Returns whether it actually freed anything. Callers need that: the lightmap
+// atlases have the same lifetime as the world model and are reachable only
+// through ModelSurface::lightmapTextureNum, so they may be released exactly when
+// the surfaces indexing them are - never on the keep-it path below.
+bool ModelCache::ReleaseWorldModel(const char * const fullName)
+{
+    if (m_worldModel == nullptr)
+    {
+        return false;
+    }
+    if (fullName != nullptr && std::strcmp(m_worldModel->name, fullName) == 0)
+    {
+        // Same map (a restart or savegame load). Keeping it means Find() will hit
+        // the cache in LoadWorldModel, which means no reload - and so no
+        // lm::BeginBuildingLightmaps() to rebuild atlases either.
+        return false;
+    }
+
+    if (kVerboseModelCache)
+    {
+        Com_DPrintf("Unloading current map '%s'...\n", m_worldModel->name);
+    }
+
+    const u64 key  = HashStr64(m_worldModel->name);
+    const u16 slot = m_lookup.Find(key);
+    if (slot != m_lookup.kInvalidValue)
+    {
+        Unload(slot);
+        m_lookup.Remove(key);
+    }
+    m_worldModel = nullptr;
+    return true;
+}
+
 void ModelCache::LoadWorldModel(const char * const mapName)
 {
     char fullName[MAX_QPATH];
@@ -323,24 +395,12 @@ void ModelCache::LoadWorldModel(const char * const mapName)
 
     // Free the old map up front if we are switching to a different one. This
     // guarantees the world's inline models are rebuilt against fresh geometry.
-    if (m_worldModel != nullptr && std::strcmp(m_worldModel->name, fullName) != 0)
-    {
-        if (kVerboseModelCache)
-        {
-            Com_DPrintf("Unloading current map '%s'...\n", m_worldModel->name);
-        }
-
-        const auto it = m_lookup.find(HashStr64(m_worldModel->name));
-        if (it != m_lookup.end())
-        {
-            Unload(it->second);
-            m_lookup.erase(it);
-        }
-        m_worldModel = nullptr;
-    }
+    // Normally a no-op by now: the server released it before it loaded the new
+    // map's collision data (see ps2::ReleaseWorldModel).
+    ReleaseWorldModel(fullName);
 
     const ModelInstance * const world = Find(fullName);
-    if (world == nullptr)
+    if (world == nullptr) [[unlikely]]
     {
         Sys_Error("ModelCache: Unable to load level map '%s'!", fullName);
     }
@@ -350,14 +410,11 @@ void ModelCache::LoadWorldModel(const char * const mapName)
 void ModelCache::EndRegistration()
 {
     // Free the models this cycle no longer references.
-    int freedCount = 0;
-    for (auto it = m_lookup.begin(); it != m_lookup.end(); )
-    {
-        ModelInstance & mdl = m_modelPool.Slot(it->second);
+    const int freedCount = static_cast<int>(m_lookup.RemoveIf([this](u64, u16 slot) {
+        ModelInstance & mdl = m_modelPool.Slot(slot);
         if (mdl.regSequence == m_regSequence)
         {
-            ++it;
-            continue;
+            return false;
         }
 
         if (kVerboseModelCache)
@@ -370,10 +427,9 @@ void ModelCache::EndRegistration()
             m_worldModel = nullptr;
         }
 
-        Unload(it->second);
-        it = m_lookup.erase(it);
-        ++freedCount;
-    }
+        Unload(slot);
+        return true;
+    }));
 
     if (freedCount > 0)
     {
@@ -402,6 +458,11 @@ void BeginRegistration(const char * mapName)
 void EndRegistration()
 {
     s_cache.EndRegistration();
+}
+
+bool ReleaseWorldModel(const char * fullName)
+{
+    return s_cache.ReleaseWorldModel(fullName);
 }
 
 const ModelInstance * Find(const char * name)

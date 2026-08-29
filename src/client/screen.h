@@ -57,7 +57,7 @@ void SCR_StopCinematic(void);
 void SCR_FinishCinematic(void);
 qboolean SCR_DrawCinematic(void);
 
-// LAMPERT: Added to QPS2 for testing.
+// [PS2_QUAKE]: Added to PS2 Quake for testing.
 qboolean CinematicTest_PlayDirect(const char * filename);
 qboolean CinematicTest_RunFrame(void);
 
