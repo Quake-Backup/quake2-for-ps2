@@ -30,7 +30,14 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #define MAX_DLIGHTS           32
 #define MAX_ENTITIES          128
 #define MAX_LIGHTSTYLES       256
-#define MAX_PARTICLES         4096
+
+// [PS2_QUAKE] 2026-08-30
+// Halved from Quake's original 4096. Two arrays are sized by this - cl_fx.c's particles[] and
+// cl_view.c's r_particles[] - and together they were 320 KB of .bss, which on a
+// 32 MB console is worth more than particles the EE was never going to draw:
+// nothing caps the count below this, and 4096 billboards at 640x448 is far past
+// what the fill rate sustains. Raise it again if headroom appears.
+#define MAX_PARTICLES         2048
 
 #define SHELL_RED_COLOR       0xF2
 #define SHELL_GREEN_COLOR     0xD0

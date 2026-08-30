@@ -77,6 +77,20 @@ static int    s_failed        = 0;
 static size_t s_peakBeforeMap = 0;
 static char   s_targetBsp[MAX_QPATH] = {};
 
+void Restart()
+{
+    s_state         = State::Idle;
+    s_nextMap       = 0;
+    s_done          = false;
+    s_issuedAtMs    = 0;
+    s_dwellUntilMs  = 0;
+    s_confirmFrames = 0;
+    s_skipped       = 0;
+    s_failed        = 0;
+    s_peakBeforeMap = 0;
+    s_targetBsp[0]  = '\0';
+}
+
 bool MapFileExists(const char * const bspName)
 {
     FILE * file = nullptr;
@@ -188,6 +202,13 @@ void RunMapCycle()
     if (s_enabled->value == 0.0f || s_done)
     {
         return;
+    }
+
+    static bool s_cmdRegistered = false;
+    if (!s_cmdRegistered)
+    {
+        Cmd_AddCommand("ps2_testmaps_restart", Restart);
+        s_cmdRegistered = true;
     }
 
     switch (s_state)

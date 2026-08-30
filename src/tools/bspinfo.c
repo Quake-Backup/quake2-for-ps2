@@ -332,7 +332,7 @@ static long compute_brush_hunk_size(const bsp_header_t * hdr, const unsigned cha
         total += align_up(lighting_len, HUNK_ALIGN);
     }
 
-    total += align_up((long)num_planes * 2 * SZ_CPLANE, HUNK_ALIGN);
+    total += align_up((long)num_planes * SZ_CPLANE, HUNK_ALIGN);
     total += align_up((long)num_texinfo * SZ_MODEL_TEXINFO, HUNK_ALIGN);
     total += align_up((long)num_faces * SZ_MODEL_SURFACE, HUNK_ALIGN);
 

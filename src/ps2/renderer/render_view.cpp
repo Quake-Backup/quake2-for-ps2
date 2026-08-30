@@ -123,12 +123,6 @@ static cplane_t s_frustum[4] = {};
 // Wall texture animation frame (viewDef.time * 2, as in ref_gl).
 static int s_textureAnimFrame = 0;
 
-// Scratch for the two-cluster PVS union used when the camera straddles a solid
-// water boundary. The single-cluster row comes from CM_ClusterPVS, which owns its
-// own buffer - this only exists because combining two clusters needs the first row
-// kept while the second is decompressed over it.
-alignas(16) static u8 s_fatPvs[MAX_MAP_LEAFS / 8];
-
 // Textures that received surfaces this frame; DrawTextureChains draws and
 // resets exactly these. One entry per live texture is the true ceiling, so it
 // tracks the cache's own capacity.
@@ -335,7 +329,7 @@ const mod::ModelLeaf * FindLeafNodeForPoint(const float * point, const mod::Mode
 // clamps a zero-run to the row length instead of running off the end.
 //
 // The row lives in a shared buffer that the next call overwrites, so don't hold
-// on to it (MarkLeaves copies it into s_fatPvs before asking for the second one).
+// on to it (MarkLeaves copies it into a temp before asking for the second one).
 inline const u8 * GetClusterPVS(const int cluster)
 {
     PS2_Assert(cluster != kInvalidCluster); // MarkLeaves handles that case itself.
@@ -396,16 +390,22 @@ void MarkLeaves(const mod::ModelInstance & world)
 
     const u8 * vis = GetClusterPVS(s_viewCluster);
 
+    // Scratch for the two-cluster PVS union used when the camera straddles a solid
+    // water boundary. The single-cluster row comes from CM_ClusterPVS, which owns its
+    // own buffer - this only exists because combining two clusters needs the first row
+    // kept while the second is decompressed over it.
+    alignas(16) u8 fatPvs[MAX_MAP_LEAFS / 8];
+
     // May have to combine two clusters because of solid water boundaries:
     if (s_viewCluster2 != s_viewCluster)
     {
         // Copy the first row out before asking for the second: CM_ClusterPVS
         // decompresses both into the same buffer.
-        std::memcpy(s_fatPvs, vis, static_cast<size_t>((world.numLeafs + 7) / 8));
+        std::memcpy(fatPvs, vis, static_cast<size_t>((world.numLeafs + 7) / 8));
         vis = GetClusterPVS(s_viewCluster2);
 
         // Both buffers are 16-byte aligned, so OR them a word at a time.
-        u32 * fat = static_cast<u32 *>(static_cast<void *>(s_fatPvs));
+        u32 * fat = static_cast<u32 *>(static_cast<void *>(fatPvs));
         const u32 * add = static_cast<const u32 *>(static_cast<const void *>(vis));
 
         const int words = (world.numLeafs + 31) / 32;
@@ -413,7 +413,7 @@ void MarkLeaves(const mod::ModelInstance & world)
         {
             fat[i] |= add[i];
         }
-        vis = s_fatPvs;
+        vis = fatPvs;
     }
 
     mod::ModelLeaf * leaf = world.leafs;

@@ -78,7 +78,7 @@ constexpr u32 kHunkAlign = 16;
 // out to be the tighter of the two - an earlier 10% margin cost 384 KB and moved the
 // failure from the world hunk to a 1 MB model load. A map that overruns either
 // capacity says so and names the constant to raise, so being wrong is loud.
-constexpr u32 kWorldHunkCapacity    = 7296u * 1024u; // 7.12 MB, power2.bsp + 4.1%
+constexpr u32 kWorldHunkCapacity    = 7168u * 1024u; // 7.00 MB, power2.bsp + 4.2%
 constexpr u32 kWorldScratchCapacity = 972u * 1024u;  // 0.95 MB, lab.bsp + 4.3%
 constexpr u32 kWorldArenaBytes      = kWorldHunkCapacity + kWorldScratchCapacity;
 
@@ -588,8 +588,11 @@ void LoadPlanes(ModelInstance & mdl, HunkAllocator & hunk, const void * const lu
     const auto * in = LumpAs<dplane_t>(lumpData);
     const int count = LumpElemCount<dplane_t>(l);
 
-    // Twice the count, matching ref_gl (the extra slots back opposite planes).
-    cplane_t * out = hunk.AllocArray<cplane_t>(count * 2);
+    // NOTE:
+    // ref_gl allocates count*2 here and only ever fills count - the second half is
+    // never written and never read, since numPlanes bounds every consumer. It looks
+    // like it was meant to back opposite planes that were never implemented.
+    cplane_t * out = hunk.AllocArray<cplane_t>(count);
     mdl.planes    = out;
     mdl.numPlanes = count;
 
@@ -1371,7 +1374,7 @@ bool ComputeBrushHunkSize(const dheader_t * header, const PrePassLumps & pre, co
 
     const int numPlanes = CheckedLumpCount(header->lumps[LUMP_PLANES], sizeof(dplane_t), "planes", name);
     if (numPlanes < 0) { return false; }
-    m.AddArray<cplane_t>(numPlanes * 2);
+    m.AddArray<cplane_t>(numPlanes);
 
     const int numTexInfos = CheckedLumpCount(header->lumps[LUMP_TEXINFO], sizeof(textureinfo_t), "texinfo", name);
     if (numTexInfos < 0) { return false; }
