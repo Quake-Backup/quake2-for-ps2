@@ -551,12 +551,7 @@ killserver ; deathmatch 1 ; cheats 1 ; map base1
 - Water/turbulent surface warping is still done on the EE and is a good candidate to move to
   VU1 ([render_view.cpp:889](src/ps2/renderer/render_view.cpp#L889)), as is particle
   billboard generation ([render_view.cpp:2077](src/ps2/renderer/render_view.cpp#L2077)).
-- `TextureTransfer` has no `EnsureSpace` and works off a fixed 128-qword scratch packet
-  ([gs.cpp:633](src/ps2/renderer/gs.cpp#L633)); CLUT reloads could also be skipped with
-  `CLUT_COMPARE_CBP0` ([gs.cpp:723](src/ps2/renderer/gs.cpp#L723)).
-- The 2D path still uses the old `libpacket`; `libpacket2` (already used by the VU1 path)
-  would remove that dependency
-  ([render_packet.h:37](src/ps2/renderer/render_packet.h#L37)).
+- CLUT reloads could also be skipped with `CLUT_COMPARE_CBP0` ([gs.cpp:723](src/ps2/renderer/gs.cpp#L723)).
 - General performance work — the target is a solid 60 fps "performance mode" in real gameplay, and that hasn't been profiled seriously yet.
 
 **Engine features**
