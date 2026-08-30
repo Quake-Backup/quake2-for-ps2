@@ -73,8 +73,13 @@ constexpr float kSubdivideSizeF = static_cast<float>(kSubdivideSize);
 // the real run exactly, and leaves vertex arrays qword-aligned for later DMA.
 constexpr u32 kHunkAlign = 16;
 
-constexpr u32 kWorldHunkCapacity    = 7680u * 1024u; // 7.50 MB, power2.bsp + 9.6%
-constexpr u32 kWorldScratchCapacity = 1024u * 1024u; // 1.00 MB, lab.bsp + 9.9%
+// Both are the measured worst case plus ~4%. The margin is deliberately thin: every
+// byte reserved here is a byte the general heap does not get, and that heap turned
+// out to be the tighter of the two - an earlier 10% margin cost 384 KB and moved the
+// failure from the world hunk to a 1 MB model load. A map that overruns either
+// capacity says so and names the constant to raise, so being wrong is loud.
+constexpr u32 kWorldHunkCapacity    = 7296u * 1024u; // 7.12 MB, power2.bsp + 4.1%
+constexpr u32 kWorldScratchCapacity = 972u * 1024u;  // 0.95 MB, lab.bsp + 4.3%
 constexpr u32 kWorldArenaBytes      = kWorldHunkCapacity + kWorldScratchCapacity;
 
 // Reserved once by ReserveWorldArena, never freed. The hunk occupies the first
@@ -283,17 +288,16 @@ public:
 
     ~BspFileReader() { Close(); }
 
-    // Opens the file, validates the header and allocates the scratch buffer.
-    bool Open(const char * const name)
+    // Adopts an already-open file positioned at the .bsp's first byte, validates
+    // the header and claims the scratch buffer. Does not take ownership: the
+    // caller opened the file to read its format tag and closes it afterwards.
+    bool Open(FILE * const file, const char * const name)
     {
-        if (FS_FOpenFile(name, &m_file) < 0 || m_file == nullptr)
-        {
-            Com_Printf("ERROR: LoadBrushModel: Unable to open '%s'!\n", name);
-            return false;
-        }
+        PS2_Assert(file != nullptr);
+        m_file = file;
 
         // Lump offsets are relative to the start of the .bsp, which inside a pak
-        // is not the start of the stream - FS_FOpenFile leaves us seeked there.
+        // is not the start of the stream - the caller left us seeked there.
         m_baseOffset = std::ftell(m_file);
         if (m_baseOffset < 0)
         {
@@ -349,16 +353,12 @@ public:
 
     void Close()
     {
-        // m_scratch points into the reserved arena and is never freed; just drop the
-        // reference so a second Close() or a use-after-close trips on null.
+        // Neither resource is ours to release: m_scratch points into the reserved
+        // arena, and the file belongs to the caller. Just drop both references so a
+        // use-after-close trips on null rather than reading a stale handle.
         m_scratch     = nullptr;
         m_scratchSize = 0;
-
-        if (m_file != nullptr)
-        {
-            FS_FCloseFile(m_file);
-            m_file = nullptr;
-        }
+        m_file        = nullptr;
     }
 
     const dheader_t & Header() const { return m_header; }
@@ -1478,9 +1478,9 @@ bool IsWorldArenaBlock(const void * const ptr)
 // BRUSH MODELS (WORLD MAP)
 // ------------------------------------------------------------------------------------------------
 
-bool LoadBrushModel(ModelInstance & mdl, const char * const fileName)
+bool LoadBrushModel(ModelInstance & mdl, FILE * const file, const char * const fileName)
 {
-    PS2_Assert(fileName != nullptr);
+    PS2_Assert(file != nullptr && fileName != nullptr);
 
     // The view walk reads this map's PVS out of the collision model rather than
     // keeping its own copy (see MarkLeaves), so the two have to be the same .bsp.
@@ -1494,7 +1494,7 @@ bool LoadBrushModel(ModelInstance & mdl, const char * const fileName)
                   "Loading a world model the collision model is not holding!");
 
     BspFileReader bsp{};
-    if (!bsp.Open(fileName))
+    if (!bsp.Open(file, fileName))
     {
         return false; // Open() has already reported why.
     }
@@ -1561,26 +1561,37 @@ bool LoadBrushModel(ModelInstance & mdl, const char * const fileName)
 // SPRITE MODELS
 // ------------------------------------------------------------------------------------------------
 
-bool LoadSpriteModel(ModelInstance & mdl, const void * const modelData, const int dataLenBytes)
+bool LoadSpriteModel(ModelInstance & mdl, FILE * const file, const int fileLen)
 {
-    PS2_Assert(modelData != nullptr);
-    PS2_Assert(dataLenBytes > 0);
+    PS2_Assert(file != nullptr);
 
-    const auto * in = static_cast<const dsprite_t *>(modelData);
-    if (in->version != SPRITE_VERSION)
+    if (fileLen < static_cast<int>(sizeof(dsprite_t)))
+    {
+        Com_Printf("ERROR: Sprite '%s' is too small to hold a header (%i bytes)\n", mdl.name, fileLen);
+        return false;
+    }
+
+    // The header first, so the file is only committed to a hunk once it is known
+    // to be a sprite we can use.
+    const long base = std::ftell(file);
+    dsprite_t header{};
+    FS_Read(&header, static_cast<int>(sizeof(header)), file);
+
+    if (header.version != SPRITE_VERSION)
     {
         Com_Printf("ERROR: Sprite '%s' has wrong version (%i should be %i)\n",
-                   mdl.name, in->version, SPRITE_VERSION);
+                   mdl.name, header.version, SPRITE_VERSION);
         return false;
     }
-    if (in->numframes < 0 || in->numframes > kMaxMD2Skins)
+    if (header.numframes < 0 || header.numframes > kMaxMD2Skins)
     {
-        Com_Printf("ERROR: Sprite '%s' has bad frame count (%i)\n", mdl.name, in->numframes);
+        Com_Printf("ERROR: Sprite '%s' has bad frame count (%i)\n", mdl.name, header.numframes);
         return false;
     }
 
-    // A sprite is stored verbatim; the hunk just holds a copy of the file.
-    const u32 hunkSize = AlignUp(static_cast<u32>(dataLenBytes), kHunkAlign);
+    // A sprite needs no decoding, so the hunk holds the file exactly as it is on
+    // disk and the read lands directly in its final home - no staging copy.
+    const u32 hunkSize = AlignUp(static_cast<u32>(fileLen), kHunkAlign);
 
     HunkAllocator hunk{};
     hunk.Init(hunkSize, MEMTAG_MDL_SPRITE);
@@ -1588,8 +1599,13 @@ bool LoadSpriteModel(ModelInstance & mdl, const void * const modelData, const in
     mdl.hunkSize = hunkSize;
     mdl.type     = ModelType::Sprite;
 
-    auto * out = static_cast<dsprite_t *>(hunk.Alloc(static_cast<u32>(dataLenBytes)));
-    std::memcpy(out, in, static_cast<size_t>(dataLenBytes));
+    auto * out = static_cast<dsprite_t *>(hunk.Alloc(static_cast<u32>(fileLen)));
+    if (std::fseek(file, base, SEEK_SET) != 0)
+    {
+        Com_Printf("ERROR: Sprite '%s': cannot rewind to the start of the model\n", mdl.name);
+        return false; // The caller's Unload releases the hunk.
+    }
+    FS_Read(out, fileLen, file);
 
     for (int i = 0; i < out->numframes; ++i)
     {
@@ -1599,7 +1615,7 @@ bool LoadSpriteModel(ModelInstance & mdl, const void * const modelData, const in
 
     if (kVerboseModelLoading)
     {
-        Com_DPrintf("Sprite model '%s' loaded.\n", mdl.name);
+        Com_DPrintf("Sprite model '%s' loaded (%u KB hunk, read in place).\n", mdl.name, hunkSize / 1024u);
     }
     return true;
 }
@@ -1608,49 +1624,59 @@ bool LoadSpriteModel(ModelInstance & mdl, const void * const modelData, const in
 // ALIAS MD2 MODELS
 // ------------------------------------------------------------------------------------------------
 
-bool LoadAliasMD2Model(ModelInstance & mdl, const void * const modelData, const int dataLenBytes)
+bool LoadAliasMD2Model(ModelInstance & mdl, FILE * const file, const int fileLen)
 {
-    PS2_Assert(modelData != nullptr);
-    PS2_Assert(dataLenBytes > 0);
+    PS2_Assert(file != nullptr);
 
-    const auto * in = static_cast<const dmdl_t *>(modelData);
-    if (in->version != ALIAS_VERSION)
+    if (fileLen < static_cast<int>(sizeof(dmdl_t)))
     {
-        Com_Printf("ERROR: Model '%s' has wrong version (%i should be %i)\n",
-                   mdl.name, in->version, ALIAS_VERSION);
+        Com_Printf("ERROR: Model '%s' is too small to hold a header (%i bytes)\n", mdl.name, fileLen);
         return false;
     }
 
-    // Validate the header before trusting any of its offsets.
-    if (in->ofs_end <= 0 || in->ofs_end > dataLenBytes)
+    // Read and validate the header before committing a hunk to it. Every offset
+    // below is trusted afterwards, so this is the only place they are checked.
+    const long base = std::ftell(file);
+    dmdl_t header{};
+    FS_Read(&header, static_cast<int>(sizeof(header)), file);
+
+    if (header.version != ALIAS_VERSION)
+    {
+        Com_Printf("ERROR: Model '%s' has wrong version (%i should be %i)\n",
+                   mdl.name, header.version, ALIAS_VERSION);
+        return false;
+    }
+    if (header.ofs_end <= 0 || header.ofs_end > fileLen)
     {
         Com_Printf("ERROR: Model '%s' has a bad end offset!\n", mdl.name);
         return false;
     }
-    if (in->skinheight > kMaxMD2SkinHeight)
+    if (header.skinheight > kMaxMD2SkinHeight)
     {
         Com_Printf("ERROR: Model '%s' has a skin taller than %i.\n", mdl.name, kMaxMD2SkinHeight);
         return false;
     }
-    if (in->num_xyz <= 0 || in->num_xyz > MAX_VERTS)
+    if (header.num_xyz <= 0 || header.num_xyz > MAX_VERTS)
     {
-        Com_Printf("ERROR: Model '%s' has a bad vertex count (%i)!\n", mdl.name, in->num_xyz);
+        Com_Printf("ERROR: Model '%s' has a bad vertex count (%i)!\n", mdl.name, header.num_xyz);
         return false;
     }
-    if (in->num_st <= 0 || in->num_tris <= 0 || in->num_frames <= 0)
+    if (header.num_st <= 0 || header.num_tris <= 0 || header.num_frames <= 0)
     {
         Com_Printf("ERROR: Model '%s' has no st verts / triangles / frames!\n", mdl.name);
         return false;
     }
-    if (in->num_skins < 0 || in->num_skins > kMaxMD2Skins)
+    if (header.num_skins < 0 || header.num_skins > kMaxMD2Skins)
     {
-        Com_Printf("ERROR: Model '%s' has a bad skin count (%i)!\n", mdl.name, in->num_skins);
+        Com_Printf("ERROR: Model '%s' has a bad skin count (%i)!\n", mdl.name, header.num_skins);
         return false;
     }
 
-    // MD2 needs no per-field expansion (no byte swap on the EE), so the hunk
-    // holds a verbatim copy of the file up to ofs_end.
-    const u32 hunkSize = AlignUp(static_cast<u32>(in->ofs_end), kHunkAlign);
+    // MD2 needs no per-field expansion (no byte swap on the EE), so the hunk holds
+    // the file verbatim up to ofs_end and the read lands straight in it. The
+    // biggest MD2 in pak0 is just under 1 MB; staging it through a second buffer
+    // used to put 2 MB of the general heap under a single model load.
+    const u32 hunkSize = AlignUp(static_cast<u32>(header.ofs_end), kHunkAlign);
 
     HunkAllocator hunk{};
     hunk.Init(hunkSize, MEMTAG_MDL_ALIAS);
@@ -1658,8 +1684,13 @@ bool LoadAliasMD2Model(ModelInstance & mdl, const void * const modelData, const 
     mdl.hunkSize = hunkSize;
     mdl.type     = ModelType::AliasMD2;
 
-    auto * out = static_cast<dmdl_t *>(hunk.Alloc(static_cast<u32>(in->ofs_end)));
-    std::memcpy(out, in, static_cast<size_t>(in->ofs_end));
+    auto * out = static_cast<dmdl_t *>(hunk.Alloc(static_cast<u32>(header.ofs_end)));
+    if (std::fseek(file, base, SEEK_SET) != 0)
+    {
+        Com_Printf("ERROR: Model '%s': cannot rewind to the start of the model\n", mdl.name);
+        return false; // The caller's Unload releases the hunk.
+    }
+    FS_Read(out, header.ofs_end, file);
 
     // Default bounds (MD2s carry no bounds; the game clips against these).
     mdl.mins      = { -32.0f, -32.0f, -32.0f };
@@ -1674,7 +1705,7 @@ bool LoadAliasMD2Model(ModelInstance & mdl, const void * const modelData, const 
 
     if (kVerboseModelLoading)
     {
-        Com_DPrintf("Alias model '%s' loaded.\n", mdl.name);
+        Com_DPrintf("Alias model '%s' loaded (%u KB hunk, read in place).\n", mdl.name, hunkSize / 1024u);
     }
     return true;
 }

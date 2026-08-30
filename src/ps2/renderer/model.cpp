@@ -140,37 +140,68 @@ const ModelInstance * ModelCache::Find(const char * const name)
     return LoadModel(name);
 }
 
-// Reads just the 4-byte format id, without loading the file. Brush models are
-// streamed lump by lump (LoadBrushModel opens the file itself), so the format has
-// to be known before deciding whether to pull the whole thing into memory.
-static bool PeekModelType(const char * const name, ModelType & outType)
+// Opens the model file and reads its 4-byte format id, then rewinds so the file is
+// positioned at the first byte again. The open handle is handed back rather than
+// closed: every loader reads straight into its own destination, so re-opening for
+// the real read would just cost a second directory lookup and pak seek.
+//
+// The caller owns the returned handle and must FS_FCloseFile it. On failure nothing
+// is left open.
+static bool PeekModelType(const char * const name, ModelType & outType,
+                          FILE ** outFile, int * outFileLen)
 {
+    *outFile    = nullptr;
+    *outFileLen = 0;
+
     FILE * file = nullptr;
-    if (FS_FOpenFile(name, &file) < static_cast<int>(sizeof(u32)) || file == nullptr)
+    const int fileLen = FS_FOpenFile(name, &file);
+
+    if (fileLen < static_cast<int>(sizeof(u32)) || file == nullptr)
     {
         if (file != nullptr) { FS_FCloseFile(file); }
         return false;
     }
 
+    // Inside a pak the model does not start at offset zero, so remember where it
+    // does before reading - that is the position to restore.
+    const long base = std::ftell(file);
+
     u32 id = 0;
     FS_Read(&id, static_cast<int>(sizeof(id)), file);
-    FS_FCloseFile(file);
+
+    if (base < 0 || std::fseek(file, base, SEEK_SET) != 0)
+    {
+        Com_Printf("ERROR: ModelCache: Cannot rewind '%s' after reading its id!\n", name);
+        FS_FCloseFile(file);
+        return false;
+    }
 
     switch (id)
     {
-    case IDBSPHEADER    : outType = ModelType::Brush;    return true;
-    case IDSPRITEHEADER : outType = ModelType::Sprite;   return true;
-    case IDALIASHEADER  : outType = ModelType::AliasMD2; return true;
+    case IDBSPHEADER    : outType = ModelType::Brush;    break;
+    case IDSPRITEHEADER : outType = ModelType::Sprite;   break;
+    case IDALIASHEADER  : outType = ModelType::AliasMD2; break;
     default :
         Com_Printf("ERROR: ModelCache: Unknown file id (0x%X) for '%s'!\n", id, name);
+        FS_FCloseFile(file);
         return false;
     }
+
+    *outFile    = file;
+    *outFileLen = fileLen;
+    return true;
 }
 
 const ModelInstance * ModelCache::LoadModel(const char * const name)
 {
     ModelType type;
-    if (!PeekModelType(name, type))
+    FILE * file    = nullptr;
+    int    fileLen = 0;
+
+    // Opens the file and leaves it positioned at byte zero; every loader below
+    // reads straight from it into its own hunk, so it stays open for the whole
+    // load and is closed once here.
+    if (!PeekModelType(name, type, &file, &fileLen)) [[unlikely]]
     {
         Com_Printf("WARNING: Unable to load model '%s'! Failed to open file.\n", name);
         return nullptr;
@@ -179,6 +210,7 @@ const ModelInstance * ModelCache::LoadModel(const char * const name)
     const u16 slot = m_modelPool.Alloc();
     if (slot == ModelPool::kInvalidIndex) [[unlikely]]
     {
+        FS_FCloseFile(file);
         Sys_Error("Out of model cache slots for '%s'! Bump ModelCache::kMaxModels (%u).", name, kMaxModels);
     }
 
@@ -198,28 +230,20 @@ const ModelInstance * ModelCache::LoadModel(const char * const name)
         PS2_AssertMsg(m_worldModel == nullptr,
                       "Loading a brush model while another still holds the world arena!");
 
-        // Streams the file itself - never holds the whole .bsp.
-        ok = LoadBrushModel(mdl, name);
+        // Streams the file lump by lump - never holds the whole .bsp.
+        ok = LoadBrushModel(mdl, file, name);
         if (ok) { SetUpInlineModels(mdl); }
     }
     else
     {
-        // Sprites and MD2s are copied into their hunk verbatim, so the loaded
-        // file and the hunk are the same size; loading whole file is fine for those.
-        void * fileData = nullptr;
-        const int fileLen = FS_LoadFile(name, &fileData);
-        if (fileData == nullptr || fileLen <= 0)
-        {
-            Com_Printf("WARNING: Unable to load model '%s'! Failed to read file.\n", name);
-            if (fileData != nullptr) { FS_FreeFile(fileData); }
-            Unload(slot);
-            return nullptr;
-        }
-
-        ok = (type == ModelType::Sprite) ? LoadSpriteModel(mdl, fileData, fileLen)
-                                         : LoadAliasMD2Model(mdl, fileData, fileLen);
-        FS_FreeFile(fileData);
+        // Both read straight into their hunk. Neither format needs decoding on the
+        // EE, so there is nothing for an intermediate buffer to do except double
+        // the peak - which for the biggest MD2 in pak0 was 2 MB.
+        ok = (type == ModelType::Sprite) ? LoadSpriteModel(mdl, file, fileLen)
+                                         : LoadAliasMD2Model(mdl, file, fileLen);
     }
+
+    FS_FCloseFile(file);
 
     if (!ok)
     {
