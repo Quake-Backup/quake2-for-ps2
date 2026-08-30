@@ -69,6 +69,25 @@ typedef struct
 const PS2MemStats * PS2_GetStatsForMemTag(PS2MemTag tag);
 const char * PS2_GetNameForMemTag(PS2MemTag tag);
 
+// A read-only snapshot of the allocator's own view of the heap, which the memtag
+// table cannot give: the tags say how many bytes each subsystem holds, this says
+// how those bytes are arranged. Cheap (a walk of dlmalloc's bins) and, unlike the
+// probe on the out-of-memory path, it allocates nothing - so it is safe to call
+// from instrumentation without changing what it is measuring.
+typedef struct
+{
+    size_t arenaBytes;    // everything dlmalloc has taken from the system, ever
+    size_t inUseBytes;    // handed out to callers
+    size_t freeBytes;     // free, across every chunk below
+    size_t topChunkBytes; // the single contiguous run at the end of the arena
+    size_t fastbinBytes;  // free bytes parked in fastbins
+    size_t freeChunks;    // free chunk count, the top chunk included
+    size_t fastbinChunks; // of which are fastbins: small, and deliberately left
+                          // uncoalesced until the next large request needs them
+} PS2HeapStats;
+
+void PS2_GetHeapStats(PS2HeapStats * outStats);
+
 // High-water mark of the sum of every tag - the largest the game was ever holding
 // at one time. Not the same as adding up the per-tag peaks: those happen at
 // different moments. This is the number that says whether a map change fits, since

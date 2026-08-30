@@ -154,18 +154,14 @@ static size_t LargestAllocatableBlock(const size_t upperBound)
 __attribute__((cold, noinline))
 static void PrintDlmallocStats(const size_t failedRequest)
 {
-    const struct mallinfo mi = dlmallinfo();
+    PS2HeapStats hs{};
+    PS2_GetHeapStats(&hs);
 
-    // mallinfo's fields are ints over unsigned-long bookkeeping, so they can read
-    // negative once the arena passes 2 GB. Never on a 32 MB console, but clamp
-    // rather than print something absurd if it ever does.
-    const auto Clamp = [](int v) -> size_t { return (v < 0) ? 0u : static_cast<size_t>(v); };
-
-    const size_t arena    = Clamp(mi.arena);
-    const size_t inUse    = Clamp(mi.uordblks);
-    const size_t freeTot  = Clamp(mi.fordblks);
-    const size_t freeChks = Clamp(mi.ordblks);
-    const size_t keepCost = Clamp(mi.keepcost);
+    const size_t arena    = hs.arenaBytes;
+    const size_t inUse    = hs.inUseBytes;
+    const size_t freeTot  = hs.freeBytes;
+    const size_t freeChks = hs.freeChunks;
+    const size_t keepCost = hs.topChunkBytes;
     const size_t largest  = LargestAllocatableBlock(failedRequest);
 
     char a[PS2_MEMUNIT_STR_SIZE], b[PS2_MEMUNIT_STR_SIZE], c[PS2_MEMUNIT_STR_SIZE];
@@ -365,6 +361,29 @@ const char * PS2_GetNameForMemTag(PS2MemTag tag)
 size_t PS2_GetPeakMemBytes()
 {
     return s_peakTotalBytes;
+}
+
+void PS2_GetHeapStats(PS2HeapStats * const outStats)
+{
+    if (outStats == nullptr) { return; }
+
+    // dlmallinfo only consolidates when the heap is still uninitialised (top == 0);
+    // after the first allocation it is a pure walk of the bins, so calling this
+    // does not disturb the arrangement it is reporting.
+    const struct mallinfo mi = dlmallinfo();
+
+    // mallinfo's fields are ints over unsigned-long bookkeeping, so they can read
+    // negative once the arena passes 2 GB. Never on a 32 MB console, but clamp
+    // rather than report something absurd if it ever does.
+    const auto Clamp = [](int v) -> size_t { return (v < 0) ? 0u : static_cast<size_t>(v); };
+
+    outStats->arenaBytes    = Clamp(mi.arena);
+    outStats->inUseBytes    = Clamp(mi.uordblks);
+    outStats->freeBytes     = Clamp(mi.fordblks);
+    outStats->topChunkBytes = Clamp(mi.keepcost);
+    outStats->fastbinBytes  = Clamp(mi.fsmblks);
+    outStats->freeChunks    = Clamp(mi.ordblks);
+    outStats->fastbinChunks = Clamp(mi.smblks);
 }
 
 const char * PS2_DumpMemTags(char * outBuffer, size_t outBufferSize)

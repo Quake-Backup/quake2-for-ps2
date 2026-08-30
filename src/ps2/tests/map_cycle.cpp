@@ -149,6 +149,55 @@ void ReportMap(const char * const name, const int index)
                (peakNow > s_peakBeforeMap) ? "  <- NEW PEAK" : "");
 }
 
+// Where the free memory sits, which the memtag table cannot show. A pass can end
+// with megabytes free and still fail the next big allocation, because dlmalloc
+// never moves a live block - so what matters is not how much is free but how it is
+// arranged. Printed per pass so the trend across a long session is visible: a
+// number that climbs pass over pass is the heap degrading, one that holds is not.
+void ReportHeap(const int pass)
+{
+    PS2HeapStats hs{};
+    PS2_GetHeapStats(&hs);
+
+    char a[PS2_MEMUNIT_STR_SIZE], b[PS2_MEMUNIT_STR_SIZE], c[PS2_MEMUNIT_STR_SIZE];
+
+    // The top chunk is one contiguous run at the end of the arena, and fastbins are
+    // small chunks dlmalloc deliberately leaves uncoalesced until a large request
+    // needs them. Neither is fragmentation. What is left over is: free bytes stuck
+    // in holes between live blocks, which only a future allocation of the right
+    // size can ever use.
+    const size_t nonInterior    = hs.topChunkBytes + hs.fastbinBytes;
+    const size_t interior       = (hs.freeBytes > nonInterior) ? (hs.freeBytes - nonInterior) : 0u;
+    const size_t interiorChunks = (hs.freeChunks > 1u) ? (hs.freeChunks - 1u) : 0u;
+
+    Com_Printf("MapCycle: ---- heap after pass %d ----\n", pass);
+    Com_Printf("MapCycle:   arena %s   in use %s   free %s\n",
+               PS2_FormatMemoryUnit(hs.arenaBytes, true, a, sizeof(a)),
+               PS2_FormatMemoryUnit(hs.inUseBytes, true, b, sizeof(b)),
+               PS2_FormatMemoryUnit(hs.freeBytes,  true, c, sizeof(c)));
+    Com_Printf("MapCycle:   top chunk %s   fastbins %s in %zu\n",
+               PS2_FormatMemoryUnit(hs.topChunkBytes, true, a, sizeof(a)),
+               PS2_FormatMemoryUnit(hs.fastbinBytes,  true, b, sizeof(b)),
+               hs.fastbinChunks);
+    Com_Printf("MapCycle:   interior holes %s in %zu chunks (avg %s)\n",
+               PS2_FormatMemoryUnit(interior, true, a, sizeof(a)), interiorChunks,
+               PS2_FormatMemoryUnit((interiorChunks != 0u) ? (interior / interiorChunks) : 0u,
+                                    true, b, sizeof(b)));
+
+    if (hs.freeBytes != 0u)
+    {
+        // Share of free memory that is neither the top run nor a fastbin. An upper
+        // bound on fragmentation, not a measurement: mallinfo reports no largest
+        // free chunk, so an interior hole could well be bigger than the top and
+        // serve a large request anyway. The number to watch is its trend, and
+        // whether the top chunk still covers the biggest allocation a map needs.
+        const double pct = 100.0 * static_cast<double>(interior) / static_cast<double>(hs.freeBytes);
+        Com_Printf("MapCycle:   scattered %.1f%% of free space (upper bound on fragmentation)\n", pct);
+        Com_Printf("MapCycle:   guaranteed contiguous: at least %s (the top chunk)\n",
+                   PS2_FormatMemoryUnit(hs.topChunkBytes, true, a, sizeof(a)));
+    }
+}
+
 void Finish()
 {
     char peak[PS2_MEMUNIT_STR_SIZE], total[PS2_MEMUNIT_STR_SIZE];
@@ -158,6 +207,12 @@ void Finish()
     Com_Printf("MapCycle: worst moment across the whole run was %s of %s installed.\n",
                PS2_FormatMemoryUnit(PS2_GetPeakMemBytes(), true, peak, sizeof(peak)),
                PS2_FormatMemoryUnit(PS2_GetTotalMemBytes(), true, total, sizeof(total)));
+
+    // Survives Restart(), so re-running the test in the same session numbers the
+    // passes and makes drift between them obvious.
+    static int s_passesRun = 0;
+    ReportHeap(++s_passesRun);
+
     s_done = true;
 }
 
