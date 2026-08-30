@@ -29,12 +29,14 @@ u8 * AllocPixels(int sizeBytes)
 {
     // 16-byte aligned: the upload DMA chain references the buffer in place,
     // and REF transfer tags require qword-aligned source addresses.
-    return static_cast<u8 *>(PS2_MemAllocAligned(16, static_cast<size_t>(sizeBytes), MEMTAG_TEXIMAGE));
+    return static_cast<u8 *>(ps2::heap::AllocAligned(ps2::heap::MemAlign(16),
+                                                     static_cast<size_t>(sizeBytes),
+                                                     ps2::heap::MemTag::TexImage));
 }
 
 void FreePixels(u8 * pic, int sizeBytes)
 {
-    PS2_MemFree(pic, static_cast<size_t>(sizeBytes), MEMTAG_TEXIMAGE);
+    ps2::heap::Free(pic, static_cast<size_t>(sizeBytes), ps2::heap::MemTag::TexImage);
 }
 
 // TGA rows are stored bottom-up; the decoders below write the file's pixel

@@ -65,7 +65,7 @@ static tex::Texture s_frameTexture = {
 
 // Allocates the frame buffer on the first frame of a cinematic. Zeroed, so the
 // rows a short frame never writes draw black instead of the previous movie's
-// leftovers. PS2_MemAllocAligned is fatal on failure, so there is no error path.
+// leftovers. ps2::heap::AllocAligned is fatal on failure, so there is no error path.
 void EnsureFrameBuffer()
 {
     if (s_frameBuffer != nullptr)
@@ -73,7 +73,7 @@ void EnsureFrameBuffer()
         return;
     }
 
-    void * const mem = PS2_MemAllocAligned(16, kFrameBufferBytes, MEMTAG_RENDERER);
+    void * const mem = ps2::heap::AllocAligned(ps2::heap::MemAlign(16), kFrameBufferBytes, ps2::heap::MemTag::Renderer);
     std::memset(mem, 0, kFrameBufferBytes);
 
     s_frameBuffer         = static_cast<u16 *>(mem);
@@ -90,7 +90,7 @@ void ReleaseFrameBuffer()
         return;
     }
 
-    PS2_MemFree(s_frameBuffer, kFrameBufferBytes, MEMTAG_RENDERER);
+    ps2::heap::Free(s_frameBuffer, kFrameBufferBytes, ps2::heap::MemTag::Renderer);
     s_frameBuffer         = nullptr;
     s_frameTexture.pixels = nullptr;
 }

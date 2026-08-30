@@ -109,17 +109,17 @@ bool TargetWorldIsResident()
     return world != nullptr && std::strcmp(world->name, s_targetBsp) == 0;
 }
 
-size_t TagBytes(const PS2MemTag tag)
+size_t TagBytes(const ps2::heap::MemTag tag)
 {
-    return PS2_GetStatsForMemTag(tag)->totalBytes;
+    return ps2::heap::GetStatsForMemTag(tag).totalBytes;
 }
 
 size_t LiveTotalBytes()
 {
     size_t total = 0;
-    for (int i = 0; i < MEMTAG_COUNT; ++i)
+    for (int i = 0; i < static_cast<int>(ps2::heap::MemTag::TagCount); ++i)
     {
-        total += TagBytes(static_cast<PS2MemTag>(i));
+        total += TagBytes(static_cast<ps2::heap::MemTag>(i));
     }
     return total;
 }
@@ -129,23 +129,23 @@ size_t LiveTotalBytes()
 // that cost the most - which is the number the whole test exists to find.
 void ReportMap(const char * const name, const int index)
 {
-    char world[PS2_MEMUNIT_STR_SIZE], audio[PS2_MEMUNIT_STR_SIZE];
-    char tex[PS2_MEMUNIT_STR_SIZE],   alias[PS2_MEMUNIT_STR_SIZE];
-    char total[PS2_MEMUNIT_STR_SIZE], peak[PS2_MEMUNIT_STR_SIZE];
-    char freeMem[PS2_MEMUNIT_STR_SIZE];
+    char world[ps2::heap::kMemUnitStrSize], audio[ps2::heap::kMemUnitStrSize];
+    char tex[ps2::heap::kMemUnitStrSize],   alias[ps2::heap::kMemUnitStrSize];
+    char total[ps2::heap::kMemUnitStrSize], peak[ps2::heap::kMemUnitStrSize];
+    char freeMem[ps2::heap::kMemUnitStrSize];
 
-    const size_t peakNow = PS2_GetPeakMemBytes();
+    const size_t peakNow = ps2::heap::GetPeakMemBytes();
 
     Com_Printf("MapCycle [%2d/%2d] %-9s World %-9s Audio %-9s Tex %-9s Mdl %-9s "
                "TOTAL %-9s PEAK %-9s FREE %-9s%s\n",
                index + 1, ArrayLength(kMaps), name,
-               PS2_FormatMemoryUnit(TagBytes(MEMTAG_MDL_WORLD), true, world, sizeof(world)),
-               PS2_FormatMemoryUnit(TagBytes(MEMTAG_AUDIO),     true, audio, sizeof(audio)),
-               PS2_FormatMemoryUnit(TagBytes(MEMTAG_TEXIMAGE),  true, tex,   sizeof(tex)),
-               PS2_FormatMemoryUnit(TagBytes(MEMTAG_MDL_ALIAS), true, alias, sizeof(alias)),
-               PS2_FormatMemoryUnit(LiveTotalBytes(),           true, total, sizeof(total)),
-               PS2_FormatMemoryUnit(peakNow,                    true, peak,  sizeof(peak)),
-               PS2_FormatMemoryUnit(PS2_GetAvailableMemBytes(), true, freeMem, sizeof(freeMem)),
+               ps2::heap::FormatMemoryUnit(TagBytes(ps2::heap::MemTag::WorldMdl), true, world, sizeof(world)),
+               ps2::heap::FormatMemoryUnit(TagBytes(ps2::heap::MemTag::Audio),    true, audio, sizeof(audio)),
+               ps2::heap::FormatMemoryUnit(TagBytes(ps2::heap::MemTag::TexImage), true, tex,   sizeof(tex)),
+               ps2::heap::FormatMemoryUnit(TagBytes(ps2::heap::MemTag::AliasMdl), true, alias, sizeof(alias)),
+               ps2::heap::FormatMemoryUnit(LiveTotalBytes(),           true, total, sizeof(total)),
+               ps2::heap::FormatMemoryUnit(peakNow,                    true, peak,  sizeof(peak)),
+               ps2::heap::FormatMemoryUnit(ps2::heap::GetAvailableMemBytes(), true, freeMem, sizeof(freeMem)),
                (peakNow > s_peakBeforeMap) ? "  <- NEW PEAK" : "");
 }
 
@@ -156,10 +156,9 @@ void ReportMap(const char * const name, const int index)
 // number that climbs pass over pass is the heap degrading, one that holds is not.
 void ReportHeap(const int pass)
 {
-    PS2HeapStats hs{};
-    PS2_GetHeapStats(&hs);
+    const ps2::heap::HeapStats hs = ps2::heap::GetHeapStats();
 
-    char a[PS2_MEMUNIT_STR_SIZE], b[PS2_MEMUNIT_STR_SIZE], c[PS2_MEMUNIT_STR_SIZE];
+    char a[ps2::heap::kMemUnitStrSize], b[ps2::heap::kMemUnitStrSize], c[ps2::heap::kMemUnitStrSize];
 
     // The top chunk is one contiguous run at the end of the arena, and fastbins are
     // small chunks dlmalloc deliberately leaves uncoalesced until a large request
@@ -172,17 +171,17 @@ void ReportHeap(const int pass)
 
     Com_Printf("MapCycle: ---- heap after pass %d ----\n", pass);
     Com_Printf("MapCycle:   arena %s   in use %s   free %s\n",
-               PS2_FormatMemoryUnit(hs.arenaBytes, true, a, sizeof(a)),
-               PS2_FormatMemoryUnit(hs.inUseBytes, true, b, sizeof(b)),
-               PS2_FormatMemoryUnit(hs.freeBytes,  true, c, sizeof(c)));
+               ps2::heap::FormatMemoryUnit(hs.arenaBytes, true, a, sizeof(a)),
+               ps2::heap::FormatMemoryUnit(hs.inUseBytes, true, b, sizeof(b)),
+               ps2::heap::FormatMemoryUnit(hs.freeBytes,  true, c, sizeof(c)));
     Com_Printf("MapCycle:   top chunk %s   fastbins %s in %zu\n",
-               PS2_FormatMemoryUnit(hs.topChunkBytes, true, a, sizeof(a)),
-               PS2_FormatMemoryUnit(hs.fastbinBytes,  true, b, sizeof(b)),
+               ps2::heap::FormatMemoryUnit(hs.topChunkBytes, true, a, sizeof(a)),
+               ps2::heap::FormatMemoryUnit(hs.fastbinBytes,  true, b, sizeof(b)),
                hs.fastbinChunks);
     Com_Printf("MapCycle:   interior holes %s in %zu chunks (avg %s)\n",
-               PS2_FormatMemoryUnit(interior, true, a, sizeof(a)), interiorChunks,
-               PS2_FormatMemoryUnit((interiorChunks != 0u) ? (interior / interiorChunks) : 0u,
-                                    true, b, sizeof(b)));
+               ps2::heap::FormatMemoryUnit(interior, true, a, sizeof(a)), interiorChunks,
+               ps2::heap::FormatMemoryUnit((interiorChunks != 0u) ? (interior / interiorChunks) : 0u,
+                                           true, b, sizeof(b)));
 
     if (hs.freeBytes != 0u)
     {
@@ -194,19 +193,19 @@ void ReportHeap(const int pass)
         const double pct = 100.0 * static_cast<double>(interior) / static_cast<double>(hs.freeBytes);
         Com_Printf("MapCycle:   scattered %.1f%% of free space (upper bound on fragmentation)\n", pct);
         Com_Printf("MapCycle:   guaranteed contiguous: at least %s (the top chunk)\n",
-                   PS2_FormatMemoryUnit(hs.topChunkBytes, true, a, sizeof(a)));
+                   ps2::heap::FormatMemoryUnit(hs.topChunkBytes, true, a, sizeof(a)));
     }
 }
 
 void Finish()
 {
-    char peak[PS2_MEMUNIT_STR_SIZE], total[PS2_MEMUNIT_STR_SIZE];
+    char peak[ps2::heap::kMemUnitStrSize], total[ps2::heap::kMemUnitStrSize];
 
     Com_Printf("MapCycle: pass complete - %d loaded, %d skipped (not in pak), %d timed out.\n",
                ArrayLength(kMaps) - s_skipped - s_failed, s_skipped, s_failed);
     Com_Printf("MapCycle: worst moment across the whole run was %s of %s installed.\n",
-               PS2_FormatMemoryUnit(PS2_GetPeakMemBytes(), true, peak, sizeof(peak)),
-               PS2_FormatMemoryUnit(PS2_GetTotalMemBytes(), true, total, sizeof(total)));
+               ps2::heap::FormatMemoryUnit(ps2::heap::GetPeakMemBytes(), true, peak, sizeof(peak)),
+               ps2::heap::FormatMemoryUnit(ps2::heap::GetTotalMemBytes(), true, total, sizeof(total)));
 
     // Survives Restart(), so re-running the test in the same session numbers the
     // passes and makes drift between them obvious.
@@ -235,7 +234,7 @@ bool StartNextMap()
 
         // Sampled before the load so ReportMap can tell whether *this* transition
         // set a new high-water, rather than just echoing the running maximum.
-        s_peakBeforeMap = PS2_GetPeakMemBytes();
+        s_peakBeforeMap = ps2::heap::GetPeakMemBytes();
 
         Cbuf_AddText(va("map %s\n", name));
 

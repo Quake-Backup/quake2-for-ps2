@@ -21,7 +21,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include "client.h"
 #include "snd_loc.h"
-#include "ps2/system/heap.h" // [PS2_QUAKE]: PS2_MemAlloc/PS2_MemFree + MEMTAG_AUDIO
+#include "ps2/system/heap.h" // [PS2_QUAKE]: PS2Quake_AudioMalloc/PS2Quake_AudioFree
 
 int cache_full_cycle;
 
@@ -39,7 +39,7 @@ void S_FreeSoundCache(sfxcache_t * sc)
     if (!sc)
         return;
 
-    PS2_MemFree(sc, (size_t)(sc->length * sc->width) + sizeof(sfxcache_t), MEMTAG_AUDIO);
+    PS2Quake_AudioFree(sc, (size_t)(sc->length * sc->width) + sizeof(sfxcache_t));
 }
 
 /*
@@ -177,9 +177,9 @@ sfxcache_t * S_LoadSound(sfx_t * s)
 
     // Not Z_Malloc: the decoded sound cache is one of the biggest pools in the
     // game, and inside the zone it was invisible behind the generic "Quake"
-    // memtag. Tagging it MEMTAG_AUDIO puts it on its own row in the memory
+    // memtag. Tagging it ps2::heap::MemTag::Audio puts it on its own row in the memory
     // overlay. Freed by S_FreeSoundCache, never Z_Free.
-    sc = s->cache = PS2_MemAlloc(len + sizeof(sfxcache_t), MEMTAG_AUDIO);
+    sc = s->cache = PS2Quake_AudioMalloc(len + sizeof(sfxcache_t));
     if (!sc)
     {
         FS_FreeFile(data);

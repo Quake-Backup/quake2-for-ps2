@@ -27,7 +27,7 @@
  * return, and a fatal-error path is about as cold as a block gets, so the scan
  * starts below the epilogue it is looking for, runs off the end of the function
  * and matches the *next* function's prologue. Measured on this build, unwinding
- * out of PS2_MemAlloc's out-of-memory branch: it reached PS2_MemAllocAligned's
+ * out of ps2::heap::Alloc's out-of-memory branch: it reached ps2::heap::AllocAligned's
  * `addiu $sp, $sp, -2096` and read that immediate back unsigned, as a +63440 byte
  * frame - $sp walked 62 KB into nothing, every frame past the third fabricated.
  *

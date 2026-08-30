@@ -57,8 +57,8 @@ float IntensityScale();
 void SetClearColor(u8 r, u8 g, u8 b);
 
 // The most qwords either per-frame DMA packet has ever held, against the capacity
-// both were allocated with. The two packets are the whole MEMTAG_RENDERER budget
-// - shown as "DmaPeak" in the draw-stats overlay.
+// both were allocated with. The two packets are the whole ps2::heap::MemTag::Renderer
+// budget - shown as "DmaPeak" in the draw-stats overlay.
 int FramePacketPeakQwords();
 int FramePacketCapacityQwords();
 

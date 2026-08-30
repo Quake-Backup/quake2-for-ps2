@@ -47,7 +47,7 @@ public:
 
         // packet2_create mallocs the header struct plus the qword buffer; neither goes
         // through the tagged allocators, so account for them here. Never freed.
-        PS2_TagsAddMem(MEMTAG_RENDERER, sizeof(packet2_t) + (static_cast<size_t>(maxQwords) * sizeof(qword_t)));
+        ps2::heap::TagsAddMem(ps2::heap::MemTag::Renderer, sizeof(packet2_t) + (static_cast<size_t>(maxQwords) * sizeof(qword_t)));
     }
 
     // Rewinds the write cursor to the start of the buffer.

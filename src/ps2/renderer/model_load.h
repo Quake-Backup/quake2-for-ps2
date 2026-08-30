@@ -21,7 +21,7 @@ struct ModelInstance;
 void ReserveWorldArena();
 
 // True if 'ptr' is the base of the reserved arena, i.e. memory that must never be
-// passed to PS2_MemFree. ModelCache::Unload checks this before releasing a hunk.
+// passed to ps2::heap::Free. ModelCache::Unload checks this before releasing a hunk.
 bool IsWorldArenaBlock(const void * ptr);
 
 // All three take an open file positioned at the model's first byte, and none of

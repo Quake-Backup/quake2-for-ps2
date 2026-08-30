@@ -182,8 +182,8 @@ void LightmapManager::ReleaseAtlases()
     {
         gs::ReleaseTexture(m_atlases[i]); // no-op when it was never resident
 
-        PS2_MemFree(m_alpha[i],  kAtlasAlphaBytes, MEMTAG_LIGHTMAP);
-        PS2_MemFree(m_mirror[i], kAtlasColorBytes, MEMTAG_LIGHTMAP);
+        ps2::heap::Free(m_alpha[i],  kAtlasAlphaBytes, ps2::heap::MemTag::Lightmap);
+        ps2::heap::Free(m_mirror[i], kAtlasColorBytes, ps2::heap::MemTag::Lightmap);
 
         m_alpha[i]   = nullptr;
         m_mirror[i]  = nullptr;
@@ -209,8 +209,8 @@ void LightmapManager::NextAtlas()
 
     const int index = m_atlasCount++;
 
-    m_alpha[index]  = static_cast<u8  *>(PS2_MemAllocAligned(16, kAtlasAlphaBytes, MEMTAG_LIGHTMAP));
-    m_mirror[index] = static_cast<u16 *>(PS2_MemAllocAligned(16, kAtlasColorBytes, MEMTAG_LIGHTMAP));
+    m_alpha[index]  = static_cast<u8  *>(ps2::heap::AllocAligned(ps2::heap::MemAlign(16), kAtlasAlphaBytes, ps2::heap::MemTag::Lightmap));
+    m_mirror[index] = static_cast<u16 *>(ps2::heap::AllocAligned(ps2::heap::MemAlign(16), kAtlasColorBytes, ps2::heap::MemTag::Lightmap));
 
     // Clear to white so the gaps the packer leaves modulate to 1.0 rather than
     // to black - a surface whose UVs stray a texel outside its block then reads

@@ -14,8 +14,8 @@
 namespace ps2::img {
 
 // On success every loader hands back a pixel buffer allocated with
-// PS2_MemAllocAligned(16, ..., MEMTAG_TEXIMAGE) - DMA-ready - that the caller
-// owns and frees with PS2_MemFree (size = width * height * bytes per texel).
+// ps2::heap::AllocAligned(16, ...) - DMA-ready - that the caller
+// owns and frees with ps2::heap::Free (size = width * height * bytes per texel).
 // On failure they warn via Com_DPrintf and return false with nothing allocated.
 
 // PCX: 8-bit palette indices, 1 byte/texel. The palette embedded in the file is

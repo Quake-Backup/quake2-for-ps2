@@ -57,7 +57,7 @@ constexpr int kRenderWidth  = 640;
 constexpr int kRenderHeight = 448;
 
 // Per-frame packet headroom, in qwords. There are two of these (double buffered)
-// and they are the whole MEMTAG_RENDERER budget, so the size is worth getting
+// and they are the whole ps2::heap::MemTag::Renderer budget, so the size is worth getting
 // right rather than rounding up out of caution.
 //
 // Was 32K (512 KB each, 1 MB total), chosen against an estimate: a full console of

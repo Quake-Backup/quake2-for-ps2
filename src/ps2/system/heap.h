@@ -12,69 +12,71 @@
 #include <stddef.h>
 
 #ifdef __cplusplus
-extern "C" {
-#endif // __cplusplus
+namespace ps2::heap {
 
 // NOTE: Be sure to update s_memTagNames[] in heap.cpp when changing this enum!
-typedef enum
+enum class MemTag : size_t
 {
-    MEMTAG_ELF_SYS,    // Memory used by the system/kernel and the estimate size of the ELF executable.
-    MEMTAG_OPNEW,      // C++ operator new/new[].
-    MEMTAG_QUAKE,      // Game allocations: Z_Malloc/Z_TagMalloc/etc.
-    MEMTAG_RENDERER,   // Things related to rendering / the refresh module.
-    MEMTAG_TEXIMAGE,   // Allocs related to images/textures/palettes.
-    MEMTAG_MDL_ALIAS,  // MD2/Alias models.
-    MEMTAG_MDL_SPRITE, // Sprite models.
-    MEMTAG_MDL_WORLD,  // World geometry.
-    MEMTAG_LIGHTMAP,   // Lightmap atlas buffers (see renderer/lightmap.cpp).
-    MEMTAG_AUDIO,      // Decoded sound cache. Its own tag because it is one of the largest pools in the game.
-    MEMTAG_COUNT,      // Number of entries in this enum. Internal use only.
-} PS2MemTag;
+    ElfSys,    // Memory used by the system/kernel and the estimate size of the ELF executable.
+    OpNew,     // C++ operator new/new[].
+    Quake,     // Game allocations: Z_Malloc/Z_TagMalloc/etc.
+    Renderer,  // Things related to rendering / the refresh module.
+    TexImage,  // Allocs related to images/textures/palettes.
+    AliasMdl,  // MD2/Alias models.
+    SpriteMdl, // Sprite models.
+    WorldMdl,  // World geometry.
+    Lightmap,  // Lightmap atlas buffers (see renderer/lightmap.cpp).
+    Audio,     // Decoded sound cache. Its own tag because it is one of the largest pools in the game.
 
-void * PS2_MemAlloc(size_t sizeBytes, PS2MemTag tag);
-void * PS2_MemAllocAligned(size_t alignment, size_t sizeBytes, PS2MemTag tag);
-void PS2_MemFree(void * ptr, size_t sizeBytes, PS2MemTag tag);
-void PS2_TagsAddMem(PS2MemTag tag, size_t sizeBytes);
+    TagCount,  // Number of entries in this enum. Internal use only.
+};
+
+enum class MemAlign : size_t {};
+
+void * Alloc(size_t sizeBytes, MemTag tag);
+void * AllocAligned(MemAlign alignment, size_t sizeBytes, MemTag tag);
+void Free(void * ptr, size_t sizeBytes, MemTag tag);
 
 // Total EE RAM as reported by the kernel (32MB on a retail console).
-size_t PS2_GetTotalMemBytes();
+size_t GetTotalMemBytes();
 
 // EE RAM still available to the program right now: the gap between the current
 // program break and the ceiling the kernel set up for the heap.
-size_t PS2_GetAvailableMemBytes();
+size_t GetAvailableMemBytes();
 
 // Books the RAM that the game can never allocate - EE kernel, the loaded ELF
-// image (text/data/bss), the main thread stack - into MEMTAG_ELF_SYS. Call once,
+// image (text/data/bss), the main thread stack - into MemTag::ElfSys. Call once,
 // as early as possible in main().
-void PS2_TagsAddSystemMem();
+void TagsAddSystemMem();
+void TagsAddMem(MemTag tag, size_t sizeBytes);
 
 // Formats a byte count as "12.34 MB" (abbreviated) or "12.34 Megabytes" into the
 // caller's buffer, and returns it so the call can be nested in a printf argument
 // list. Takes the buffer rather than owning a static one so two calls in the same
 // format string don't overwrite each other.
-enum { PS2_MEMUNIT_STR_SIZE = 32 };
-const char * PS2_FormatMemoryUnit(size_t memorySizeInBytes, int abbreviated,
-                                  char * outBuffer, size_t outBufferSize);
+constexpr int kMemUnitStrSize = 32;
+const char * FormatMemoryUnit(size_t memorySizeInBytes, bool abbreviated,
+                              char * outBuffer, size_t outBufferSize);
 
-typedef struct
+struct MemStats
 {
     size_t totalBytes;
-    size_t peakBytes; // High-water mark of totalBytes. See PS2_GetPeakMemBytes.
+    size_t peakBytes; // High-water mark of totalBytes. See GetPeakMemBytes.
     size_t totalAllocs;
     size_t totalFrees;
     size_t smallestAlloc;
     size_t largestAlloc;
-} PS2MemStats;
+};
 
-const PS2MemStats * PS2_GetStatsForMemTag(PS2MemTag tag);
-const char * PS2_GetNameForMemTag(PS2MemTag tag);
+const MemStats & GetStatsForMemTag(MemTag tag);
+const char * GetNameForMemTag(MemTag tag);
 
 // A read-only snapshot of the allocator's own view of the heap, which the memtag
 // table cannot give: the tags say how many bytes each subsystem holds, this says
 // how those bytes are arranged. Cheap (a walk of dlmalloc's bins) and, unlike the
 // probe on the out-of-memory path, it allocates nothing - so it is safe to call
 // from instrumentation without changing what it is measuring.
-typedef struct
+struct HeapStats
 {
     size_t arenaBytes;    // everything dlmalloc has taken from the system, ever
     size_t inUseBytes;    // handed out to callers
@@ -84,22 +86,36 @@ typedef struct
     size_t freeChunks;    // free chunk count, the top chunk included
     size_t fastbinChunks; // of which are fastbins: small, and deliberately left
                           // uncoalesced until the next large request needs them
-} PS2HeapStats;
+};
 
-void PS2_GetHeapStats(PS2HeapStats * outStats);
+HeapStats GetHeapStats();
 
 // High-water mark of the sum of every tag - the largest the game was ever holding
 // at one time. Not the same as adding up the per-tag peaks: those happen at
 // different moments. This is the number that says whether a map change fits, since
 // the transient (old map still resident while the new one loads) never shows up in
 // a steady-state reading.
-size_t PS2_GetPeakMemBytes();
+size_t GetPeakMemBytes();
 
 // Renders the whole memory-tag table into the caller's buffer and returns it.
-// Truncates rather than overrunning if the buffer is short; PS2_MEMTAGS_DUMP_SIZE
+// Truncates rather than overrunning if the buffer is short; kMemTagsDumpSize
 // is big enough for the full table.
-enum { PS2_MEMTAGS_DUMP_SIZE = 2048 };
-const char * PS2_DumpMemTags(char * outBuffer, size_t outBufferSize);
+constexpr int kMemTagsDumpSize = 2048;
+const char * DumpMemTags(char * outBuffer, size_t outBufferSize);
+
+} // namespace ps2::heap
+#endif // __cplusplus
+
+// ps2::heap C wrappers called by the Quake 2 code.
+#ifdef __cplusplus
+extern "C" {
+#endif // __cplusplus
+
+void * PS2Quake_ZMalloc(size_t sizeBytes);
+void PS2Quake_ZFree(void * ptr, size_t sizeBytes);
+
+void * PS2Quake_AudioMalloc(size_t sizeBytes);
+void PS2Quake_AudioFree(void * ptr, size_t sizeBytes);
 
 #ifdef __cplusplus
 } // extern "C"

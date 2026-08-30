@@ -49,7 +49,7 @@ bool NextScrap()
     const int index = s_scrapCount++;
     Scrap &   scrap = s_scraps[index];
 
-    scrap.pixels = static_cast<u8 *>(PS2_MemAllocAligned(16, kScrapBytes, MEMTAG_TEXIMAGE));
+    scrap.pixels = static_cast<u8 *>(ps2::heap::AllocAligned(ps2::heap::MemAlign(16), kScrapBytes, ps2::heap::MemTag::TexImage));
     std::memset(scrap.pixels, kTransparentIndex, kScrapBytes);
     scrap.packer.Reset();
 

@@ -7,16 +7,15 @@
  * This source code is released under the GNU GPL v2 license.
  * ================================================================================================ */
 
-#include "ps2/common.h" // Sys_Error, etc
 #include "ps2/system/heap.h"
+#include "ps2/common.h"            // Sys_Error, etc
 #include "ps2/debug/stack_trace.h" // PrintStackTrace
 
 #include <new>
-#include <cstdio>  // snprintf
-#include <cstring> // memset
-#include <cstdint> // uintptr_t
+#include <cstdio>   // snprintf
+#include <cstring>  // memset
+#include <cstdint>  // uintptr_t
 #include <unistd.h> // sbrk
-
 #include <kernel.h> // EndOfHeap, GetMemorySize
 
 // dlmalloc
@@ -34,45 +33,47 @@ extern "C" {
 #pragma GCC diagnostic pop
 
 // ------------------------------------------------------------------------------------------------
-// operator new / delete -> dlmalloc global heap
+// operator new / delete -> dlmalloc global heap redirect
 //
 // Built with -fno-exceptions, so we cannot throw std::bad_alloc; a failed
 // allocation is a fatal Sys_Error instead. delete is always noexcept.
 // ------------------------------------------------------------------------------------------------
 
-void * operator new(std::size_t n)   { return PS2_MemAlloc(n, MEMTAG_OPNEW); }
-void * operator new[](std::size_t n) { return PS2_MemAlloc(n, MEMTAG_OPNEW); }
+void * operator new(std::size_t n)   { return ps2::heap::Alloc(n, ps2::heap::MemTag::OpNew); }
+void * operator new[](std::size_t n) { return ps2::heap::Alloc(n, ps2::heap::MemTag::OpNew); }
 
-void * operator new(std::size_t n, const std::nothrow_t &)   noexcept { return PS2_MemAlloc(n, MEMTAG_OPNEW); }
-void * operator new[](std::size_t n, const std::nothrow_t &) noexcept { return PS2_MemAlloc(n, MEMTAG_OPNEW); }
+void * operator new(std::size_t n, const std::nothrow_t &)   noexcept { return ps2::heap::Alloc(n, ps2::heap::MemTag::OpNew); }
+void * operator new[](std::size_t n, const std::nothrow_t &) noexcept { return ps2::heap::Alloc(n, ps2::heap::MemTag::OpNew); }
 
-void * operator new(std::size_t n, std::align_val_t al)   { return PS2_MemAllocAligned(static_cast<std::size_t>(al), n, MEMTAG_OPNEW); }
-void * operator new[](std::size_t n, std::align_val_t al) { return PS2_MemAllocAligned(static_cast<std::size_t>(al), n, MEMTAG_OPNEW); }
+void * operator new(std::size_t n, std::align_val_t al)   { return ps2::heap::AllocAligned(ps2::heap::MemAlign(al), n, ps2::heap::MemTag::OpNew); }
+void * operator new[](std::size_t n, std::align_val_t al) { return ps2::heap::AllocAligned(ps2::heap::MemAlign(al), n, ps2::heap::MemTag::OpNew); }
 
-void operator delete(void * p)   noexcept { PS2_MemFree(p, dlmalloc_usable_size(p), MEMTAG_OPNEW); }
-void operator delete[](void * p) noexcept { PS2_MemFree(p, dlmalloc_usable_size(p), MEMTAG_OPNEW); }
+void operator delete(void * p)   noexcept { ps2::heap::Free(p, dlmalloc_usable_size(p), ps2::heap::MemTag::OpNew); }
+void operator delete[](void * p) noexcept { ps2::heap::Free(p, dlmalloc_usable_size(p), ps2::heap::MemTag::OpNew); }
 
-void operator delete(void * p, std::size_t n)   noexcept { PS2_MemFree(p, n, MEMTAG_OPNEW); }
-void operator delete[](void * p, std::size_t n) noexcept { PS2_MemFree(p, n, MEMTAG_OPNEW); }
+void operator delete(void * p, std::size_t n)   noexcept { ps2::heap::Free(p, n, ps2::heap::MemTag::OpNew); }
+void operator delete[](void * p, std::size_t n) noexcept { ps2::heap::Free(p, n, ps2::heap::MemTag::OpNew); }
 
-void operator delete(void * p, const std::nothrow_t &)   noexcept { PS2_MemFree(p, dlmalloc_usable_size(p), MEMTAG_OPNEW); }
-void operator delete[](void * p, const std::nothrow_t &) noexcept { PS2_MemFree(p, dlmalloc_usable_size(p), MEMTAG_OPNEW); }
+void operator delete(void * p, const std::nothrow_t &)   noexcept { ps2::heap::Free(p, dlmalloc_usable_size(p), ps2::heap::MemTag::OpNew); }
+void operator delete[](void * p, const std::nothrow_t &) noexcept { ps2::heap::Free(p, dlmalloc_usable_size(p), ps2::heap::MemTag::OpNew); }
 
-void operator delete(void * p, std::align_val_t)   noexcept { PS2_MemFree(p, dlmalloc_usable_size(p), MEMTAG_OPNEW); }
-void operator delete[](void * p, std::align_val_t) noexcept { PS2_MemFree(p, dlmalloc_usable_size(p), MEMTAG_OPNEW); }
+void operator delete(void * p, std::align_val_t)   noexcept { ps2::heap::Free(p, dlmalloc_usable_size(p), ps2::heap::MemTag::OpNew); }
+void operator delete[](void * p, std::align_val_t) noexcept { ps2::heap::Free(p, dlmalloc_usable_size(p), ps2::heap::MemTag::OpNew); }
 
-void operator delete(void * p, std::size_t n, std::align_val_t)   noexcept { PS2_MemFree(p, n, MEMTAG_OPNEW); }
-void operator delete[](void * p, std::size_t n, std::align_val_t) noexcept { PS2_MemFree(p, n, MEMTAG_OPNEW); }
+void operator delete(void * p, std::size_t n, std::align_val_t)   noexcept { ps2::heap::Free(p, n, ps2::heap::MemTag::OpNew); }
+void operator delete[](void * p, std::size_t n, std::align_val_t) noexcept { ps2::heap::Free(p, n, ps2::heap::MemTag::OpNew); }
+
+namespace ps2::heap {
 
 // ------------------------------------------------------------------------------------------------
-// Tagged allocation + memory accounting.
-// C linkage (declared extern "C" in heap.h) so common.c can call these.
+// Tagged allocation + memory accounting
 // ------------------------------------------------------------------------------------------------
 
-static PS2MemStats s_memTagCounts[MEMTAG_COUNT] = {};
+static constexpr auto kMemTagCount = static_cast<size_t>(MemTag::TagCount);
+static MemStats s_memTagCounts[kMemTagCount] = {};
 
-// NOTE: These should match the PS2MemTag declaration order!
-static const char * const s_memTagNames[MEMTAG_COUNT] = {
+// NOTE: These should match the MemTag enum declaration order!
+static const char * const s_memTagNames[kMemTagCount] = {
     "ELF_Sys",
     "OpNew",
     "Quake",
@@ -85,10 +86,10 @@ static const char * const s_memTagNames[MEMTAG_COUNT] = {
     "Audio",
 };
 
-static inline size_t MemTagToIndex(PS2MemTag tag)
+static inline size_t MemTagToIndex(const MemTag tag)
 {
-    const int t = static_cast<int>(tag);
-    return (t >= 0 && t < MEMTAG_COUNT) ? static_cast<size_t>(t) : static_cast<size_t>(MEMTAG_ELF_SYS);
+    const auto t = static_cast<size_t>(tag);
+    return t < kMemTagCount ? t : static_cast<size_t>(MemTag::ElfSys);
 }
 
 // Running sum of every tag's totalBytes, and the largest it has ever been. Kept
@@ -98,22 +99,22 @@ static inline size_t MemTagToIndex(PS2MemTag tag)
 static size_t s_liveTotalBytes = 0;
 static size_t s_peakTotalBytes = 0;
 
-static inline void AccountAlloc(PS2MemTag tag, size_t bytes)
+static inline void AccountAlloc(const MemTag tag, const size_t bytes)
 {
-    PS2MemStats * c = &s_memTagCounts[MemTagToIndex(tag)];
-    c->totalBytes  += bytes;
-    c->totalAllocs += 1u;
+    MemStats & s = s_memTagCounts[MemTagToIndex(tag)];
+    s.totalBytes  += bytes;
+    s.totalAllocs += 1u;
 
-    if (c->smallestAlloc == 0u || bytes < c->smallestAlloc) { c->smallestAlloc = bytes; }
-    if (bytes > c->largestAlloc) { c->largestAlloc = bytes; }
-    if (c->totalBytes > c->peakBytes) { c->peakBytes = c->totalBytes; }
+    if (s.smallestAlloc == 0u || bytes < s.smallestAlloc) { s.smallestAlloc = bytes; }
+    if (bytes > s.largestAlloc) { s.largestAlloc = bytes; }
+    if (s.totalBytes > s.peakBytes) { s.peakBytes = s.totalBytes; }
 
     s_liveTotalBytes += bytes;
     if (s_liveTotalBytes > s_peakTotalBytes) { s_peakTotalBytes = s_liveTotalBytes; }
 }
 
 // ------------------------------------------------------------------------------------------------
-// Allocator dump
+// Heap dump
 // ------------------------------------------------------------------------------------------------
 
 // The largest block dlmalloc would actually hand out right now, found by probing
@@ -154,8 +155,7 @@ static size_t LargestAllocatableBlock(const size_t upperBound)
 __attribute__((cold, noinline))
 static void PrintDlmallocStats(const size_t failedRequest)
 {
-    PS2HeapStats hs{};
-    PS2_GetHeapStats(&hs);
+    const HeapStats hs = GetHeapStats();
 
     const size_t arena    = hs.arenaBytes;
     const size_t inUse    = hs.inUseBytes;
@@ -164,38 +164,38 @@ static void PrintDlmallocStats(const size_t failedRequest)
     const size_t keepCost = hs.topChunkBytes;
     const size_t largest  = LargestAllocatableBlock(failedRequest);
 
-    char a[PS2_MEMUNIT_STR_SIZE], b[PS2_MEMUNIT_STR_SIZE], c[PS2_MEMUNIT_STR_SIZE];
+    char a[kMemUnitStrSize], b[kMemUnitStrSize], c[kMemUnitStrSize];
 
     std::printf("-------------------------- DLMALLOC ---------------------------\n");
-    std::printf("Arena (sbrk'd)   : %s\n", PS2_FormatMemoryUnit(arena, true, a, sizeof(a)));
-    std::printf("In use           : %s\n", PS2_FormatMemoryUnit(inUse, true, a, sizeof(a)));
+    std::printf("Arena (sbrk'd)   : %s\n", FormatMemoryUnit(arena, true, a, sizeof(a)));
+    std::printf("In use           : %s\n", FormatMemoryUnit(inUse, true, a, sizeof(a)));
     std::printf("Free total       : %s  in %zu chunks (avg %s)\n",
-                PS2_FormatMemoryUnit(freeTot, true, a, sizeof(a)), freeChks,
-                PS2_FormatMemoryUnit((freeChks != 0u) ? (freeTot / freeChks) : 0u, true, b, sizeof(b)));
-    std::printf("Top releasable   : %s\n", PS2_FormatMemoryUnit(keepCost, true, a, sizeof(a)));
+                FormatMemoryUnit(freeTot, true, a, sizeof(a)), freeChks,
+                FormatMemoryUnit((freeChks != 0u) ? (freeTot / freeChks) : 0u, true, b, sizeof(b)));
+    std::printf("Top releasable   : %s\n", FormatMemoryUnit(keepCost, true, a, sizeof(a)));
     std::printf("Largest free blk : %s   (the failed request wanted %s)\n",
-                PS2_FormatMemoryUnit(largest, true, a, sizeof(a)),
-                PS2_FormatMemoryUnit(failedRequest, true, b, sizeof(b)));
+                FormatMemoryUnit(largest, true, a, sizeof(a)),
+                FormatMemoryUnit(failedRequest, true, b, sizeof(b)));
 
     // The verdict, spelled out, so the log answers the question without arithmetic.
     if (freeTot >= failedRequest)
     {
         std::printf("VERDICT: FRAGMENTATION. %s free in total, but the largest single run is\n"
                     "         only %s. The bytes exist; they are not adjacent.\n",
-                    PS2_FormatMemoryUnit(freeTot, true, a, sizeof(a)),
-                    PS2_FormatMemoryUnit(largest, true, c, sizeof(c)));
+                    FormatMemoryUnit(freeTot, true, a, sizeof(a)),
+                    FormatMemoryUnit(largest, true, c, sizeof(c)));
     }
     else
     {
         std::printf("VERDICT: EXHAUSTION. Only %s free in total, less than the request.\n",
-                    PS2_FormatMemoryUnit(freeTot, true, a, sizeof(a)));
+                    FormatMemoryUnit(freeTot, true, a, sizeof(a)));
     }
     std::printf("-------------------------- DLMALLOC ---------------------------\n");
     std::fflush(stdout);
 }
 
 __attribute__((cold, noinline))
-static void OutOfMemory(const size_t requestSize, const PS2MemTag tag, const char * const funcName)
+static void OutOfMemory(const size_t requestSize, const MemTag tag, const char * const funcName)
 {
     // The call stack goes to stdout, not to Sys_Error: the panic screen it
     // paints has 24 lines to spend on the message and the memtag table, and
@@ -206,66 +206,59 @@ static void OutOfMemory(const size_t requestSize, const PS2MemTag tag, const cha
     PrintDlmallocStats(requestSize);
     ps2::debug::PrintStackTrace();
 
-    char dump[PS2_MEMTAGS_DUMP_SIZE];
+    char dump[kMemTagsDumpSize];
     Sys_Error("%s: failed to allocate %zu bytes (%s)\n%s",
               funcName, requestSize, s_memTagNames[MemTagToIndex(tag)],
-              PS2_DumpMemTags(dump, sizeof(dump)));
+              DumpMemTags(dump, sizeof(dump)));
 }
 
 // ------------------------------------------------------------------------------------------------
 // Public API
 // ------------------------------------------------------------------------------------------------
 
-extern "C" {
-
-void * PS2_MemAlloc(size_t sizeBytes, PS2MemTag tag)
+void * Alloc(const size_t sizeBytes, const MemTag tag)
 {
     const size_t n = (sizeBytes != 0u ? sizeBytes : 1u);
     void * p = dlmalloc(n);
 
     if (p == nullptr) [[unlikely]]
     {
-        OutOfMemory(sizeBytes, tag, "PS2_MemAlloc");
+        OutOfMemory(sizeBytes, tag, "ps2::heap::Alloc");
     }
 
     AccountAlloc(tag, n);
     return p;
 }
 
-void * PS2_MemAllocAligned(size_t alignment, size_t sizeBytes, PS2MemTag tag)
+void * AllocAligned(const MemAlign alignment, const size_t sizeBytes, const MemTag tag)
 {
     const size_t n = (sizeBytes != 0u ? sizeBytes : 1u);
-    void * p = dlmemalign(alignment, n);
+    void * p = dlmemalign(static_cast<size_t>(alignment), n);
 
     if (p == nullptr) [[unlikely]]
     {
-        OutOfMemory(sizeBytes, tag, "PS2_MemAllocAligned");
+        OutOfMemory(sizeBytes, tag, "ps2::heap::AllocAligned");
     }
 
     AccountAlloc(tag, n);
     return p;
 }
 
-void PS2_MemFree(void * ptr, size_t sizeBytes, PS2MemTag tag)
+void Free(void * ptr, const size_t sizeBytes, const MemTag tag)
 {
     if (ptr == nullptr) { return; }
-    PS2MemStats * c = &s_memTagCounts[MemTagToIndex(tag)];
-    c->totalFrees += 1u;
+    MemStats & s = s_memTagCounts[MemTagToIndex(tag)];
+    s.totalFrees += 1u;
     if (sizeBytes != 0u)
     {
-        const size_t taken = (c->totalBytes >= sizeBytes) ? sizeBytes : c->totalBytes;
-        c->totalBytes     -= taken;
+        const size_t taken = (s.totalBytes >= sizeBytes) ? sizeBytes : s.totalBytes;
+        s.totalBytes      -= taken;
         s_liveTotalBytes  -= (s_liveTotalBytes >= taken) ? taken : s_liveTotalBytes;
     }
     dlfree(ptr);
 }
 
-void PS2_TagsAddMem(PS2MemTag tag, size_t sizeBytes)
-{
-    AccountAlloc(tag, sizeBytes);
-}
-
-size_t PS2_GetTotalMemBytes()
+size_t GetTotalMemBytes()
 {
     // GetMemorySize() is an EE kernel syscall returning the installed RAM in
     // bytes. Retail consoles answer 32MB; fall back to that if it ever fails.
@@ -273,7 +266,7 @@ size_t PS2_GetTotalMemBytes()
     return (memSize > 0) ? static_cast<size_t>(memSize) : (32u * 1024u * 1024u);
 }
 
-size_t PS2_GetAvailableMemBytes()
+size_t GetAvailableMemBytes()
 {
     // sbrk(0) hands back the current program break without moving it. crt0 hands
     // the kernel [_end, all remaining RAM) via SetupHeap, so the break starts at
@@ -292,10 +285,10 @@ size_t PS2_GetAvailableMemBytes()
     return static_cast<size_t>(top - brk);
 }
 
-void PS2_TagsAddSystemMem()
+void TagsAddSystemMem()
 {
-    const size_t totalBytes = PS2_GetTotalMemBytes();
-    const size_t availBytes = PS2_GetAvailableMemBytes();
+    const size_t totalBytes = GetTotalMemBytes();
+    const size_t availBytes = GetAvailableMemBytes();
 
     // Everything the game will never get to allocate: the first megabyte of RAM
     // reserved for the EE kernel, our ELF image (text/data/bss), and the stack
@@ -308,12 +301,17 @@ void PS2_TagsAddSystemMem()
                              static_cast<double>(availBytes) / 1024.0 / 1024.0,
                              static_cast<double>(totalUsedBytes) / 1024.0 / 1024.0));
 
-        PS2_TagsAddMem(MEMTAG_ELF_SYS, totalUsedBytes);
+        TagsAddMem(MemTag::ElfSys, totalUsedBytes);
     }
 }
 
-const char * PS2_FormatMemoryUnit(size_t memorySizeInBytes, int abbreviated,
-                                  char * outBuffer, size_t outBufferSize)
+void TagsAddMem(const MemTag tag, const size_t sizeBytes)
+{
+    AccountAlloc(tag, sizeBytes);
+}
+
+const char * FormatMemoryUnit(const size_t memorySizeInBytes, const bool abbreviated,
+                              char * const outBuffer, const size_t outBufferSize)
 {
     const char * unit;
     double value;
@@ -348,25 +346,23 @@ const char * PS2_FormatMemoryUnit(size_t memorySizeInBytes, int abbreviated,
     return outBuffer;
 }
 
-const PS2MemStats * PS2_GetStatsForMemTag(PS2MemTag tag)
+const MemStats & GetStatsForMemTag(const MemTag tag)
 {
-    return &s_memTagCounts[MemTagToIndex(tag)];
+    return s_memTagCounts[MemTagToIndex(tag)];
 }
 
-const char * PS2_GetNameForMemTag(PS2MemTag tag)
+const char * GetNameForMemTag(const MemTag tag)
 {
     return s_memTagNames[MemTagToIndex(tag)];
 }
 
-size_t PS2_GetPeakMemBytes()
+size_t GetPeakMemBytes()
 {
     return s_peakTotalBytes;
 }
 
-void PS2_GetHeapStats(PS2HeapStats * const outStats)
+HeapStats GetHeapStats()
 {
-    if (outStats == nullptr) { return; }
-
     // dlmallinfo only consolidates when the heap is still uninitialised (top == 0);
     // after the first allocation it is a pure walk of the bins, so calling this
     // does not disturb the arrangement it is reporting.
@@ -377,19 +373,21 @@ void PS2_GetHeapStats(PS2HeapStats * const outStats)
     // rather than report something absurd if it ever does.
     const auto Clamp = [](int v) -> size_t { return (v < 0) ? 0u : static_cast<size_t>(v); };
 
-    outStats->arenaBytes    = Clamp(mi.arena);
-    outStats->inUseBytes    = Clamp(mi.uordblks);
-    outStats->freeBytes     = Clamp(mi.fordblks);
-    outStats->topChunkBytes = Clamp(mi.keepcost);
-    outStats->fastbinBytes  = Clamp(mi.fsmblks);
-    outStats->freeChunks    = Clamp(mi.ordblks);
-    outStats->fastbinChunks = Clamp(mi.smblks);
+    HeapStats outStats;
+    outStats.arenaBytes    = Clamp(mi.arena);
+    outStats.inUseBytes    = Clamp(mi.uordblks);
+    outStats.freeBytes     = Clamp(mi.fordblks);
+    outStats.topChunkBytes = Clamp(mi.keepcost);
+    outStats.fastbinBytes  = Clamp(mi.fsmblks);
+    outStats.freeChunks    = Clamp(mi.ordblks);
+    outStats.fastbinChunks = Clamp(mi.smblks);
+    return outStats;
 }
 
-const char * PS2_DumpMemTags(char * outBuffer, size_t outBufferSize)
+const char * DumpMemTags(char * const outBuffer, size_t const outBufferSize)
 {
-    char unitStr[PS2_MEMUNIT_STR_SIZE];
-    char peakStr[PS2_MEMUNIT_STR_SIZE];
+    char unitStr[kMemUnitStrSize];
+    char peakStr[kMemUnitStrSize];
     char * const end = outBuffer + outBufferSize;
     size_t memTotal = 0;
 
@@ -413,14 +411,14 @@ const char * PS2_DumpMemTags(char * outBuffer, size_t outBufferSize)
     append("%s", "--------------------------- MEMTAGS ---------------------------\n");
     append("%s", "Tag      Total     Peak      Allocs  Frees   Small    Large\n");
 
-    for (int i = 0; i < MEMTAG_COUNT; ++i)
+    for (int i = 0; i < static_cast<int>(MemTag::TagCount); ++i)
     {
         memTotal += s_memTagCounts[i].totalBytes;
 
         append("%-8s %-9s %-9s %-7zu %-7zu %-8zu %-8zu\n",
                s_memTagNames[i],
-               PS2_FormatMemoryUnit(s_memTagCounts[i].totalBytes, true, unitStr, sizeof(unitStr)),
-               PS2_FormatMemoryUnit(s_memTagCounts[i].peakBytes,  true, peakStr, sizeof(peakStr)),
+               FormatMemoryUnit(s_memTagCounts[i].totalBytes, true, unitStr, sizeof(unitStr)),
+               FormatMemoryUnit(s_memTagCounts[i].peakBytes,  true, peakStr, sizeof(peakStr)),
                s_memTagCounts[i].totalAllocs,
                s_memTagCounts[i].totalFrees,
                s_memTagCounts[i].smallestAlloc,
@@ -429,13 +427,41 @@ const char * PS2_DumpMemTags(char * outBuffer, size_t outBufferSize)
 
     // PEAK MEM is the high-water of the sum, not the sum of the per-tag peaks:
     // those happen at different moments, so adding them up would over-report.
-    append("\nTOTAL MEM: %s", PS2_FormatMemoryUnit(memTotal, true, unitStr, sizeof(unitStr)));
-    append("   PEAK MEM: %s\n", PS2_FormatMemoryUnit(s_peakTotalBytes, true, peakStr, sizeof(peakStr)));
-    append("FREE MEM (sbrk): %s\n", PS2_FormatMemoryUnit(PS2_GetAvailableMemBytes(), true, unitStr, sizeof(unitStr)));
+    append("\nTOTAL MEM: %s", FormatMemoryUnit(memTotal, true, unitStr, sizeof(unitStr)));
+    append("   PEAK MEM: %s\n", FormatMemoryUnit(s_peakTotalBytes, true, peakStr, sizeof(peakStr)));
+    append("FREE MEM (sbrk): %s\n", FormatMemoryUnit(GetAvailableMemBytes(), true, unitStr, sizeof(unitStr)));
     append("%s", "--------------------------- MEMTAGS ---------------------------");
 
     outBuffer[outBufferSize - 1u] = '\0';
     return outBuffer;
+}
+
+} // namespace ps2::heap
+
+// ------------------------------------------------------------------------------------------------
+// ps2::heap C wrappers called by the Quake 2 code
+// ------------------------------------------------------------------------------------------------
+
+extern "C" {
+
+void * PS2Quake_ZMalloc(size_t sizeBytes)
+{
+    return ps2::heap::Alloc(sizeBytes, ps2::heap::MemTag::Quake);
+}
+
+void PS2Quake_ZFree(void * ptr, size_t sizeBytes)
+{
+    ps2::heap::Free(ptr, sizeBytes, ps2::heap::MemTag::Quake);
+}
+
+void * PS2Quake_AudioMalloc(size_t sizeBytes)
+{
+    return ps2::heap::Alloc(sizeBytes, ps2::heap::MemTag::Audio);
+}
+
+void PS2Quake_AudioFree(void * ptr, size_t sizeBytes)
+{
+    ps2::heap::Free(ptr, sizeBytes, ps2::heap::MemTag::Audio);
 }
 
 } // extern "C"

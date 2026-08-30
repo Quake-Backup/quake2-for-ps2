@@ -1140,7 +1140,7 @@ void Z_Free(void * ptr)
     z_count--;
     z_bytes -= z->size;
 
-    PS2_MemFree(z, z->size, MEMTAG_QUAKE);
+    PS2Quake_ZFree(z, z->size);
 }
 
 /*
@@ -1172,7 +1172,7 @@ void * Z_TagMalloc(int size, int tag)
     zhead_t * z;
 
     size = size + sizeof(zhead_t);
-    z = PS2_MemAlloc(size, MEMTAG_QUAKE);
+    z = PS2Quake_ZMalloc(size);
 
     if (z == NULL)
     {

@@ -21,9 +21,9 @@ int main()
 #endif // PS2_QUAKE_DEBUG
 
     // Book the RAM we never get to allocate (EE kernel, ELF image, stack) against
-    // MEMTAG_ELF_SYS. Must happen before anything touches the heap, so that what the
+    // ps2::heap::MemTag::ElfSys. Must happen before anything touches the heap, so that what the
     // tags add up to stays a faithful picture of the console's 32MB.
-    PS2_TagsAddSystemMem();
+    ps2::heap::TagsAddSystemMem();
 
     // Qcommon_Init wants an argv[]; synthesise a minimal one.
     static char s_arg0[] = "quake2.elf";

@@ -29,15 +29,15 @@ namespace {
 // Extra debug printing for cache hits / evictions.
 constexpr bool kVerboseModelCache = false;
 
-PS2MemTag MemTagForType(ModelType type)
+ps2::heap::MemTag MemTagForType(const ModelType type)
 {
     switch (type)
     {
-    case ModelType::Brush    : return MEMTAG_MDL_WORLD;
-    case ModelType::Sprite   : return MEMTAG_MDL_SPRITE;
-    case ModelType::AliasMD2 : return MEMTAG_MDL_ALIAS;
+    case ModelType::Brush    : return ps2::heap::MemTag::WorldMdl;
+    case ModelType::Sprite   : return ps2::heap::MemTag::SpriteMdl;
+    case ModelType::AliasMD2 : return ps2::heap::MemTag::AliasMdl;
     }
-    return MEMTAG_MDL_WORLD; // Unreachable; keeps GCC's -Wreturn-type happy.
+    return ps2::heap::MemTag::WorldMdl; // Unreachable; keeps GCC's -Wreturn-type happy.
 }
 
 // Owns the model pool and the name lookup. Internal singleton (s_cache);
@@ -378,7 +378,7 @@ void ModelCache::Unload(u16 slot)
     }
     else if (mdl.hunkBase != nullptr)
     {
-        PS2_MemFree(mdl.hunkBase, mdl.hunkSize, MemTagForType(mdl.type));
+        ps2::heap::Free(mdl.hunkBase, mdl.hunkSize, MemTagForType(mdl.type));
     }
 
     m_modelPool.Free(slot); // Zeroes the slot.

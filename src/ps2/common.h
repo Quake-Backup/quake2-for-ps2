@@ -13,7 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 
-// PS2_MemAlloc / MemTags (shared with common.c's Z_Malloc)
+// ps2::heap / MemTags (shared with common.c's Z_Malloc)
 #include "ps2/system/heap.h"
 
 // The C engine/game/client API plus the kept C "coupling" headers, given C

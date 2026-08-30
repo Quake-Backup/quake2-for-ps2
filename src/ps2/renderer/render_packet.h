@@ -57,7 +57,7 @@ public:
         // Same shape packet_init produced: 64-byte (cache line) aligned, zeroed.
         const size_t sizeBytes = static_cast<size_t>(maxQwords + kGuardQwords) * sizeof(qword_t);
 
-        m_base = static_cast<qword_t *>(PS2_MemAllocAligned(64, sizeBytes, MEMTAG_RENDERER));
+        m_base = static_cast<qword_t *>(ps2::heap::AllocAligned(ps2::heap::MemAlign(64), sizeBytes, ps2::heap::MemTag::Renderer));
         std::memset(m_base, 0, sizeBytes);
 
         m_maxQwords = maxQwords;

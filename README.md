@@ -159,7 +159,7 @@ Fatal allocation failures print the call stack to stdout before halting (see
 is stripped, what comes out is raw addresses:
 
 ```
-PS2_MemAlloc: failed to allocate 262144 bytes (Audio)
+ps2::heap::Alloc: failed to allocate 262144 bytes (Audio)
 ------------------------- STACK TRACE -------------------------
 #0  0x00195020
 #1  0x001331bc
@@ -174,7 +174,7 @@ next to the stripped one:
 $ build/tools/symbolize < emulog.txt
 ELF: build/debug/quake2_unstripped.elf
 
-#0  0x00195020  PS2_MemAlloc                       src/ps2/system/heap.cpp:116
+#0  0x00195020  ps2::heap::Alloc                   src/ps2/system/heap.cpp:116
 #1  0x001331bc  S_LoadSound                        src/client/snd_mem.c:184
 #2  0x00130f10  S_RegisterSound                    src/client/snd_dma.c:308
 ```
@@ -463,9 +463,9 @@ required order.
 
 Memory is a single program-wide `dlmalloc` heap ([heap.h](src/ps2/system/heap.h)) with
 `operator new`/`delete` and the engine's `Z_Malloc` routed through a tag-accounting layer
-(`MEMTAG_QUAKE`, `MEMTAG_RENDERER`, `MEMTAG_TEXIMAGE`, `MEMTAG_MDL_*`, `MEMTAG_LIGHTMAP`, …).
+(`ps2::heap::MemTag::Quake`, `ps2::heap::MemTag::Renderer`, `ps2::heap::MemTag::TexImage`, `ps2::heap::MemTag::*Mdl`, `ps2::heap::MemTag::Lightmap`, …).
 The RAM the game can never allocate — EE kernel, ELF image, stack — is booked against
-`MEMTAG_ELF_SYS` at startup so the tags add up to a faithful picture of the console's 32 MB.
+`ps2::heap::MemTag::ElfSys` at startup so the tags add up to a faithful picture of the console's 32 MB.
 Built with `-fno-exceptions`, so a failed allocation is a fatal `Sys_Error`, not a throw.
 
 Networking is loopback only ([net/net.cpp](src/ps2/net/net.cpp)) — enough for a local

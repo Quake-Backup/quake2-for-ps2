@@ -189,7 +189,7 @@ u8 * DownsampleIndexed2x(u8 * pic8, int * width, int * height)
     const int dstH = srcH / 2;
 
     u8 * const scaled = static_cast<u8 *>(
-        PS2_MemAllocAligned(16, static_cast<size_t>(dstW * dstH), MEMTAG_TEXIMAGE));
+        ps2::heap::AllocAligned(ps2::heap::MemAlign(16), static_cast<size_t>(dstW * dstH), ps2::heap::MemTag::TexImage));
 
     for (int y = 0; y < dstH; ++y)
     {
@@ -201,7 +201,7 @@ u8 * DownsampleIndexed2x(u8 * pic8, int * width, int * height)
         }
     }
 
-    PS2_MemFree(pic8, static_cast<size_t>(srcW * srcH), MEMTAG_TEXIMAGE);
+    ps2::heap::Free(pic8, static_cast<size_t>(srcW * srcH), ps2::heap::MemTag::TexImage);
 
     *width  = dstW;
     *height = dstH;
@@ -467,7 +467,7 @@ const Texture * TextureCache::LoadFromFile(const char * fullname, const ImageTyp
                 // Register still wants a non-null 'pixels', and every assert
                 // that checks it should keep passing, so point it at the atlas -
                 // Unload knows not to free it.
-                PS2_MemFree(pic8, static_cast<size_t>(width * height), MEMTAG_TEXIMAGE);
+                ps2::heap::Free(pic8, static_cast<size_t>(width * height), ps2::heap::MemTag::TexImage);
 
                 Texture & packed = Register(fullname, atlas->pixels, width, height,
                                             format, components, type, TexFlags::None);
@@ -527,7 +527,7 @@ void TextureCache::Unload(u16 slot)
     if (texture.atlas == nullptr)
     {
         const int pixelBytes = texture.width * texture.height * BytesPerTexel(texture.format);
-        PS2_MemFree(const_cast<void *>(texture.pixels), static_cast<size_t>(pixelBytes), MEMTAG_TEXIMAGE);
+        ps2::heap::Free(const_cast<void *>(texture.pixels), static_cast<size_t>(pixelBytes), ps2::heap::MemTag::TexImage);
     }
 
     m_texturePool.Free(slot); // resets the slot; its type reads Null again

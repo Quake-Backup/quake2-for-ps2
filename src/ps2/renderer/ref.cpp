@@ -154,8 +154,8 @@ void DrawMemUsageOverlay()
         return;
     }
 
-    constexpr int kLineHeight = kGlyphSize + 2;   // Matches DrawInternalString spacing.
-    constexpr int kNumLines   = MEMTAG_COUNT + 4; // Header + one per tag + total + peak + sbrk left.
+    constexpr int kLineHeight = kGlyphSize + 2; // Matches DrawInternalString spacing.
+    constexpr int kNumLines   = static_cast<int>(ps2::heap::MemTag::TagCount) + 4; // Header + one per tag + total + peak + sbrk left.
     constexpr int kPanelWidth = 176;
     constexpr int kPadding    = 4;
 
@@ -173,24 +173,24 @@ void DrawMemUsageOverlay()
     textY += kLineHeight;
 
     char line[64];
-    char unit[PS2_MEMUNIT_STR_SIZE];
+    char unit[ps2::heap::kMemUnitStrSize];
     size_t totalBytes = 0;
-    for (int i = 0; i < MEMTAG_COUNT; ++i)
+    for (int i = 0; i < static_cast<int>(ps2::heap::MemTag::TagCount); ++i)
     {
-        const PS2MemTag tag = static_cast<PS2MemTag>(i);
-        const size_t tagBytes = PS2_GetStatsForMemTag(tag)->totalBytes;
+        const auto tag = static_cast<ps2::heap::MemTag>(i);
+        const size_t tagBytes = ps2::heap::GetStatsForMemTag(tag).totalBytes;
         totalBytes += tagBytes;
 
         std::snprintf(line, sizeof(line), "%-10s %s",
-                      PS2_GetNameForMemTag(tag),
-                      PS2_FormatMemoryUnit(tagBytes, true, unit, sizeof(unit)));
+                      ps2::heap::GetNameForMemTag(tag),
+                      ps2::heap::FormatMemoryUnit(tagBytes, true, unit, sizeof(unit)));
 
         DrawInternalString(textX, textY, line);
         textY += kLineHeight;
     }
 
     std::snprintf(line, sizeof(line), "%-10s %s", "Total",
-                  PS2_FormatMemoryUnit(totalBytes, true, unit, sizeof(unit)));
+                  ps2::heap::FormatMemoryUnit(totalBytes, true, unit, sizeof(unit)));
     DrawInternalString(textX, textY, line);
     textY += kLineHeight;
 
@@ -198,12 +198,12 @@ void DrawMemUsageOverlay()
     // change fits: the transient where the old map is still resident while the new
     // one loads is long gone by the time anyone reads Total off the screen.
     std::snprintf(line, sizeof(line), "%-10s %s", "Peak",
-                  PS2_FormatMemoryUnit(PS2_GetPeakMemBytes(), true, unit, sizeof(unit)));
+                  ps2::heap::FormatMemoryUnit(ps2::heap::GetPeakMemBytes(), true, unit, sizeof(unit)));
     DrawInternalString(textX, textY, line);
     textY += kLineHeight;
 
     std::snprintf(line, sizeof(line), "%-10s %s", "Sbrk Left",
-                  PS2_FormatMemoryUnit(PS2_GetAvailableMemBytes(), true, unit, sizeof(unit)));
+                  ps2::heap::FormatMemoryUnit(ps2::heap::GetAvailableMemBytes(), true, unit, sizeof(unit)));
     DrawInternalString(textX, textY, line);
 }
 
@@ -240,17 +240,17 @@ void DrawVramUsageOverlay()
     textY += kLineHeight;
 
     char line[64];
-    char unit[PS2_MEMUNIT_STR_SIZE];
+    char unit[ps2::heap::kMemUnitStrSize];
 
     std::snprintf(line, sizeof(line), "%-10s %s", "Used",
-                  PS2_FormatMemoryUnit(static_cast<size_t>(stats.totalWords - stats.freeWords) * 4u,
-                                       true, unit, sizeof(unit)));
+                  ps2::heap::FormatMemoryUnit(static_cast<size_t>(stats.totalWords - stats.freeWords) * 4u,
+                                              true, unit, sizeof(unit)));
     DrawInternalString(textX, textY, line);
     textY += kLineHeight;
 
     std::snprintf(line, sizeof(line), "%-10s %s", "Total",
-                  PS2_FormatMemoryUnit(static_cast<size_t>(stats.totalWords) * 4u,
-                                       true, unit, sizeof(unit)));
+                  ps2::heap::FormatMemoryUnit(static_cast<size_t>(stats.totalWords) * 4u,
+                                              true, unit, sizeof(unit)));
     DrawInternalString(textX, textY, line);
     textY += kLineHeight;
 

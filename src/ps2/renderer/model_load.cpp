@@ -135,11 +135,11 @@ class HunkAllocator final
 {
 public:
     // Allocates and zero-fills the block (loaders rely on zero-initialised
-    // fields, matching ref_gl's Hunk_Alloc semantics). PS2_MemAllocAligned aborts
+    // fields, matching ref_gl's Hunk_Alloc semantics). ps2::heap::AllocAligned aborts
     // on OOM, so this always succeeds.
-    void Init(u32 sizeBytes, PS2MemTag tag)
+    void Init(u32 sizeBytes, ps2::heap::MemTag tag)
     {
-        m_base     = static_cast<u8 *>(PS2_MemAllocAligned(kHunkAlign, sizeBytes, tag));
+        m_base     = static_cast<u8 *>(ps2::heap::AllocAligned(ps2::heap::MemAlign(kHunkAlign), sizeBytes, tag));
         m_offset   = 0;
         m_capacity = sizeBytes;
         std::memset(m_base, 0, sizeBytes);
@@ -1465,7 +1465,7 @@ void ReserveWorldArena()
     PS2_AssertMsg(s_worldArena == nullptr, "ReserveWorldArena called twice!");
 
     s_worldArena = static_cast<u8 *>(
-        PS2_MemAllocAligned(kHunkAlign, kWorldArenaBytes, MEMTAG_MDL_WORLD));
+        ps2::heap::AllocAligned(ps2::heap::MemAlign(kHunkAlign), kWorldArenaBytes, ps2::heap::MemTag::WorldMdl));
 
     Com_DPrintf("World arena reserved: %u KB (%u KB hunk + %u KB lump scratch), "
                 "held for the life of the program.\n",
@@ -1597,7 +1597,7 @@ bool LoadSpriteModel(ModelInstance & mdl, FILE * const file, const int fileLen)
     const u32 hunkSize = AlignUp(static_cast<u32>(fileLen), kHunkAlign);
 
     HunkAllocator hunk{};
-    hunk.Init(hunkSize, MEMTAG_MDL_SPRITE);
+    hunk.Init(hunkSize, ps2::heap::MemTag::SpriteMdl);
     mdl.hunkBase = hunk.Base();
     mdl.hunkSize = hunkSize;
     mdl.type     = ModelType::Sprite;
@@ -1682,7 +1682,7 @@ bool LoadAliasMD2Model(ModelInstance & mdl, FILE * const file, const int fileLen
     const u32 hunkSize = AlignUp(static_cast<u32>(header.ofs_end), kHunkAlign);
 
     HunkAllocator hunk{};
-    hunk.Init(hunkSize, MEMTAG_MDL_ALIAS);
+    hunk.Init(hunkSize, ps2::heap::MemTag::AliasMdl);
     mdl.hunkBase = hunk.Base();
     mdl.hunkSize = hunkSize;
     mdl.type     = ModelType::AliasMD2;
