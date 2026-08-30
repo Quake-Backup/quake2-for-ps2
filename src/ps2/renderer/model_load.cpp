@@ -39,20 +39,60 @@ namespace {
 // Extra debug printing during model load.
 constexpr bool kVerboseModelLoading = false;
 
+constexpr float kTriangulationEpsilon  = 0.001f;
+constexpr int   kTriangulationMaxVerts = 128; // Per polygon.
+
+constexpr float kSubdivideSizeF = static_cast<float>(kSubdivideSize);
+
+// ------------------------------------------------------------------------------------------------
+// World arena
+//
+// The world hunk is the largest single allocation the program makes - 6.85 MB on
+// power2 - and it is allocated and freed on every map change. dlmalloc cannot move
+// live blocks, so once a few hundred longer-lived allocations have settled into the
+// holes left behind, no contiguous run that big survives.
+//
+// So the world hunk does not come from the general heap at all. It is carved out of
+// one block reserved at startup and never returned, which makes it immune to that
+// by construction rather than merely less likely to hit it. The staging buffer the
+// streamed loader uses gets the same treatment for the same reason.
+//
+// Both capacities come from build/tools/bspinfo, which mirrors the sizers here and
+// reports the worst case over a map set:
+//
+//     WORST HUNK   : power2.bsp needs 7177824 bytes (6.85 MB)
+//     WORST SCRATCH: lab.bsp    needs  954048 bytes (0.91 MB)
+//
+// with ~10% on top for maps that are not in pak0. Re-run bspinfo after adding a
+// mission pack or custom maps; a map that does not fit says so and stops, rather
+// than falling back to the heap and quietly reintroducing the problem.
+// ------------------------------------------------------------------------------------------------
+
 // Alignment of every hunk sub-allocation. Rounding each allocation up keeps the
 // running offset aligned, so the pre-pass total is order-independent and matches
 // the real run exactly, and leaves vertex arrays qword-aligned for later DMA.
 constexpr u32 kHunkAlign = 16;
 
+constexpr u32 kWorldHunkCapacity    = 7680u * 1024u; // 7.50 MB, power2.bsp + 9.6%
+constexpr u32 kWorldScratchCapacity = 1024u * 1024u; // 1.00 MB, lab.bsp + 9.9%
+constexpr u32 kWorldArenaBytes      = kWorldHunkCapacity + kWorldScratchCapacity;
+
+// Reserved once by ReserveWorldArena, never freed. The hunk occupies the first
+// kWorldHunkCapacity bytes and the scratch the rest.
+static u8 * s_worldArena = nullptr;
+
+// The most any map has actually needed, for the load-time log line. Worth watching:
+// it is the evidence that the capacities above are still right.
+static u32 s_hunkPeakUsed    = 0;
+static u32 s_scratchPeakUsed = 0;
+
+inline u8 * WorldHunkBase()    { return s_worldArena; }
+inline u8 * WorldScratchBase() { return s_worldArena + kWorldHunkCapacity; }
+
 constexpr u32 AlignUp(u32 value, u32 alignment)
 {
     return (value + (alignment - 1)) & ~(alignment - 1);
 }
-
-constexpr float kTriangulationEpsilon  = 0.001f;
-constexpr int   kTriangulationMaxVerts = 128; // Per polygon.
-
-constexpr float kSubdivideSizeF = static_cast<float>(kSubdivideSize);
 
 // ------------------------------------------------------------------------------------------------
 // Hunk sizing and allocation
@@ -98,6 +138,37 @@ public:
         m_offset   = 0;
         m_capacity = sizeBytes;
         std::memset(m_base, 0, sizeBytes);
+    }
+
+    // Points the hunk at the reserved world arena instead of allocating. Only brush
+    // models use this - sprites and MD2s are small, short-lived and numerous, which
+    // is what the general heap is good at. The caller must not free the result; see
+    // ReserveWorldArena and ModelCache::Unload.
+    // False when the map does not fit the reservation, which the caller reports the
+    // same way as any other malformed-map failure.
+    bool InitFromWorldArena(u32 sizeBytes, const char * name)
+    {
+        PS2_AssertMsg(s_worldArena != nullptr, "World arena used before it was reserved!");
+
+        if (sizeBytes > kWorldHunkCapacity) [[unlikely]]
+        {
+            Com_Printf("ERROR: LoadBrushModel: '%s' needs a %u KB world hunk but the reserved\n"
+                       "       arena is only %u KB. Re-run build/tools/bspinfo over this map set\n"
+                       "       and raise kWorldHunkCapacity in model_load.cpp.\n",
+                       name, sizeBytes / 1024u, kWorldHunkCapacity / 1024u);
+            return false;
+        }
+
+        m_base     = WorldHunkBase();
+        m_offset   = 0;
+        m_capacity = sizeBytes;
+
+        // Only the part this map uses: the loaders rely on zero-initialised fields,
+        // and clearing the whole 7.5 MB every load would cost more than it buys.
+        std::memset(m_base, 0, sizeBytes);
+
+        if (sizeBytes > s_hunkPeakUsed) { s_hunkPeakUsed = sizeBytes; }
+        return true;
     }
 
     void * Alloc(u32 sizeBytes)
@@ -257,19 +328,32 @@ public:
             }
         }
 
+        // Use the arena scratch buffer to avoid fragmentation.
+        PS2_AssertMsg(s_worldArena != nullptr, "World arena used before it was reserved!");
+
         m_scratchSize = RequiredScratchBytes();
-        m_scratch = static_cast<u8 *>(PS2_MemAllocAligned(kHunkAlign, m_scratchSize, MEMTAG_MDL_WORLD));
+        if (m_scratchSize > kWorldScratchCapacity)
+        {
+            Com_Printf("ERROR: LoadBrushModel: '%s' needs a %u KB lump scratch but the reserved\n"
+                       "       arena is only %u KB. Re-run build/tools/bspinfo over this map set\n"
+                       "       and raise kWorldScratchCapacity in model_load.cpp.\n",
+                       name, m_scratchSize / 1024u, kWorldScratchCapacity / 1024u);
+            Close();
+            return false;
+        }
+
+        m_scratch = WorldScratchBase();
+        if (m_scratchSize > s_scratchPeakUsed) { s_scratchPeakUsed = m_scratchSize; }
         return true;
     }
 
     void Close()
     {
-        if (m_scratch != nullptr)
-        {
-            PS2_MemFree(m_scratch, m_scratchSize, MEMTAG_MDL_WORLD);
-            m_scratch     = nullptr;
-            m_scratchSize = 0;
-        }
+        // m_scratch points into the reserved arena and is never freed; just drop the
+        // reference so a second Close() or a use-after-close trips on null.
+        m_scratch     = nullptr;
+        m_scratchSize = 0;
+
         if (m_file != nullptr)
         {
             FS_FCloseFile(m_file);
@@ -278,6 +362,9 @@ public:
     }
 
     const dheader_t & Header() const { return m_header; }
+
+    // How much of the reserved scratch this map actually needs. Valid until Close().
+    u32 ScratchSize() const { return m_scratchSize; }
 
     // Reads one lump into the scratch buffer at 'atOffset' and returns it. The
     // result stays valid until another read overlaps it.
@@ -1367,6 +1454,27 @@ bool ComputeBrushHunkSize(const dheader_t * header, const PrePassLumps & pre, co
 } // namespace
 
 // ------------------------------------------------------------------------------------------------
+// WORLD MODEL SCRATCH ARENA
+// ------------------------------------------------------------------------------------------------
+
+void ReserveWorldArena()
+{
+    PS2_AssertMsg(s_worldArena == nullptr, "ReserveWorldArena called twice!");
+
+    s_worldArena = static_cast<u8 *>(
+        PS2_MemAllocAligned(kHunkAlign, kWorldArenaBytes, MEMTAG_MDL_WORLD));
+
+    Com_DPrintf("World arena reserved: %u KB (%u KB hunk + %u KB lump scratch), "
+                "held for the life of the program.\n",
+                kWorldArenaBytes / 1024u, kWorldHunkCapacity / 1024u, kWorldScratchCapacity / 1024u);
+}
+
+bool IsWorldArenaBlock(const void * const ptr)
+{
+    return ptr != nullptr && ptr == static_cast<const void *>(s_worldArena);
+}
+
+// ------------------------------------------------------------------------------------------------
 // BRUSH MODELS (WORLD MAP)
 // ------------------------------------------------------------------------------------------------
 
@@ -1405,7 +1513,10 @@ bool LoadBrushModel(ModelInstance & mdl, const char * const fileName)
     }
 
     HunkAllocator hunk{};
-    hunk.Init(hunkSize, MEMTAG_MDL_WORLD);
+    if (!hunk.InitFromWorldArena(hunkSize, mdl.name))
+    {
+        return false;
+    }
     mdl.hunkBase = hunk.Base();
     mdl.hunkSize = hunkSize;
     mdl.type     = ModelType::Brush;
@@ -1436,10 +1547,13 @@ bool LoadBrushModel(ModelInstance & mdl, const char * const fileName)
     // The hunk was sized to exactly what we allocate; assert we did not drift.
     PS2_Assert(hunk.BytesUsed() == hunkSize);
 
-    if (kVerboseModelLoading)
-    {
-        Com_DPrintf("Brush model '%s' loaded (%u KB hunk).\n", mdl.name, hunkSize / 1024);
-    }
+    // Always logged, not just under kVerboseModelLoading: these numbers against their
+    // capacities are the running evidence that the reservations are still sized
+    // right, and a full map cycle is the only thing that produces them.
+    Com_Printf("Brush model '%s': hunk %u/%u KB (peak %u), scratch %u/%u KB (peak %u).\n",
+               mdl.name,
+               hunkSize / 1024u, kWorldHunkCapacity / 1024u, s_hunkPeakUsed / 1024u,
+               bsp.ScratchSize() / 1024u, kWorldScratchCapacity / 1024u, s_scratchPeakUsed / 1024u);
     return true;
 }
 

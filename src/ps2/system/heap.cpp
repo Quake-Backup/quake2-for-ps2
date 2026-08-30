@@ -25,6 +25,11 @@
 extern "C" {
     #define USE_DL_PREFIX 1
     #include "dlmalloc/malloc.h"
+
+    // malloc.h declares this one unprefixed even under USE_DL_PREFIX (both arms of
+    // its #ifndef say "mallinfo"), so the name it actually exports goes undeclared.
+    // malloc.c does define dlmallinfo - see public_mALLINFo - so declare it here.
+    struct mallinfo dlmallinfo(void);
 }
 #pragma GCC diagnostic pop
 
@@ -108,6 +113,110 @@ static inline void AccountAlloc(PS2MemTag tag, size_t bytes)
 }
 
 // ------------------------------------------------------------------------------------------------
+// Allocator dump
+// ------------------------------------------------------------------------------------------------
+
+// The largest block dlmalloc would actually hand out right now, found by probing
+// and immediately giving back. mallinfo reports free bytes and free chunk count
+// but not the largest run, and the largest run is the number that decides whether
+// a big contiguous request can be served.
+//
+// Only ever called on the way to Sys_Error. It allocates, so it perturbs the heap
+// it is measuring - acceptable exactly once, at the point where the program is
+// already terminating.
+__attribute__((cold, noinline))
+static size_t LargestAllocatableBlock(const size_t upperBound)
+{
+    if (upperBound < 16u) { return 0u; }
+
+    // Binary search the largest size that succeeds. ~24 iterations for a 32 MB
+    // span, each one a malloc/free pair.
+    size_t lo = 0u;         // known to succeed (trivially)
+    size_t hi = upperBound; // known to fail (the caller just proved it)
+
+    while (hi - lo > 4096u)
+    {
+        const size_t mid = lo + ((hi - lo) / 2u);
+        void * const p = dlmalloc(mid);
+        if (p != nullptr)
+        {
+            dlfree(p);
+            lo = mid;
+        }
+        else
+        {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+__attribute__((cold, noinline))
+static void PrintDlmallocStats(const size_t failedRequest)
+{
+    const struct mallinfo mi = dlmallinfo();
+
+    // mallinfo's fields are ints over unsigned-long bookkeeping, so they can read
+    // negative once the arena passes 2 GB. Never on a 32 MB console, but clamp
+    // rather than print something absurd if it ever does.
+    const auto Clamp = [](int v) -> size_t { return (v < 0) ? 0u : static_cast<size_t>(v); };
+
+    const size_t arena    = Clamp(mi.arena);
+    const size_t inUse    = Clamp(mi.uordblks);
+    const size_t freeTot  = Clamp(mi.fordblks);
+    const size_t freeChks = Clamp(mi.ordblks);
+    const size_t keepCost = Clamp(mi.keepcost);
+    const size_t largest  = LargestAllocatableBlock(failedRequest);
+
+    char a[PS2_MEMUNIT_STR_SIZE], b[PS2_MEMUNIT_STR_SIZE], c[PS2_MEMUNIT_STR_SIZE];
+
+    std::printf("-------------------------- DLMALLOC ---------------------------\n");
+    std::printf("Arena (sbrk'd)   : %s\n", PS2_FormatMemoryUnit(arena, true, a, sizeof(a)));
+    std::printf("In use           : %s\n", PS2_FormatMemoryUnit(inUse, true, a, sizeof(a)));
+    std::printf("Free total       : %s  in %zu chunks (avg %s)\n",
+                PS2_FormatMemoryUnit(freeTot, true, a, sizeof(a)), freeChks,
+                PS2_FormatMemoryUnit((freeChks != 0u) ? (freeTot / freeChks) : 0u, true, b, sizeof(b)));
+    std::printf("Top releasable   : %s\n", PS2_FormatMemoryUnit(keepCost, true, a, sizeof(a)));
+    std::printf("Largest free blk : %s   (the failed request wanted %s)\n",
+                PS2_FormatMemoryUnit(largest, true, a, sizeof(a)),
+                PS2_FormatMemoryUnit(failedRequest, true, b, sizeof(b)));
+
+    // The verdict, spelled out, so the log answers the question without arithmetic.
+    if (freeTot >= failedRequest)
+    {
+        std::printf("VERDICT: FRAGMENTATION. %s free in total, but the largest single run is\n"
+                    "         only %s. The bytes exist; they are not adjacent.\n",
+                    PS2_FormatMemoryUnit(freeTot, true, a, sizeof(a)),
+                    PS2_FormatMemoryUnit(largest, true, c, sizeof(c)));
+    }
+    else
+    {
+        std::printf("VERDICT: EXHAUSTION. Only %s free in total, less than the request.\n",
+                    PS2_FormatMemoryUnit(freeTot, true, a, sizeof(a)));
+    }
+    std::printf("-------------------------- DLMALLOC ---------------------------\n");
+    std::fflush(stdout);
+}
+
+__attribute__((cold, noinline))
+static void OutOfMemory(const size_t requestSize, const PS2MemTag tag, const char * const funcName)
+{
+    // The call stack goes to stdout, not to Sys_Error: the panic screen it
+    // paints has 24 lines to spend on the message and the memtag table, and
+    // stdout is where the PCSX2/ps2client log goes.
+    std::printf("%s: failed to allocate %zu bytes (tag: %s)\n",
+                funcName, requestSize, s_memTagNames[MemTagToIndex(tag)]);
+
+    PrintDlmallocStats(requestSize);
+    ps2::debug::PrintStackTrace();
+
+    char dump[PS2_MEMTAGS_DUMP_SIZE];
+    Sys_Error("%s: failed to allocate %zu bytes (%s)\n%s",
+              funcName, requestSize, s_memTagNames[MemTagToIndex(tag)],
+              PS2_DumpMemTags(dump, sizeof(dump)));
+}
+
+// ------------------------------------------------------------------------------------------------
 // Public API
 // ------------------------------------------------------------------------------------------------
 
@@ -120,20 +229,7 @@ void * PS2_MemAlloc(size_t sizeBytes, PS2MemTag tag)
 
     if (p == nullptr) [[unlikely]]
     {
-        // The call stack goes to stdout, not to Sys_Error: the panic screen it
-        // paints has 24 lines to spend on the message and the memtag table, and
-        // stdout is where the PCSX2/ps2client log goes.
-        std::printf("PS2_MemAlloc: failed to allocate %zu bytes (%s)\n",
-                    n, s_memTagNames[MemTagToIndex(tag)]);
-        ps2::debug::PrintStackTrace();
-
-        // On the stack, not a static: this path is out-of-memory, so the last
-        // thing it should do is depend on 2 KB of .bss the failure just proved
-        // is scarce. There is plenty of room on the EE's 128 KB stack.
-        char dump[PS2_MEMTAGS_DUMP_SIZE];
-        Sys_Error("PS2_MemAlloc: failed to allocate %zu bytes (%s)\n"
-                  "%s", n, s_memTagNames[MemTagToIndex(tag)],
-                  PS2_DumpMemTags(dump, sizeof(dump)));
+        OutOfMemory(sizeBytes, tag, "PS2_MemAlloc");
     }
 
     AccountAlloc(tag, n);
@@ -147,14 +243,7 @@ void * PS2_MemAllocAligned(size_t alignment, size_t sizeBytes, PS2MemTag tag)
 
     if (p == nullptr) [[unlikely]]
     {
-        std::printf("PS2_MemAllocAligned: failed to allocate %zu bytes (align %zu, %s)\n",
-                    n, alignment, s_memTagNames[MemTagToIndex(tag)]);
-        ps2::debug::PrintStackTrace(); // Stdout, for the same reason as above.
-
-        char dump[PS2_MEMTAGS_DUMP_SIZE]; // Stack, for the same reason as above.
-        Sys_Error("PS2_MemAllocAligned: failed to allocate %zu bytes (align %zu, %s)\n"
-                  "%s", n, alignment, s_memTagNames[MemTagToIndex(tag)],
-                  PS2_DumpMemTags(dump, sizeof(dump)));
+        OutOfMemory(sizeBytes, tag, "PS2_MemAllocAligned");
     }
 
     AccountAlloc(tag, n);
@@ -282,7 +371,6 @@ const char * PS2_DumpMemTags(char * outBuffer, size_t outBufferSize)
 {
     char unitStr[PS2_MEMUNIT_STR_SIZE];
     char peakStr[PS2_MEMUNIT_STR_SIZE];
-    char * ptr;
     char * const end = outBuffer + outBufferSize;
     size_t memTotal = 0;
 
@@ -294,7 +382,7 @@ const char * PS2_DumpMemTags(char * outBuffer, size_t outBufferSize)
     // snprintf clamps and reports the *untruncated* length, so advance by
     // whichever is smaller: a dump that outgrows the caller's buffer stops
     // filling it instead of walking off the end.
-    ptr = outBuffer;
+    char * ptr = outBuffer;
     const auto append = [&ptr, end](const char * fmt, auto... args)
     {
         if (ptr >= end) { return; }

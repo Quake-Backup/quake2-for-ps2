@@ -101,6 +101,11 @@ void ModelCache::Init()
 {
     m_modelPool.Init(); // One-shot; asserts if called twice.
     m_regSequence = 1;  // See the member declaration for why it starts here.
+
+    // Before any map loads, and early enough that it lands in a heap nothing has
+    // fragmented yet - which is the whole point of reserving it.
+    ReserveWorldArena();
+
     Com_Printf("Model cache initialised.\n");
 }
 
@@ -185,6 +190,14 @@ const ModelInstance * ModelCache::LoadModel(const char * const name)
     bool ok = false;
     if (type == ModelType::Brush)
     {
+        // Every brush model is carved out of the single reserved world arena, so
+        // only one may be live at a time. LoadWorldModel guarantees that by
+        // releasing the old world before asking for the new one; this is the check
+        // that it stays true, because a second tenant would silently hand out the
+        // same memory twice.
+        PS2_AssertMsg(m_worldModel == nullptr,
+                      "Loading a brush model while another still holds the world arena!");
+
         // Streams the file itself - never holds the whole .bsp.
         ok = LoadBrushModel(mdl, name);
         if (ok) { SetUpInlineModels(mdl); }
@@ -330,10 +343,20 @@ void ModelCache::ReferenceAllTextures(ModelInstance & mdl)
 void ModelCache::Unload(u16 slot)
 {
     ModelInstance & mdl = m_modelPool.Slot(slot);
-    if (mdl.hunkBase != nullptr)
+
+    // Brush models are carved out of the permanently reserved world arena, so their
+    // hunk is not the allocator's to take back - dropping the slot is the whole of
+    // the release. Everything else owns its hunk. (Inline submodels alias the world's
+    // and leave hunkBase null, so they fall through both branches.)
+    if (IsWorldArenaBlock(mdl.hunkBase))
+    {
+        PS2_Assert(mdl.type == ModelType::Brush);
+    }
+    else if (mdl.hunkBase != nullptr)
     {
         PS2_MemFree(mdl.hunkBase, mdl.hunkSize, MemTagForType(mdl.type));
     }
+
     m_modelPool.Free(slot); // Zeroes the slot.
 }
 
