@@ -113,7 +113,7 @@ just a config selector, so it composes: `make release run` builds and launches t
 ELF. `BUILD=debug` / `BUILD=release` does the same thing from the command line.
 
 Both configs **strip** the linked ELF, which is mostly about the debug build — DWARF
-dominates its size, and stripping takes it from ~7.7 MB to ~1.7 MB. Nothing is lost: the
+dominates its size, and stripping saves several MB of file size. Nothing is lost: the
 PS2 loader only reads program headers, and the full symbols stay next to it in
 `quake2_unstripped.elf` (feed that one to `addr2line` to resolve a crash address). Build
 with `STRIP_ELF=0` to ship the unstripped ELF as `quake2.elf` instead.
@@ -257,17 +257,16 @@ src/
     system/                       main() entry point, Sys_* seam, IOP boot, dlmalloc heap
     renderer/                     GS front-end, VRAM heap, textures, models, VU1 path
       vu1progs/                   VU1 microprograms (.vcl)
-      tests/                      standalone bring-up scenes (test cube, cinematics)
     audio/                        SNDDMA_* seam, audsrv device, mix ring
     input/                        IN_* seam, DualShock pad, USB keyboard
     math/                         vector/matrix math for the renderer
     net/                          NET_* seam (loopback only)
     builtin/                      images baked into the ELF (font, palette, HUD tiles)
-    debug/                        simple on-screen printing for fatal errors
+    debug/                        simple on-screen printing for fatal errors, stack trace, HW exception handling
+    tests/                        standalone bring-up scenes (test cube, cinematics, map cycle)
 ```
 
-Every file carries a header comment explaining what it does and *why* it does it that way;
-those comments are the real documentation and this section is only a map to them.
+Every file carries a header comment explaining what it does and *why* it does it that way.
 [src/ps2/common.h](src/ps2/common.h) is the single seam between the C++ backend and the C
 engine — backend sources usually include it rather than reaching into engine headers directly.
 
@@ -278,7 +277,8 @@ engine — backend sources usually include it rather than reaching into engine h
 ### Rendering
 
 The renderer implements `refexport_t` in [ps2/renderer/ref.cpp](src/ps2/renderer/ref.cpp) —
-the same interface `ref_gl` and `ref_soft` implemented, so the client above it is unmodified.
+the same interface `ref_gl` and `ref_soft` implemented, but we link statically rather than
+having a DLL as the original Quake 2 did.
 
 **Video mode and VRAM budget.** 640x448, NTSC/PAL auto-detected, double-buffered using both
 GS drawing contexts. The framebuffer format is chosen by `ps2_fb_16bit` (default on): 16-bit
@@ -286,7 +286,7 @@ buffers cost 560 KB each instead of 1120 KB, which is where most of the texture 
 headroom comes from, and halve the GS's colour write and blend-read bandwidth — at the cost
 of 5:5:5 colour, which `ps2_fb_dither` can smooth over. Depth is 16-bit either way (the GS
 requires colour and depth to share a page layout). What is left after the two framebuffers,
-the z-buffer and two CLUTs — about 1.27 MB in the 16-bit configuration — becomes the
+the z-buffer and CLUTs — ~1.27 MB in the 16-bit configuration — becomes the
 streamed texture heap.
 
 **Frame structure.** `BeginFrame()` clears colour and depth; 2D and 3D then draw in any
@@ -543,15 +543,11 @@ against a release ELF you get function names from the symbol table but no file o
 
 **Rendering**
 
-- Non-power-of-two wall textures sample incorrectly and need resampling at load time
-  ([image_load.cpp:153](src/ps2/renderer/image_load.cpp#L153)).
-- No texture mipmaps ([texture.h:119](src/ps2/renderer/texture.h#L119)); minification
-  aliasing is visible on distant world geometry.
-- Water/turbulent surface warping is still done on the EE and is a good candidate to move to
-  VU1 ([render_view.cpp:889](src/ps2/renderer/render_view.cpp#L889)), as is particle
-  billboard generation ([render_view.cpp:2077](src/ps2/renderer/render_view.cpp#L2077)).
-- CLUT reloads could also be skipped with `CLUT_COMPARE_CBP0` ([gs.cpp:723](src/ps2/renderer/gs.cpp#L723)).
-- General performance work — the target is a solid 60 fps "performance mode" in real gameplay, and that hasn't been profiled seriously yet.
+- Non-power-of-two wall textures sample incorrectly and need resampling at load time.
+- No texture mipmaps; minification aliasing is visible on distant world geometry.
+- Water/turbulent surface warping is still done on the EE and is a good candidate to move to VU1, as is particle billboard generation.
+- CLUT reloads could be skipped with `CLUT_COMPARE_CBP0`.
+- General performance work — the target is a solid 60 fps "performance mode" in real gameplay.
 
 **Engine features**
 
