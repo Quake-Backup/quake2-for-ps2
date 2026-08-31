@@ -105,7 +105,7 @@ the affected objects.
 | Optimization | `-O2` | `-O3` |
 | Debug info | `-gdwarf-2 -gz` | none |
 | `PS2_Assert` / `PS2_AssertMsg` | on | compiled out |
-| `PS2_QUAKE_DEBUG` code (test cube, cinematic test, extra debug textures) | in | compiled out |
+| `PS2_QUAKE_DEBUG` (tests, debug-only code) | in | compiled out |
 
 Each config keeps its own object tree under `build/<config>/`, so switching back and forth
 neither mixes objects built with different flags nor forces a full rebuild. `release` is
@@ -151,43 +151,6 @@ is simply copied into place):
   the global palette under [src/ps2/builtin/](src/ps2/builtin/) were generated. Those are
   compiled into the ELF so the executable can boot and print errors before any game data
   is found.
-
-#### Reading a stack trace
-
-Fatal allocation failures print the call stack to stdout before halting (see
-[src/ps2/debug/stack_trace.cpp](src/ps2/debug/stack_trace.cpp)). Because the ELF that runs
-is stripped, what comes out is raw addresses:
-
-```
-ps2::heap::Alloc: failed to allocate 262144 bytes (Audio)
-------------------------- STACK TRACE -------------------------
-#0  0x00195020
-#1  0x001331bc
-#2  0x00130f10
-------------------------- STACK TRACE -------------------------
-```
-
-Pipe that at `symbolize`, which resolves it against the `quake2_unstripped.elf` sitting
-next to the stripped one:
-
-```
-$ build/tools/symbolize < emulog.txt
-ELF: build/debug/quake2_unstripped.elf
-
-#0  0x00195020  ps2::heap::Alloc                   src/ps2/system/heap.cpp:116
-#1  0x001331bc  S_LoadSound                        src/client/snd_mem.c:184
-#2  0x00130f10  S_RegisterSound                    src/client/snd_dma.c:308
-```
-
-Paste in as much surrounding log as you like — banner lines, `[Q2]` prefixes and other
-noise are ignored, and anything shaped like a `#N 0xADDR` frame is picked out. It also
-accepts a file argument, or bare addresses (`symbolize 0x00195020 0x001331bc`).
-
-It defaults to the most recently built `build/<config>/quake2_unstripped.elf`; pass
-`-e <elf>` to choose. **The dump and the ELF must come from the same build** — addresses
-from a different one will silently resolve to the wrong names. Inlined frames are expanded
-by default (`--no-inlines` turns that off). Note that only the debug config carries DWARF:
-against a release ELF you get function names from the symbol table but no file or line.
 
 ### Running in PCSX2
 
@@ -462,11 +425,10 @@ while the pad driver loads its `rom0:` modules later — after the IOP reset, wh
 required order.
 
 Memory is a single program-wide `dlmalloc` heap ([heap.h](src/ps2/system/heap.h)) with
-`operator new`/`delete` and the engine's `Z_Malloc` routed through a tag-accounting layer
-(`ps2::heap::MemTag::Quake`, `ps2::heap::MemTag::Renderer`, `ps2::heap::MemTag::TexImage`, `ps2::heap::MemTag::*Mdl`, `ps2::heap::MemTag::Lightmap`, …).
+`operator new`/`delete` and Quake's `Z_Malloc` routed through a tag-accounting layer (`ps2::heap::MemTag::*`).
 The RAM the game can never allocate — EE kernel, ELF image, stack — is booked against
 `ps2::heap::MemTag::ElfSys` at startup so the tags add up to a faithful picture of the console's 32 MB.
-Built with `-fno-exceptions`, so a failed allocation is a fatal `Sys_Error`, not a throw.
+Built with `-fno-exceptions`, so a failed allocation is a fatal `Sys_Error`, not an exception throw.
 
 Networking is loopback only ([net/net.cpp](src/ps2/net/net.cpp)) — enough for a local
 single-player/listen-server game; remote sends are dropped.
@@ -501,13 +463,13 @@ staying in each for `ps2_testmaps_dwell` seconds (default 8) once it has finishe
 prints a line per map:
 
 ```
-MapCycle [23/39] power2    World 6.84 MB  Audio 3.51 MB  Tex 3.23 MB  Mdl 2.21 MB  TOTAL 24.09 MB  PEAK 26.31 MB  FREE 1.94 MB  <- NEW PEAK
+MapCycle [23/39] power2    World 6.84 MB  Audio 3.51 MB  Tex 3.23 MB  Mdl 2.21 MB  TOTAL 24.09 MB  PEAK 26.31 MB  FREE 1.94 MB
 ```
 
 The maps matter less than the transitions between them: a map change is the worst moment in
 the program, because the outgoing map's data can still be resident while the next one is
 built, and that is where every out-of-memory failure in this port has happened. `PEAK` is the
-global high-water (`PS2_GetPeakMemBytes`), so `NEW PEAK` marks the transition that cost the
+global high-water (`GetPeakMemBytes`), so `NEW PEAK` marks the transition that cost the
 most - which is the number to watch. A full pass takes roughly fifteen minutes at the default
 dwell. Debug builds only; the whole test compiles out of release.
 
@@ -537,6 +499,43 @@ unwinder uses cannot read code it has no symbols for.
 ```
 killserver ; deathmatch 1 ; cheats 1 ; map base1
 ```
+
+#### Reading a stack trace
+
+Fatal allocation failures print the call stack to stdout before halting (see
+[src/ps2/debug/stack_trace.cpp](src/ps2/debug/stack_trace.cpp)). Because the ELF that runs
+is stripped, what comes out is raw addresses:
+
+```
+ps2::heap::Alloc: failed to allocate 262144 bytes (Audio)
+------------------------- STACK TRACE -------------------------
+#0  0x00195020
+#1  0x001331bc
+#2  0x00130f10
+------------------------- STACK TRACE -------------------------
+```
+
+Pipe that at `symbolize`, which resolves it against the `quake2_unstripped.elf` sitting
+next to the stripped one:
+
+```
+$ build/tools/symbolize < emulog.txt
+ELF: build/debug/quake2_unstripped.elf
+
+#0  0x00195020  ps2::heap::Alloc                   src/ps2/system/heap.cpp:116
+#1  0x001331bc  S_LoadSound                        src/client/snd_mem.c:184
+#2  0x00130f10  S_RegisterSound                    src/client/snd_dma.c:308
+```
+
+Paste in as much surrounding log as you like — banner lines, `[Q2]` prefixes and other
+noise are ignored, and anything shaped like a `#N 0xADDR` frame is picked out. It also
+accepts a file argument, or bare addresses (`symbolize 0x00195020 0x001331bc`).
+
+It defaults to the most recently built `build/<config>/quake2_unstripped.elf`; pass
+`-e <elf>` to choose. **The dump and the ELF must come from the same build** — addresses
+from a different one will silently resolve to the wrong names. Inlined frames are expanded
+by default (`--no-inlines` turns that off). Note that only the debug config carries DWARF:
+against a release ELF you get function names from the symbol table but no file or line.
 
 ---
 
