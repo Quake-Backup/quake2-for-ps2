@@ -8,15 +8,15 @@ This is an unofficial fan-made port, targeting the PlayStation 2 console, of the
 
 The port relies solely on the free [PS2DEV SDK][link_ps2_dev] to provide rendering, input,
 audio and system services for the Quake II engine — no official Sony SDK, no proprietary
-libraries. The long-term goal is a fully functional and playable single-player Quake II
-on the PS2, built with freely available tools only.
+libraries. This project's goal is a fully functional and playable single-player Quake II
+on the PS2, built entirely with freely available tools.
 
 The engine, game and server code under [src/client/](src/client/), [src/common/](src/common/),
 [src/game/](src/game/) and [src/server/](src/server/) is id's original C, kept as close to
 untouched as possible. Everything specific to the console lives in [src/ps2/](src/ps2/) and is
 written in modern C++ (C++20, no exceptions, no RTTI, warnings-as-errors). The two halves meet
 at a small number of well defined seams — `refexport_t`, `SNDDMA_*`, `IN_*`, `Sys_*`, `NET_*`
-— exactly where the original win32/linux backends plugged in.
+— where the original win32/linux backends plugged in.
 
 ### What works today
 
