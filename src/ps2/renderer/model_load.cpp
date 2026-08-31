@@ -630,7 +630,8 @@ void LoadTexInfo(ModelInstance & mdl, HunkAllocator & hunk, const void * const l
             out[i].vecs[1][j] = in[i].vecs[1][j];
         }
 
-        out[i].flags = in[i].flags;
+        PS2_Assert(in[i].flags <= UINT16_MAX);
+        out[i].flags = static_cast<u16>(in[i].flags);
 
         const int next = in[i].nexttexinfo;
         out[i].next = (next > 0) ? (mdl.texInfos + next) : nullptr;
@@ -655,6 +656,7 @@ void LoadTexInfo(ModelInstance & mdl, HunkAllocator & hunk, const void * const l
         base->numFrames = 1;
         for (const ModelTexInfo * step = base->next; step != nullptr && step != base; step = step->next)
         {
+            PS2_Assert(base->numFrames < UINT16_MAX);
             base->numFrames++;
         }
     }
@@ -698,15 +700,31 @@ void CalcSurfaceExtents(const ModelInstance & mdl, ModelSurface & surf)
 // ------------------------------------------------------------------------------------------------
 
 // Polygon normal via the sum of edge cross products (see iquilezles.org/articles/areas).
+// The sum is taken relative to the first vertex. The identity holds about any origin
+// (the extra terms cancel around a closed loop), but world coordinates run to a few
+// thousand units while a face's own area is comparatively tiny, so summing absolute
+// positions is catastrophic cancellation: 24 mantissa bits leave the result of a
+// small far-from-origin face with barely any significant digits.
 Vec3 ComputePolygonNormal(const ModelPoly & poly)
 {
+    const Vec3 origin = poly.vertexes[0].position;
+
     Vec3 normal = { 0.0f, 0.0f, 0.0f };
     for (int v = 0; v < poly.numVerts; ++v)
     {
         const int vNext = (v + 1) % poly.numVerts;
-        normal = normal + math::Cross(poly.vertexes[v].position, poly.vertexes[vNext].position);
+        normal = normal + math::Cross(poly.vertexes[v].position - origin,
+                                      poly.vertexes[vNext].position - origin);
     }
     return math::Normalize(normal);
+}
+
+// Two vertexes closer together than this are the same point as far as the
+// triangulation is concerned; the direction between them cannot be normalized.
+inline bool IsDegenerateEdge(const Vec3 & v)
+{
+    constexpr float kMinEdgeLengthSqrd = 1e-8f;
+    return math::Dot(v, v) < kMinEdgeLengthSqrd;
 }
 
 int NextActive(int x, const int numVerts, const bool * const active)
@@ -731,6 +749,21 @@ bool TestTriangle(int pi1, int pi2, int pi3,
                   const Vec3 & p1, const Vec3 & p2, const Vec3 & p3, const Vec3 & normal,
                   const bool * const active, const ModelPoly & poly, float epsilon)
 {
+    // Two corners in the same place: a zero-area candidate. It has to be handled
+    // before anything is normalized, because qbsp's T-junction fixup does leave
+    // repeated vertexes in face windings, and math::Normalize of a zero-length
+    // vector is 1/sqrt(0). On a PC that is an infinity and every comparison below
+    // it goes false, which happens to be harmless; the EE's FPU has no infinities
+    // or NaNs, so it saturates to FLT_MAX and the vector comes back as (0,0,0),
+    // which then quietly passes the "inside the triangle" test and vetoes ears
+    // that are perfectly good. Clipping the zero-area ear instead is harmless (it
+    // rasterizes to nothing) and it retires the duplicate vertex, so the sweep
+    // makes progress rather than walking the whole ring and giving up.
+    if (IsDegenerateEdge(p2 - p1) || IsDegenerateEdge(p3 - p2) || IsDegenerateEdge(p1 - p3))
+    {
+        return true;
+    }
+
     const Vec3 n1 = math::Cross(normal, math::Normalize(p2 - p1));
     if (math::Dot(n1, p3 - p1) <= epsilon)
     {
@@ -746,6 +779,14 @@ bool TestTriangle(int pi1, int pi2, int pi3,
         if (active[v] && v != pi1 && v != pi2 && v != pi3)
         {
             const Vec3 & pv = poly.vertexes[v].position;
+
+            // Same reason: a vertex duplicating one of the corners sits on the
+            // boundary, not inside, and has no direction to normalize.
+            if (IsDegenerateEdge(pv - p1) || IsDegenerateEdge(pv - p2) || IsDegenerateEdge(pv - p3))
+            {
+                continue;
+            }
+
             if (math::Dot(n1, math::Normalize(pv - p1)) > -epsilon &&
                 math::Dot(n2, math::Normalize(pv - p2)) > -epsilon &&
                 math::Dot(n3, math::Normalize(pv - p3)) > -epsilon)
@@ -890,12 +931,15 @@ void TriangulatePolygon(ModelPoly & poly)
         }
     }
 
-    // Not a hard error: the algorithm may fail to produce the expected count on
-    // pathological polygons. The unused triangles stay zeroed.
-    // FIXME: Find out why this happens and try to fix it (e.g. base2 triggers this error).
+    // Not a hard error. A winding that retraces itself - qbsp's T-junction fixup
+    // leaves a couple of those per map, a spike out to a vertex and straight back -
+    // simply has fewer than numVerts - 2 non-degenerate triangles in it, so the
+    // count can legitimately come up short. What was emitted still covers the
+    // polygon's area; the unused triangles stay zeroed and draw nothing.
     if (triesDone != numTriangles)
     {
-        Com_Printf("WARNING: TriangulatePolygon: Unexpected triangle count!\n");
+        Com_DPrintf("TriangulatePolygon: %i of %i triangles from a %i-vert polygon (degenerate winding).\n",
+                    triesDone, numTriangles, numVerts);
     }
 }
 
@@ -1120,7 +1164,6 @@ void LoadFaces(ModelInstance & mdl, HunkAllocator & hunk, const void * const lum
         ModelSurface & surf = out[surfNum];
         surf.firstEdge = in[surfNum].firstedge;
         surf.numEdges  = in[surfNum].numedges;
-        surf.color     = 0xFFFFFFFF; // <-- NOTE: Can add a debug color here.
         surf.flags     = SurfaceFlags::None;
         surf.polys     = nullptr;
         surf.lightmapTextureNum = kNotLightmapped;
@@ -1615,7 +1658,8 @@ bool LoadSpriteModel(ModelInstance & mdl, FILE * const file, const int fileLen)
     {
         mdl.skins[i] = tex::Find(out->frames[i].name, tex::ImageType::Sprite);
     }
-    mdl.numFrames = out->numframes;
+    PS2_Assert(out->numframes >= 0 && out->numframes <= UINT16_MAX);
+    mdl.numFrames = static_cast<u16>(out->numframes);
 
     if (kVerboseModelLoading)
     {
@@ -1697,9 +1741,11 @@ bool LoadAliasMD2Model(ModelInstance & mdl, FILE * const file, const int fileLen
     FS_Read(out, header.ofs_end, file);
 
     // Default bounds (MD2s carry no bounds; the game clips against these).
-    mdl.mins      = { -32.0f, -32.0f, -32.0f };
-    mdl.maxs      = {  32.0f,  32.0f,  32.0f };
-    mdl.numFrames = out->num_frames;
+    mdl.mins = { -32.0f, -32.0f, -32.0f };
+    mdl.maxs = {  32.0f,  32.0f,  32.0f };
+
+    PS2_Assert(out->num_frames >= 0 && out->num_frames <= UINT16_MAX);
+    mdl.numFrames = static_cast<u16>(out->num_frames);
 
     for (int i = 0; i < out->num_skins; ++i)
     {

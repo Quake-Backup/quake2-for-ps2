@@ -117,8 +117,8 @@ struct ModelEdge
 struct ModelTexInfo
 {
     float vecs[2][4];
-    int flags;
-    int numFrames;
+    u16 flags; // SURF_SKY | SURF_TRANS33 | SURF_TRANS66 | SURF_WARP | etc
+    u16 numFrames;
     const tex::Texture * texture;
     const ModelTexInfo * next; // Texture animation chain.
 };
@@ -142,12 +142,11 @@ struct ModelPoly
 // so the field widths are chosen to pack rather than for uniformity: anything
 // that provably fits in 16 bits is s16, and the members are grouped so the
 // narrow ones share words instead of each taking one.
+//
 struct ModelSurface
 {
     int visFrame; // should be drawn when node is crossed.
-
     cplane_s * plane;
-    u32 color;
 
     int firstEdge; // look up in model->surfEdges[], negative numbers are backwards edges.
     s16 numEdges;  // dface_t::numedges is a s16 on disk, so this cannot truncate.
@@ -258,22 +257,20 @@ struct ModelInstance final
     bool isInline;
 
     // Number of animation frames (usually = 2 for brush models: regular and alternate animation).
-    int numFrames;
+    u16 numFrames;
 
     // Volume occupied by the model graphics.
+    float radius;
     Vec3 mins;
     Vec3 maxs;
-    float radius;
 
     // Solid volume for clipping.
     Vec3 clipMins;
     Vec3 clipMaxs;
-    bool clipBox;
 
     // Brush model.
     int firstModelSurface;
     int numModelSurfaces;
-    int lightmap; // Only for submodels.
 
     int numSubModels;
     SubModelInfo * subModels;
@@ -308,10 +305,11 @@ struct ModelInstance final
 
     // No visibility lump here: the collision model already holds it verbatim in
     // map_visibility[], so the view walk asks CM_ClusterPVS instead of carrying a
-    // second copy (saves up to 376 KB on 'jail5'). See MarkLeaves.
+    // second copy. See MarkLeaves.
     u8 * lightData;
 
-    const tex::Texture * skins[kMaxMD2Skins]; // For alias models and skins.
+    // For alias models and skins.
+    const tex::Texture * skins[kMaxMD2Skins];
 
     // Backing store for everything loaded above: one heap block that all the
     // pointers index into, sized up front by a pre-pass and filled by a bump

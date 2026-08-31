@@ -174,18 +174,6 @@ constexpr u64 PackDitherMatrix(const signed char (&matrix)[16])
     return packed;
 }
 
-// Pixel stride the texture occupies VRAM with (the TEX0 TBW and transfer DBW).
-// 8-bit textures must use a multiple of 128 (TBW must be even for PSMT8/4);
-// other formats use their width as-is.
-inline int TextureStridePixels(const tex::Texture & texture, int psm)
-{
-    if (psm == GS_PSM_8)
-    {
-        return (texture.width + 127) & ~127;
-    }
-    return texture.width;
-}
-
 inline RenderPacket & FramePacket()
 {
     return s_framePacket[s_packetIdx];
@@ -648,7 +636,7 @@ void EnsureTextureResident(const tex::Texture & texture)
     PS2_AssertMsg(texture.atlas == nullptr, "EnsureTextureResident on a scrapped image - bind its atlas!");
 
     const int psm    = tex::GsPsm(texture.format);
-    const int stride = TextureStridePixels(texture, psm);
+    const int stride = tex::TextureStridePixels(texture, psm);
 
     if (texture.vramAddr != tex::Texture::kNotResident)
     {
@@ -693,17 +681,6 @@ void EnsureTextureResident(const tex::Texture & texture)
         }
 
         texture.vramAddr = addr;
-
-        // Fill the libdraw descriptor used when binding. The stride (TEX0's TBW)
-        // differs from the width for narrow 8-bit textures; the page-grid footprint
-        // already covers the rounding.
-        texture.texbuf.address         = static_cast<unsigned int>(addr);
-        texture.texbuf.width           = static_cast<unsigned int>(stride);
-        texture.texbuf.psm             = static_cast<unsigned int>(psm);
-        texture.texbuf.info.width      = draw_log2(static_cast<unsigned int>(texture.width));
-        texture.texbuf.info.height     = draw_log2(static_cast<unsigned int>(texture.height));
-        texture.texbuf.info.components = static_cast<unsigned char>(tex::GsComponents(texture.components));
-        texture.texbuf.info.function   = static_cast<unsigned char>(tex::GsFunction(texture.function));
 
         Com_DPrintf("VRAM: uploaded '%s' (%dx%d, %d KB)\n", texture.name,
                     texture.width, texture.height, sizeWords * 4 / 1024);
@@ -831,7 +808,20 @@ void SetTextureFor2D(const tex::Texture & texture)
         clut.load_method  = CLUT_NO_LOAD;
     }
 
-    texbuffer_t texbuf = bindTex.texbuf; // libdraw wants a mutable pointer
+    const int psm    = tex::GsPsm(bindTex.format);
+    const int stride = tex::TextureStridePixels(bindTex, psm);
+
+    // Fill the libdraw descriptor used when binding. The stride (TEX0's TBW)
+    // differs from the width for narrow 8-bit textures; the page-grid footprint
+    // already covers the rounding.
+    texbuffer_t texbuf;
+    texbuf.address         = static_cast<unsigned int>(bindTex.vramAddr);
+    texbuf.width           = static_cast<unsigned int>(stride);
+    texbuf.psm             = static_cast<unsigned int>(psm);
+    texbuf.info.width      = draw_log2(static_cast<unsigned int>(bindTex.width));
+    texbuf.info.height     = draw_log2(static_cast<unsigned int>(bindTex.height));
+    texbuf.info.components = static_cast<unsigned char>(tex::GsComponents(bindTex.components));
+    texbuf.info.function   = static_cast<unsigned char>(tex::GsFunction(bindTex.function));
 
     pkt.TextureSampling(s_drawCtx, lod);
     pkt.TextureBuffer(s_drawCtx, texbuf, clut);

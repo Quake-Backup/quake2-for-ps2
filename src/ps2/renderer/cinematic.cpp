@@ -47,6 +47,7 @@ static tex::Texture s_frameTexture = {
     .pixels       = nullptr,
     .width        = kFrameDim,
     .height       = kFrameDim,
+    .dirtyPixels  = false,
     .type         = tex::ImageType::Pic,
     .flags        = tex::TexFlags::None,
     .format       = tex::PixelFormat::RGB16,
@@ -58,9 +59,7 @@ static tex::Texture s_frameTexture = {
     .atlas        = nullptr, // owns its own VRAM; far too big for a scrap anyway
     .atlasX       = 0,
     .atlasY       = 0,
-    .vramAddr     = tex::Texture::kNotResident,
-    .texbuf       = {},
-    .dirtyPixels  = false,
+    .vramAddr     = tex::Texture::kNotResident
 };
 
 // Allocates the frame buffer on the first frame of a cinematic. Zeroed, so the

@@ -14,7 +14,9 @@
 #include "ps2/renderer/vram.h"
 
 #include <tamtypes.h>
-#include <draw_buffers.h> // texbuffer_t
+#include <gs_psm.h>
+#include <draw_buffers.h>  // texbuffer_t
+#include <draw_sampling.h> // LOD_*
 
 namespace ps2::mod { struct ModelSurface; }
 
@@ -91,8 +93,9 @@ struct Texture final
     char          name[MAX_QPATH]; // Game path, e.g. "pics/conback.pcx" (must be the first field - game code assumes this).
     u32           regSequence;     // Registration sequence the texture was last found in; stale level assets are freed at EndRegistration().
     const void *  pixels;          // Pixel data in EE RAM (static memory for built-ins, heap for file loads).
-    int           width;           // In pixels, > 0.
-    int           height;          // In pixels, > 0.
+    s16           width;           // In pixels, > 0.
+    s16           height;          // In pixels, > 0.
+    mutable bool  dirtyPixels;     // CPU rewrote 'pixels'; the next bind re-uploads them.
     ImageType     type;
     TexFlags      flags;
     PixelFormat   format;
@@ -119,9 +122,7 @@ struct Texture final
     // Residency is a cache managed by gs/vram: binding a const Texture may
     // upload it (or evict others), so these mutate behind the const API.
     static constexpr auto kNotResident = vram::Address::Invalid;
-    mutable vram::Address vramAddr;    // GS VRAM word address; kNotResident when not uploaded.
-    mutable texbuffer_t   texbuf;      // libdraw descriptor used when binding (filled on upload).
-    mutable bool          dirtyPixels; // CPU rewrote 'pixels'; the next bind re-uploads them.
+    mutable vram::Address vramAddr; // GS VRAM word address; kNotResident when not uploaded.
 
     // For dynamic textures (cinematic frames/lightmaps/scrap atlas).
     // Called after rewriting 'pixels' so the next bind refreshes GS VRAM.
@@ -130,29 +131,64 @@ struct Texture final
     // TODO: Consider texture mipmaps support.
 };
 
-// Bytes of EE RAM one texel occupies in each PixelFormat (Palette8 = 1).
-int BytesPerTexel(PixelFormat format);
-
 // Mappings from the strongly typed enums above to the plain integer constants
 // libdraw/GS registers expect. SDK constants stay out of the rest of the backend.
-int GsPsm(PixelFormat format);
-int GsComponents(TexComponents components);
-int GsFunction(TexFunction function);
-int GsMagFilter(TexFilter filter);
-int GsMinFilter(TexFilter filter);
+inline int GsComponents(TexComponents components)
+{
+    return (components == TexComponents::RGBA) ? TEXTURE_COMPONENTS_RGBA : TEXTURE_COMPONENTS_RGB;
+}
 
-// Converts image-normalized texture coordinates - 0..1 spanning the image,
-// which is what Quake's MD2 glcmds store - into the GS's normalized ST space.
-// The two are not the same thing: normalized ST spans the TEX0 TW/TH extent,
-// the image size rounded UP to a power of two, so for the non-power-of-two
-// images Quake is full of (a 276x194 model skin samples as 512x256) ST = 1.0
-// lands well past the last real texel. Multiply by these to hit the image's
-// true right/bottom edge; both come back 1.0 for power-of-two images.
-//
-// Only valid for coordinates that stay within [0, 1]. A tiling texture still
-// wraps at the power-of-two extent, so non-power-of-two world textures need
-// resampling on load, not a coordinate scale.
-void StScaleFor(const Texture & texture, float * outScaleS, float * outScaleT);
+inline int GsFunction(TexFunction function)
+{
+    return (function == TexFunction::Decal) ? TEXTURE_FUNCTION_DECAL : TEXTURE_FUNCTION_MODULATE;
+}
+
+inline int GsMagFilter(TexFilter filter)
+{
+    return (filter == TexFilter::Linear) ? LOD_MAG_LINEAR : LOD_MAG_NEAREST;
+}
+
+inline int GsMinFilter(TexFilter filter)
+{
+    return (filter == TexFilter::Linear) ? LOD_MIN_LINEAR : LOD_MIN_NEAREST;
+}
+
+inline int GsPsm(PixelFormat format)
+{
+    switch (format)
+    {
+    case PixelFormat::RGBA32   : return GS_PSM_32;
+    case PixelFormat::RGB16    : return GS_PSM_16;
+    case PixelFormat::Palette8 : return GS_PSM_8;
+    case PixelFormat::Alpha8   : return GS_PSM_8;
+    }
+    return GS_PSM_32; // Unreachable; keeps GCC's -Wreturn-type happy.
+}
+
+// Bytes of EE RAM one texel occupies in each PixelFormat (Palette8 = 1).
+inline int BytesPerTexel(PixelFormat format)
+{
+    switch (format)
+    {
+    case PixelFormat::RGBA32   : return 4;
+    case PixelFormat::RGB16    : return 2;
+    case PixelFormat::Palette8 : return 1;
+    case PixelFormat::Alpha8   : return 1;
+    }
+    return 4; // Unreachable; keeps GCC's -Wreturn-type happy.
+}
+
+// Pixel stride the texture occupies VRAM with (the TEX0 TBW and transfer DBW).
+// 8-bit textures must use a multiple of 128 (TBW must be even for PSMT8/4);
+// other formats use their width as-is.
+inline int TextureStridePixels(const Texture & texture, int psm)
+{
+    if (psm == GS_PSM_8)
+    {
+        return (texture.width + 127) & ~127;
+    }
+    return texture.width;
+}
 
 // Registers the built-in images (they stream into GS VRAM on first bind).
 // Call once, after gs::Init().
@@ -214,5 +250,18 @@ const Texture & DebugTexture(int variant = 0);
 // shape in alpha with every texel's colour at the modulate identity, so the
 // particle's colour comes entirely from its vertices.
 const Texture & ParticleTexture(bool highQuality);
+
+// Converts image-normalized texture coordinates - 0..1 spanning the image,
+// which is what Quake's MD2 glcmds store - into the GS's normalized ST space.
+// The two are not the same thing: normalized ST spans the TEX0 TW/TH extent,
+// the image size rounded UP to a power of two, so for the non-power-of-two
+// images Quake is full of (a 276x194 model skin samples as 512x256) ST = 1.0
+// lands well past the last real texel. Multiply by these to hit the image's
+// true right/bottom edge; both come back 1.0 for power-of-two images.
+//
+// Only valid for coordinates that stay within [0, 1]. A tiling texture still
+// wraps at the power-of-two extent, so non-power-of-two world textures need
+// resampling on load, not a coordinate scale.
+void StScaleFor(const Texture & texture, float * outScaleS, float * outScaleT);
 
 } // namespace ps2::tex

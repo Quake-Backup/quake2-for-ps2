@@ -203,13 +203,25 @@ inline u64 MakeTex0Data(const tex::Texture & texture)
     const vram::Address clutAddr = gs::ClutAddressFor(texture);
     const bool palettized = (clutAddr != vram::Address::Invalid);
 
-    return GS_SET_TEX0(texture.texbuf.address >> 6,
-                       texture.texbuf.width >> 6,
-                       texture.texbuf.psm,
-                       texture.texbuf.info.width,
-                       texture.texbuf.info.height,
-                       texture.texbuf.info.components,
-                       texture.texbuf.info.function,
+    const int psm    = tex::GsPsm(texture.format);
+    const int stride = tex::TextureStridePixels(texture, psm);
+
+    texbuffer_t texbuf;
+    texbuf.address         = static_cast<unsigned int>(texture.vramAddr);
+    texbuf.width           = static_cast<unsigned int>(stride);
+    texbuf.psm             = static_cast<unsigned int>(psm);
+    texbuf.info.width      = draw_log2(static_cast<unsigned int>(texture.width));
+    texbuf.info.height     = draw_log2(static_cast<unsigned int>(texture.height));
+    texbuf.info.components = static_cast<unsigned char>(tex::GsComponents(texture.components));
+    texbuf.info.function   = static_cast<unsigned char>(tex::GsFunction(texture.function));
+
+    return GS_SET_TEX0(texbuf.address >> 6,
+                       texbuf.width >> 6,
+                       texbuf.psm,
+                       texbuf.info.width,
+                       texbuf.info.height,
+                       texbuf.info.components,
+                       texbuf.info.function,
                        palettized ? ((int)clutAddr >> 6) : 0,
                        GS_PSM_32, // CPSM; only read for palettized PSMs (and == 0 anyway)
                        CLUT_STORAGE_MODE1, 0,

@@ -358,7 +358,8 @@ void ModelCache::ReferenceAllTextures(ModelInstance & mdl)
                 const char * skinName = reinterpret_cast<const char *>(md2) + md2->ofs_skins + (i * MAX_SKINNAME);
                 mdl.skins[i] = tex::Find(skinName, tex::ImageType::Skin);
             }
-            mdl.numFrames = md2->num_frames;
+            PS2_Assert(md2->num_frames >= 0 && md2->num_frames <= UINT16_MAX);
+            mdl.numFrames = static_cast<u16>(md2->num_frames);
             break;
         }
     }

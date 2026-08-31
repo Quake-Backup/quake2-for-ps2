@@ -17,74 +17,7 @@
 #include <cstdio>
 #include <cstring>
 
-#include <draw_sampling.h> // LOD_*
-#include <gs_psm.h>
-
 namespace ps2::tex {
-
-// ------------------------------------------------------------------------------------------------
-// Enum -> SDK constant mappings
-// ------------------------------------------------------------------------------------------------
-
-int GsPsm(PixelFormat format)
-{
-    switch (format)
-    {
-    case PixelFormat::RGBA32   : return GS_PSM_32;
-    case PixelFormat::RGB16    : return GS_PSM_16;
-    case PixelFormat::Palette8 : return GS_PSM_8;
-    case PixelFormat::Alpha8   : return GS_PSM_8;
-    }
-    return GS_PSM_32; // Unreachable; keeps GCC's -Wreturn-type happy.
-}
-
-int GsComponents(TexComponents components)
-{
-    return (components == TexComponents::RGBA) ? TEXTURE_COMPONENTS_RGBA : TEXTURE_COMPONENTS_RGB;
-}
-
-int GsFunction(TexFunction function)
-{
-    return (function == TexFunction::Decal) ? TEXTURE_FUNCTION_DECAL : TEXTURE_FUNCTION_MODULATE;
-}
-
-int GsMagFilter(TexFilter filter)
-{
-    return (filter == TexFilter::Linear) ? LOD_MAG_LINEAR : LOD_MAG_NEAREST;
-}
-
-int GsMinFilter(TexFilter filter)
-{
-    return (filter == TexFilter::Linear) ? LOD_MIN_LINEAR : LOD_MIN_NEAREST;
-}
-
-void StScaleFor(const Texture & texture, float * outScaleS, float * outScaleT)
-{
-    // draw_log2 rounds up, and it is the same call gs.cpp fills TEX0's TW/TH
-    // with - so this stays exact whatever the texture is, resident or not.
-    const int potWidth  = 1 << draw_log2(static_cast<unsigned int>(texture.width));
-    const int potHeight = 1 << draw_log2(static_cast<unsigned int>(texture.height));
-
-    *outScaleS = static_cast<float>(texture.width)  / static_cast<float>(potWidth);
-    *outScaleT = static_cast<float>(texture.height) / static_cast<float>(potHeight);
-}
-
-int BytesPerTexel(PixelFormat format)
-{
-    switch (format)
-    {
-    case PixelFormat::RGBA32   : return 4;
-    case PixelFormat::RGB16    : return 2;
-    case PixelFormat::Palette8 : return 1;
-    case PixelFormat::Alpha8   : return 1;
-    }
-    return 4; // Unreachable; keeps GCC's -Wreturn-type happy.
-}
-
-// ------------------------------------------------------------------------------------------------
-// TextureCache
-// ------------------------------------------------------------------------------------------------
-
 namespace {
 
 // Cache lookup key: the name hash continued with the image type as one extra
@@ -585,6 +518,7 @@ Texture & TextureCache::Register(const char * name, const void * pixels, int wid
                                  ImageType type, TexFlags flags)
 {
     PS2_Assert(width > 0 && height > 0 && pixels != nullptr);
+    PS2_AssertMsg(width <= INT16_MAX && height <= INT16_MAX, "Texture width/height too big!");
 
     const u16 slot = m_texturePool.Alloc();
     if (slot == TexturePool::kInvalidIndex) [[unlikely]]
@@ -606,8 +540,8 @@ Texture & TextureCache::Register(const char * name, const void * pixels, int wid
 
     texture.regSequence  = m_regSequence;
     texture.pixels       = pixels;
-    texture.width        = width;
-    texture.height       = height;
+    texture.width        = static_cast<s16>(width);
+    texture.height       = static_cast<s16>(height);
     texture.type         = type;
     texture.flags        = flags;
     texture.format       = format;
@@ -620,7 +554,6 @@ Texture & TextureCache::Register(const char * name, const void * pixels, int wid
     texture.atlasX       = 0;
     texture.atlasY       = 0;
     texture.vramAddr     = Texture::kNotResident;
-    texture.texbuf       = {};
     texture.dirtyPixels  = !builtin; // loader-written pixels may still sit in the dcache;
                                      // the first upload must flush them (built-ins were
                                      // written by the ELF loader and need no flush).
@@ -757,6 +690,17 @@ const Texture & DebugTexture(int variant)
 const Texture & ParticleTexture(bool highQuality)
 {
     return s_cache.ParticleTexture(highQuality);
+}
+
+void StScaleFor(const Texture & texture, float * outScaleS, float * outScaleT)
+{
+    // draw_log2 rounds up, and it is the same call gs.cpp fills TEX0's TW/TH
+    // with - so this stays exact whatever the texture is, resident or not.
+    const int potWidth  = 1 << draw_log2(static_cast<unsigned int>(texture.width));
+    const int potHeight = 1 << draw_log2(static_cast<unsigned int>(texture.height));
+
+    *outScaleS = static_cast<float>(texture.width)  / static_cast<float>(potWidth);
+    *outScaleT = static_cast<float>(texture.height) / static_cast<float>(potHeight);
 }
 
 } // namespace ps2::tex
