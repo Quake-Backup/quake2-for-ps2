@@ -892,6 +892,7 @@ void TriangulatePolygon(ModelPoly & poly)
 
     // Not a hard error: the algorithm may fail to produce the expected count on
     // pathological polygons. The unused triangles stay zeroed.
+    // FIXME: Find out why this happens and try to fix it (e.g. base2 triggers this error).
     if (triesDone != numTriangles)
     {
         Com_Printf("WARNING: TriangulatePolygon: Unexpected triangle count!\n");
